@@ -1,0 +1,18 @@
+[package]
+name = "dbvalet"
+version = "0.0.0"
+edition = "2024"
+# Fixed at the stable release on launch day; raised only in a minor release.
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "Run an AI coding agent with a temporary PostgreSQL login it never sees."
+repository = "https://github.com/dbvalet/dbvalet"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
