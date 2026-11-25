@@ -29,6 +29,7 @@ const LEASE_AHEAD: &str = "15 minutes";
 const SESSION_END_TIMEOUT_MS: i64 = 5_000;
 
 /// Temporary logins created over admin SQL, with a fresh admin connection per operation.
+#[derive(Debug)]
 pub struct DirectSource {
     alias: DatabaseAlias,
     admin: Arc<AdminLogin>,
@@ -60,7 +61,8 @@ impl CredentialSource for DirectSource {
                 &format!(
                     "SELECT current_setting('server_version'),
                             current_setting('server_version_num')::int,
-                            (now() + interval '{LEASE_AHEAD}')::text"
+                            to_char((now() + interval '{LEASE_AHEAD}') AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
                 ),
                 &[],
             )
@@ -77,10 +79,12 @@ impl CredentialSource for DirectSource {
         // Only the SCRAM verifier reaches the server, so its logs never hold the password.
         let verifier =
             postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
-        let self_grant = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-            "SET createrole_self_grant = 'inherit';"
+        // The admin needs the login's privileges to end its sessions and drop what it owns:
+        // PostgreSQL 16 and later give them through createrole_self_grant, older ones through ROLE.
+        let (self_grant, admin_member) = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+            ("SET createrole_self_grant = 'inherit';", String::new())
         } else {
-            ""
+            ("", format!("ROLE {}", quote_ident(self.admin.user())))
         };
         let read_only = if grant.read_only {
             format!("ALTER ROLE {user} SET default_transaction_read_only = on;")
@@ -91,7 +95,8 @@ impl CredentialSource for DirectSource {
         client
             .batch_execute(&format!(
                 "{self_grant}
-                 CREATE ROLE {user} LOGIN PASSWORD {verifier} VALID UNTIL {valid_until} IN ROLE {group};
+                 CREATE ROLE {user} LOGIN PASSWORD {verifier} VALID UNTIL {valid_until}
+                     IN ROLE {group} {admin_member};
                  {read_only}",
                 verifier = quote_literal(&verifier),
                 valid_until = quote_literal(&valid_until),
@@ -136,6 +141,20 @@ pub(super) async fn drop_login(
         )
         .await
         .map_err(|err| drop_failed(describe_sql_error(&err)))?;
+    // pg_terminate_backend returns false rather than failing, so count what is left.
+    let remaining: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &[&user],
+        )
+        .await
+        .map_err(|err| drop_failed(describe_sql_error(&err)))?
+        .get(0);
+    if remaining > 0 {
+        return Err(drop_failed(format!(
+            "{remaining} of its sessions didn't end within {SESSION_END_TIMEOUT_MS} ms"
+        )));
+    }
     let login = quote_ident(user);
     client
         .batch_execute(&format!(

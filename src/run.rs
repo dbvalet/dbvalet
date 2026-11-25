@@ -41,6 +41,7 @@ pub async fn run<S: CredentialSource>(
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
+    assert!(!command.is_empty(), "run needs a command");
     let lease = source.mint(grant).await?;
     let finished = run_child(lease.login(), upstream, command).await;
     if let Err(err) = lease.release().await {
@@ -98,7 +99,8 @@ fn child_command(
         .env(
             "DATABASE_URL",
             format!(
-                "postgresql://{user}:{token}@{PROXY_HOST}:{port}/{}?sslmode=disable",
+                "postgresql://{}:{token}@{PROXY_HOST}:{port}/{}?sslmode=disable",
+                url_encoded(user),
                 url_encoded(database)
             ),
         );

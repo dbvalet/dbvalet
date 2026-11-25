@@ -392,11 +392,18 @@ fn create_reader_group() {
 /// Stores a superuser admin login under `alias` and writes a `dbvalet.toml` that lists
 /// `alias` with a read-only `reader` role. Returns the directory holding the file.
 fn project_with_reader(alias: &str) -> PathBuf {
+    project_with_reader_and_admin(alias, "SUPERUSER")
+}
+
+/// Like [`project_with_reader`], with an admin that has `attributes` and ADMIN OPTION on
+/// `dbvalet_reader`, which `dbvalet init` will grant.
+fn project_with_reader_and_admin(alias: &str, attributes: &str) -> PathBuf {
     create_reader_group();
     let admin = alias.replace('-', "_");
     superuser_sql(&format!(
         "DROP ROLE IF EXISTS {admin};
-         CREATE ROLE {admin} LOGIN SUPERUSER PASSWORD 'pw-{alias}-admin';"
+         CREATE ROLE {admin} LOGIN {attributes} PASSWORD 'pw-{alias}-admin';
+         GRANT dbvalet_reader TO {admin} WITH ADMIN OPTION;"
     ));
     let stored = login(
         alias,
@@ -596,14 +603,24 @@ fn the_child_environment_points_at_the_proxy_and_drops_the_parent_pg_values() {
 
     let env = text(&output.stdout);
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(env.contains("\nPGHOST=127.0.0.1\n"), "{env}");
-    assert!(env.contains("\nPGSSLMODE=disable\n"), "{env}");
-    assert!(env.contains("\nPGDATABASE=postgres\n"), "{env}");
-    assert!(env.contains("\nPGUSER=dbvalet_"), "{env}");
-    assert!(env.contains("\nPGPORT="), "{env}");
-    assert!(env.contains("\nPGPASSWORD="), "{env}");
+    assert!(env.lines().any(|line| line == "PGHOST=127.0.0.1"), "{env}");
+    assert!(env.lines().any(|line| line == "PGSSLMODE=disable"), "{env}");
     assert!(
-        env.contains("\nDATABASE_URL=postgresql://dbvalet_"),
+        env.lines().any(|line| line == "PGDATABASE=postgres"),
+        "{env}"
+    );
+    assert!(
+        env.lines().any(|line| line.starts_with("PGUSER=dbvalet_")),
+        "{env}"
+    );
+    assert!(env.lines().any(|line| line.starts_with("PGPORT=")), "{env}");
+    assert!(
+        env.lines().any(|line| line.starts_with("PGPASSWORD=")),
+        "{env}"
+    );
+    assert!(
+        env.lines()
+            .any(|line| line.starts_with("DATABASE_URL=postgresql://dbvalet_")),
         "{env}"
     );
     assert!(!env.contains("parent"), "{env}");
@@ -725,4 +742,75 @@ fn a_child_can_hold_two_proxy_connections_at_once() {
 
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "2\n");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_run_with_a_createrole_admin_reads_and_leaves_no_login_or_session() {
+    let dir = project_with_reader_and_admin("e2e-run-createrole", "CREATEROLE");
+
+    let output = run_in(
+        &dir,
+        &["sh", "-c", "echo \"$PGUSER\"; psql -qAtc 'SELECT 1'"],
+    );
+
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert!(
+        text(&output.stderr).is_empty(),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+    let login_name = stdout.lines().next().unwrap().to_owned();
+    assert_eq!(stdout, format!("{login_name}\n1\n"));
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_teardown_failure_is_printed_and_the_child_exit_code_is_still_returned() {
+    let dir = project_with_reader("e2e-run-teardown-fails");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg("echo \"login=$PGUSER\"; read line; exit 7")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first_line = String::new();
+    BufReader::new(run.stdout.take().unwrap())
+        .read_line(&mut first_line)
+        .unwrap();
+    let login_name = first_line.trim().strip_prefix("login=").unwrap().to_owned();
+
+    superuser_sql("ALTER ROLE e2e_run_teardown_fails NOLOGIN;");
+    run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let output = run.wait_with_output().unwrap();
+    superuser_sql(&format!("DROP ROLE {login_name};"));
+
+    let stderr = text(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("couldn't drop the temporary login `{login_name}`")),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("pw-e2e-run-teardown-fails-admin"),
+        "{stderr}"
+    );
 }

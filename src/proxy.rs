@@ -22,6 +22,11 @@ use crate::source::UpstreamLogin;
 /// PostgreSQL refuses longer startup packets too.
 const MAX_STARTUP_PACKET_LEN: usize = 10_000;
 const MAX_PASSWORD_MESSAGE_LEN: usize = 1_000;
+/// Far above any authentication message, so a non-PostgreSQL peer can't make dbvalet
+/// reserve gigabytes.
+const MAX_UPSTREAM_LOGIN_MESSAGE_LEN: usize = 64 * 1024;
+/// SSL and GSS encryption requests are a length and a code, nothing more.
+const ENCRYPTION_REQUEST_LEN: usize = 8;
 const PROTOCOL_VERSION_3_0: u32 = 3 << 16;
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 const SSL_REQUEST_CODE: u32 = 80_877_103;
@@ -34,6 +39,7 @@ const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 const INVALID_PASSWORD_SQLSTATE: &str = "28P01";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 
+#[derive(Debug)]
 pub struct Proxy {
     port: u16,
     stop: oneshot::Sender<()>,
@@ -161,7 +167,9 @@ async fn read_startup(client: &mut TcpStream) -> io::Result<Option<Vec<(String, 
         client.read_exact(&mut packet).await?;
         let (code, rest) = packet.split_at(4);
         match u32::from_be_bytes([code[0], code[1], code[2], code[3]]) {
-            SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => client.write_all(b"N").await?,
+            SSL_REQUEST_CODE | GSSENC_REQUEST_CODE if len == ENCRYPTION_REQUEST_LEN => {
+                client.write_all(b"N").await?;
+            }
             CANCEL_REQUEST_CODE => return Ok(None),
             PROTOCOL_VERSION_3_0 => return parse_parameters(rest).map(Some),
             _ => return Err(invalid_data("the client asked for an unsupported protocol")),
@@ -190,7 +198,11 @@ fn parse_parameters(bytes: &[u8]) -> io::Result<Vec<(String, String)>> {
     }
     fields
         .chunks(2)
-        .map(|pair| Ok((text(pair[0])?, text(pair[1])?)))
+        .map(|pair| match pair {
+            [[], _] => Err(invalid_data("a startup parameter has an empty name")),
+            [name, value] => Ok((text(name)?, text(value)?)),
+            _ => unreachable!("chunks(2) of an even-length list are pairs"),
+        })
         .collect()
 }
 
@@ -210,7 +222,9 @@ async fn read_password(client: &mut TcpStream) -> io::Result<SecretSlice<u8>> {
 /// Compares in time that doesn't depend on how much of the token matches.
 fn token_matches(password_message: &SecretSlice<u8>, token: &SecretString) -> bool {
     let presented = password_message.expose_secret();
-    let presented = presented.strip_suffix(&[0]).unwrap_or(presented);
+    let Some(presented) = presented.strip_suffix(&[0]) else {
+        return false;
+    };
     presented.ct_eq(token.expose_secret().as_bytes()).into()
 }
 
@@ -271,7 +285,7 @@ async fn connect_upstream(
     loop {
         out.clear();
         match read_backend_message(&mut server, &mut unread).await? {
-            backend::Message::AuthenticationSasl(_) => {
+            backend::Message::AuthenticationSasl(_) if scram.is_none() => {
                 let started = ScramSha256::new(
                     login.password().expose_secret().as_bytes(),
                     ChannelBinding::unsupported(),
@@ -293,6 +307,9 @@ async fn connect_upstream(
             backend::Message::AuthenticationOk if scram.is_none() || server_verified => {
                 return Ok((server, unread));
             }
+            backend::Message::AuthenticationSasl(_) | backend::Message::AuthenticationOk => {
+                return Err(out_of_order());
+            }
             _ => {
                 return Err(UpstreamRefusal::Failed(
                     "the database asked for an authentication other than SCRAM-SHA-256".to_owned(),
@@ -310,6 +327,11 @@ async fn read_backend_message(
     loop {
         if let Some(header) = backend::Header::parse(unread).map_err(failed)? {
             let frame_len = 1 + header.len() as usize;
+            if frame_len > MAX_UPSTREAM_LOGIN_MESSAGE_LEN {
+                return Err(UpstreamRefusal::Failed(
+                    "the database sent an oversized message during login".to_owned(),
+                ));
+            }
             if header.tag() == ERROR_RESPONSE_TAG && unread.len() >= frame_len {
                 return Err(UpstreamRefusal::ErrorResponse(unread.split_to(frame_len)));
             }
@@ -359,6 +381,17 @@ mod tests {
     fn startup_parameters_without_the_final_terminator_are_refused() {
         assert!(parse_parameters(b"user\0agent").is_err());
         assert!(parse_parameters(b"user\0agent\0").is_err());
+    }
+
+    #[test]
+    fn a_startup_parameter_with_an_empty_name_is_refused() {
+        assert!(parse_parameters(b"\0\0\0").is_err());
+    }
+
+    #[test]
+    fn a_password_message_without_its_terminator_does_not_match() {
+        let token = SecretString::from("tokenabcdefghijk");
+        assert!(!token_matches(&b"tokenabcdefghijk".to_vec().into(), &token));
     }
 
     #[test]
