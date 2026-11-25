@@ -55,8 +55,8 @@ jobs:
           --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install gnome-keyring and the D-Bus headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring dbus libdbus-1-dev pkg-config
+      - name: Install gnome-keyring, the D-Bus headers and psql for the run tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring dbus libdbus-1-dev pkg-config postgresql-client
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal

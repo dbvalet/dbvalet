@@ -1,14 +1,19 @@
 //! The command line, mapped onto library calls.
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read};
-use std::process::ExitCode;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{ExitCode, ExitStatus};
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 use crate::DatabaseAlias;
+use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
-use crate::source::direct;
+use crate::policy::{self, PolicyError};
+use crate::run::{self, RunError};
+use crate::source::direct::{self, DirectSource};
 
 const INITIAL_STDIN_CAPACITY: usize = 256;
 
@@ -32,6 +37,21 @@ enum Command {
         #[arg(long)]
         allow_plaintext: bool,
     },
+    /// Run a command with a temporary login behind a local proxy, dropped when it exits.
+    Run {
+        /// The database from dbvalet.toml. Needed when the file lists more than one.
+        #[arg(long)]
+        db: Option<DatabaseAlias>,
+        /// A role dbvalet.toml lists for the database.
+        #[arg(long, default_value = "reader")]
+        role: String,
+        /// Connect without TLS. Allowed only for a database on localhost.
+        #[arg(long)]
+        allow_plaintext: bool,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +64,14 @@ pub enum CliError {
     InvalidUtf8,
     #[error(transparent)]
     Keychain(#[from] KeychainError),
+    #[error("couldn't read the current directory")]
+    CurrentDirectory(#[source] io::Error),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    #[error(transparent)]
+    Run(#[from] RunError),
 }
 
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -69,7 +97,32 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 ExitCode::FAILURE
             })
         }
+        Command::Run {
+            db,
+            role,
+            allow_plaintext,
+            command,
+        } => {
+            let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let config = config::find_and_load(&cwd)?;
+            let (alias, database) = policy::choose_database(&config, db.as_ref())?;
+            let grant = policy::choose_role(alias, database, &role)?;
+            let admin = keychain::load(alias, allow_plaintext)?;
+            let upstream = admin.endpoint().clone();
+            let source = DirectSource::new(alias.clone(), admin);
+            let status = run::run(&source, grant, upstream, &command).await?;
+            Ok(exit_code(status))
+        }
     }
+}
+
+/// The child's exit code, or 128 plus the signal that killed it, as a shell reports it.
+fn exit_code(status: ExitStatus) -> ExitCode {
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1);
+    ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
 
 fn read_connection_string(alias: &DatabaseAlias) -> Result<SecretString, CliError> {
