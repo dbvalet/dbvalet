@@ -147,7 +147,7 @@ fn a_createrole_admin_before_postgresql_16_is_told_to_grant_pg_signal_backend() 
     assert!(stdout.contains("ok   `e2e_createrole_old_admin` has CREATEROLE\n"));
     assert!(stdout.contains(
         "FAIL `e2e_createrole_old_admin` can't end other roles' sessions: \
-         as a superuser, run GRANT pg_signal_backend TO e2e_createrole_old_admin\n"
+         as a superuser, run GRANT pg_signal_backend TO \"e2e_createrole_old_admin\"\n"
     ));
 }
 
@@ -170,7 +170,7 @@ fn an_admin_without_createrole_is_told_it_lacks_createrole() {
     assert!(!checked.status.success());
     assert!(stdout.contains(
         "FAIL `e2e_plain_admin` has neither SUPERUSER nor CREATEROLE: as a superuser, \
-         run ALTER ROLE e2e_plain_admin CREATEROLE, or use your provider's admin login\n"
+         run ALTER ROLE \"e2e_plain_admin\" CREATEROLE, or use your provider's admin login\n"
     ));
 }
 

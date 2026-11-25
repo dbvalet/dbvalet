@@ -69,7 +69,11 @@ fn is_loopback(host: &str) -> bool {
 
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}/{}", self.host, self.port, self.database)
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}/{}", self.host, self.port, self.database)
+        } else {
+            write!(f, "{}:{}/{}", self.host, self.port, self.database)
+        }
     }
 }
 
@@ -99,5 +103,21 @@ mod tests {
     fn without_allow_plaintext_every_host_needs_verified_tls() {
         let endpoint = Endpoint::new("localhost".to_owned(), 5432, "postgres".to_owned(), false);
         assert_eq!(endpoint.unwrap().tls(), Tls::VerifyFull);
+    }
+
+    #[test]
+    fn display_brackets_ipv6_addresses_and_leaves_other_hosts_unbracketed() {
+        assert_eq!(
+            with_plaintext("::1").unwrap().to_string(),
+            "[::1]:5432/postgres"
+        );
+        assert_eq!(
+            with_plaintext("localhost").unwrap().to_string(),
+            "localhost:5432/postgres"
+        );
+        assert_eq!(
+            with_plaintext("127.0.0.1").unwrap().to_string(),
+            "127.0.0.1:5432/postgres"
+        );
     }
 }

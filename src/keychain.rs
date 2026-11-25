@@ -115,8 +115,8 @@ fn parse(
         .map_err(|_| bad("it isn't a PostgreSQL connection string"))?;
 
     let host = match config.get_hosts() {
-        [tokio_postgres::config::Host::Tcp(host)] => host.clone(),
-        [] => return Err(bad("it names no host")),
+        [tokio_postgres::config::Host::Tcp(host)] if !host.is_empty() => host.clone(),
+        [tokio_postgres::config::Host::Tcp(_)] | [] => return Err(bad("it names no host")),
         [_] => return Err(bad("a Unix socket isn't supported, name a TCP host")),
         _ => return Err(bad("it names more than one host")),
     };
@@ -125,13 +125,26 @@ fn parse(
             "`hostaddr` isn't supported, name the address as the host",
         ));
     }
-    let port = config.get_ports().first().copied().unwrap_or(DEFAULT_PORT);
-    let user = config.get_user().ok_or_else(|| bad("it names no user"))?;
+    let port = match config.get_ports() {
+        [] => DEFAULT_PORT,
+        [0] => return Err(bad("its port can't be 0")),
+        [port] => *port,
+        _ => return Err(bad("it names more than one port")),
+    };
+    let user = config
+        .get_user()
+        .filter(|user| !user.is_empty())
+        .ok_or_else(|| bad("it names no user"))?;
     let password = config
         .get_password()
+        .filter(|password| !password.is_empty())
         .ok_or_else(|| bad("it has no password"))?;
     let password = std::str::from_utf8(password).map_err(|_| bad("its password isn't UTF-8"))?;
-    let database = config.get_dbname().unwrap_or(user);
+    let database = match config.get_dbname() {
+        Some("") => return Err(bad("it names an empty database")),
+        Some(database) => database,
+        None => user,
+    };
 
     Ok(AdminLogin {
         endpoint: Endpoint::new(host, port, database.to_owned(), allow_plaintext)?,
@@ -246,5 +259,72 @@ mod tests {
             parse_error("postgresql://admin@localhost/postgres"),
             KeychainError::BadConnectionString { .. }
         ));
+    }
+
+    #[test]
+    fn an_empty_host_user_password_or_database_is_refused() {
+        let empty_host = parse_error("postgresql://admin:pw-unit-7f3a9c@:5432/postgres");
+        assert!(matches!(
+            empty_host,
+            KeychainError::BadConnectionString {
+                problem: "it names no host",
+                ..
+            }
+        ));
+        assert_hides_password(&empty_host);
+
+        let empty_user = parse_error("postgresql://:pw-unit-7f3a9c@localhost:5432/postgres");
+        assert!(matches!(
+            empty_user,
+            KeychainError::BadConnectionString {
+                problem: "it names no user",
+                ..
+            }
+        ));
+        assert_hides_password(&empty_user);
+
+        let empty_password = parse_error("postgresql://admin:@localhost:5432/postgres");
+        assert!(matches!(
+            empty_password,
+            KeychainError::BadConnectionString {
+                problem: "it has no password",
+                ..
+            }
+        ));
+
+        let empty_database =
+            parse_error("host=localhost dbname='' user=admin password=pw-unit-7f3a9c");
+        assert!(matches!(
+            empty_database,
+            KeychainError::BadConnectionString {
+                problem: "it names an empty database",
+                ..
+            }
+        ));
+        assert_hides_password(&empty_database);
+    }
+
+    #[test]
+    fn port_zero_and_multiple_ports_are_refused() {
+        let port_zero = parse_error("postgresql://admin:pw-unit-7f3a9c@localhost:0/postgres");
+        assert!(matches!(
+            port_zero,
+            KeychainError::BadConnectionString {
+                problem: "its port can't be 0",
+                ..
+            }
+        ));
+        assert_hides_password(&port_zero);
+
+        let multiple_ports =
+            parse_error("host=localhost port=5432,5433 user=admin password=pw-unit-7f3a9c");
+        assert!(matches!(
+            multiple_ports,
+            KeychainError::BadConnectionString {
+                problem: "it names more than one port",
+                ..
+            }
+        ));
+        assert_hides_password(&multiple_ports);
     }
 }

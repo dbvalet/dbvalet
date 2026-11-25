@@ -4,11 +4,13 @@ use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 use crate::DatabaseAlias;
 use crate::keychain::{self, KeychainError};
 use crate::source::direct;
+
+const INITIAL_STDIN_CAPACITY: usize = 256;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -72,9 +74,29 @@ fn read_connection_string(alias: &DatabaseAlias) -> io::Result<SecretString> {
         let prompt = format!("Admin connection string for `{alias}`: ");
         return rpassword::prompt_password(prompt).map(SecretString::from);
     }
-    // shortcut: buffers that read_to_string outgrows aren't zeroed; fine for one short line.
-    let mut connection_string = String::new();
-    io::stdin().read_to_string(&mut connection_string)?;
-    connection_string.truncate(connection_string.trim_end().len());
-    Ok(SecretString::from(connection_string))
+    read_secret_line(io::stdin())
+}
+
+fn read_secret_line(mut reader: impl Read) -> io::Result<SecretString> {
+    let mut buffer = SecretBox::new(Box::new(String::with_capacity(INITIAL_STDIN_CAPACITY)));
+    reader.read_to_string(buffer.expose_secret_mut())?;
+    Ok(SecretString::from(buffer.expose_secret().trim_end()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reading_a_piped_secret_trims_trailing_newlines() {
+        let secret =
+            read_secret_line(b"postgresql://admin:pw@localhost/db\r\n".as_slice()).unwrap();
+        assert_eq!(secret.expose_secret(), "postgresql://admin:pw@localhost/db");
+    }
+
+    #[test]
+    fn reading_a_piped_secret_rejects_invalid_utf8() {
+        let err = read_secret_line(b"postgresql://admin:pw@\xff".as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

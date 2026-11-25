@@ -134,9 +134,10 @@ fn create_role_check(user: &str, rights: &Rights) -> Check {
     } else if rights.create_role {
         Check::passed(format!("`{user}` has CREATEROLE"))
     } else {
+        let quoted = quote_ident(user);
         Check::failed(format!(
             "`{user}` has neither SUPERUSER nor CREATEROLE: as a superuser, \
-             run ALTER ROLE {user} CREATEROLE, or use your provider's admin login"
+             run ALTER ROLE {quoted} CREATEROLE, or use your provider's admin login"
         ))
     }
 }
@@ -155,12 +156,24 @@ fn end_sessions_check(user: &str, rights: &Rights) -> Check {
             "`{user}` can end the sessions of logins it creates, \
              because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
         ))
-    } else {
+    } else if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+        let quoted = quote_ident(user);
         Check::failed(format!(
             "`{user}` can't end other roles' sessions: \
-             as a superuser, run GRANT pg_signal_backend TO {user}"
+             as a superuser, run ALTER ROLE {quoted} CREATEROLE, \
+             or GRANT pg_signal_backend TO {quoted}"
+        ))
+    } else {
+        let quoted = quote_ident(user);
+        Check::failed(format!(
+            "`{user}` can't end other roles' sessions: \
+             as a superuser, run GRANT pg_signal_backend TO {quoted}"
         ))
     }
+}
+
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 async fn connect(admin: &AdminLogin) -> Result<Client, String> {
@@ -190,5 +203,125 @@ fn describe(err: &tokio_postgres::Error) -> String {
     match err.source() {
         Some(cause) => format!("{err}: {cause}"),
         None => err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rights(
+        server_version: &str,
+        server_version_num: i32,
+        superuser: bool,
+        create_role: bool,
+        signal_backend: bool,
+    ) -> Rights {
+        Rights {
+            server_version: server_version.to_owned(),
+            server_version_num,
+            superuser,
+            create_role,
+            signal_backend,
+        }
+    }
+
+    #[test]
+    fn postgresql_13_fails_the_version_check_and_names_14() {
+        let check = version_check(&rights("13.18", 130018, true, false, false));
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "PostgreSQL 13.18 is too old: dbvalet needs 14 or later"
+        );
+    }
+
+    #[test]
+    fn postgresql_14_passes_the_version_check() {
+        let check = version_check(&rights("14.0", 140000, true, false, false));
+        assert!(check.passed);
+        assert_eq!(check.message, "PostgreSQL 14.0 is 14 or later");
+    }
+
+    #[test]
+    fn a_superuser_passes_the_create_role_check() {
+        let check = create_role_check("admin", &rights("16.4", 160004, true, false, false));
+        assert!(check.passed);
+        assert_eq!(check.message, "`admin` is a superuser");
+    }
+
+    #[test]
+    fn a_createrole_admin_passes_the_create_role_check() {
+        let check = create_role_check("admin", &rights("16.4", 160004, false, true, false));
+        assert!(check.passed);
+        assert_eq!(check.message, "`admin` has CREATEROLE");
+    }
+
+    #[test]
+    fn an_admin_without_createrole_fails_with_a_quoted_alter_role_command() {
+        let check = create_role_check(
+            "postgres.proj-1",
+            &rights("16.4", 160004, false, false, false),
+        );
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`postgres.proj-1` has neither SUPERUSER nor CREATEROLE: as a superuser, \
+             run ALTER ROLE \"postgres.proj-1\" CREATEROLE, or use your provider's admin login"
+        );
+    }
+
+    #[test]
+    fn a_superuser_can_end_sessions() {
+        let check = end_sessions_check("admin", &rights("14.12", 140012, true, false, false));
+        assert!(check.passed);
+        assert_eq!(
+            check.message,
+            "`admin` can end other roles' sessions, as a superuser"
+        );
+    }
+
+    #[test]
+    fn an_admin_with_pg_signal_backend_can_end_sessions_before_postgresql_16() {
+        let check = end_sessions_check("admin", &rights("14.12", 140012, false, true, true));
+        assert!(check.passed);
+        assert_eq!(
+            check.message,
+            "`admin` can end other roles' sessions, through pg_signal_backend"
+        );
+    }
+
+    #[test]
+    fn a_createrole_admin_on_postgresql_16_can_end_sessions() {
+        let check = end_sessions_check("admin", &rights("16.0", 160000, false, true, false));
+        assert!(check.passed);
+        assert_eq!(
+            check.message,
+            "`admin` can end the sessions of logins it creates, \
+             because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
+        );
+    }
+
+    #[test]
+    fn a_createrole_admin_before_postgresql_16_without_pg_signal_backend_is_told_to_grant_it() {
+        let check = end_sessions_check("app-admin", &rights("14.12", 140012, false, true, false));
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`app-admin` can't end other roles' sessions: \
+             as a superuser, run GRANT pg_signal_backend TO \"app-admin\""
+        );
+    }
+
+    #[test]
+    fn an_admin_without_createrole_on_postgresql_16_is_told_to_add_createrole_first() {
+        let check = end_sessions_check("Db\"Admin", &rights("16.4", 160004, false, false, false));
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`Db\"Admin` can't end other roles' sessions: \
+             as a superuser, run ALTER ROLE \"Db\"\"Admin\" CREATEROLE, \
+             or GRANT pg_signal_backend TO \"Db\"\"Admin\""
+        );
     }
 }

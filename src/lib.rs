@@ -13,7 +13,9 @@ pub mod source;
 pub struct DatabaseAlias(String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("a database alias uses only letters, digits, `_` and `-`, like `app`")]
+#[error(
+    "a database alias uses only letters, digits, `_` and `-`, and can't start with `-`, like `app`"
+)]
 pub struct InvalidAlias;
 
 impl DatabaseAlias {
@@ -27,7 +29,7 @@ impl FromStr for DatabaseAlias {
 
     fn from_str(alias: &str) -> Result<Self, Self::Err> {
         let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-        if alias.is_empty() || !alias.chars().all(allowed) {
+        if alias.is_empty() || alias.starts_with('-') || !alias.chars().all(allowed) {
             return Err(InvalidAlias);
         }
         Ok(Self(alias.to_owned()))
@@ -55,6 +57,7 @@ mod tests {
     #[test]
     fn an_empty_alias_or_one_with_other_characters_is_refused() {
         assert!("".parse::<DatabaseAlias>().is_err());
+        assert!("-app".parse::<DatabaseAlias>().is_err());
         assert!("my app".parse::<DatabaseAlias>().is_err());
         assert!("../app".parse::<DatabaseAlias>().is_err());
     }
