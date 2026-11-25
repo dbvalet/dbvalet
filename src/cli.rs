@@ -38,6 +38,10 @@ enum Command {
 pub enum CliError {
     #[error("couldn't read the connection string")]
     ReadConnectionString(#[source] io::Error),
+    #[error("the connection string must be a single line")]
+    MultipleLines,
+    #[error("the connection string didn't contain valid UTF-8")]
+    InvalidUtf8,
     #[error(transparent)]
     Keychain(#[from] KeychainError),
 }
@@ -45,8 +49,7 @@ pub enum CliError {
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     match cli.command {
         Command::Login { alias } => {
-            let connection_string =
-                read_connection_string(&alias).map_err(CliError::ReadConnectionString)?;
+            let connection_string = read_connection_string(&alias)?;
             keychain::store(&alias, connection_string)?;
             println!("Stored the admin login for `{alias}` in the OS keychain.");
             Ok(ExitCode::SUCCESS)
@@ -69,18 +72,46 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     }
 }
 
-fn read_connection_string(alias: &DatabaseAlias) -> io::Result<SecretString> {
+fn read_connection_string(alias: &DatabaseAlias) -> Result<SecretString, CliError> {
     if io::stdin().is_terminal() {
         let prompt = format!("Admin connection string for `{alias}`: ");
-        return rpassword::prompt_password(prompt).map(SecretString::from);
+        return read_prompt_secret(prompt, rpassword::ConfigBuilder::new().build());
     }
     read_secret_line(io::stdin())
 }
 
-fn read_secret_line(mut reader: impl Read) -> io::Result<SecretString> {
+fn read_prompt_secret(prompt: String, config: rpassword::Config) -> Result<SecretString, CliError> {
+    let secret = rpassword::prompt_password_with_config(prompt, config)
+        .map(SecretString::from)
+        .map_err(CliError::ReadConnectionString)?;
+    // rpassword turns invalid UTF-8 bytes into U+FFFD rather than returning an error.
+    if secret.expose_secret().contains('\u{FFFD}') {
+        return Err(CliError::InvalidUtf8);
+    }
+    Ok(secret)
+}
+
+fn read_secret_line(mut reader: impl Read) -> Result<SecretString, CliError> {
+    // Inputs past INITIAL_STDIN_CAPACITY reallocate, and the old buffer isn't zeroed.
     let mut buffer = SecretBox::new(Box::new(String::with_capacity(INITIAL_STDIN_CAPACITY)));
-    reader.read_to_string(buffer.expose_secret_mut())?;
-    Ok(SecretString::from(buffer.expose_secret().trim_end()))
+    reader
+        .read_to_string(buffer.expose_secret_mut())
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::InvalidData {
+                CliError::InvalidUtf8
+            } else {
+                CliError::ReadConnectionString(err)
+            }
+        })?;
+    let mut non_empty_lines = buffer
+        .expose_secret()
+        .split(['\n', '\r'])
+        .filter(|line| !line.trim().is_empty());
+    let first = non_empty_lines.next().unwrap_or("");
+    if non_empty_lines.next().is_some() {
+        return Err(CliError::MultipleLines);
+    }
+    Ok(SecretString::from(first.trim_end()))
 }
 
 #[cfg(test)]
@@ -97,6 +128,28 @@ mod tests {
     #[test]
     fn reading_a_piped_secret_rejects_invalid_utf8() {
         let err = read_secret_line(b"postgresql://admin:pw@\xff".as_slice()).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, CliError::InvalidUtf8));
+    }
+
+    #[test]
+    fn reading_a_piped_secret_rejects_more_than_one_non_empty_line() {
+        let err = read_secret_line(
+            b"postgresql://admin:pw1@localhost/db\npostgresql://other:pw2@localhost/db\n"
+                .as_slice(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CliError::MultipleLines));
+    }
+
+    #[test]
+    fn reading_a_prompt_secret_rejects_invalid_utf8() {
+        let config = rpassword::ConfigBuilder::new()
+            .input_data(b"postgresql://admin:pw-prompt-9c1\xff@localhost/db\n".to_vec())
+            .output_discard()
+            .build();
+        let err = read_prompt_secret("Prompt: ".to_owned(), config).unwrap_err();
+        assert!(matches!(err, CliError::InvalidUtf8));
+        assert!(!format!("{err}").contains("pw-prompt-9c1"));
+        assert!(!format!("{err:?}").contains("pw-prompt-9c1"));
     }
 }

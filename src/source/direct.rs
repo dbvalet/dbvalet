@@ -1,11 +1,12 @@
 //! Temporary logins created with the admin login, over admin SQL.
 
-use std::error::Error as _;
 use std::fmt;
+use std::io;
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
 use crate::DatabaseAlias;
@@ -58,7 +59,7 @@ pub async fn doctor(alias: &DatabaseAlias, allow_plaintext: bool) -> Vec<Check> 
     ))];
 
     let user = admin.user();
-    let client = match connect(&admin).await {
+    let client = match connect(alias, &admin).await {
         Ok(client) => client,
         Err(reason) => {
             checks.push(Check::failed(format!(
@@ -81,7 +82,7 @@ pub async fn doctor(alias: &DatabaseAlias, allow_plaintext: bool) -> Vec<Check> 
         }
         Err(err) => checks.push(Check::failed(format!(
             "can't read the rights of `{user}`: {}",
-            describe(&err)
+            describe_query_error(&err)
         ))),
     }
     checks
@@ -92,7 +93,9 @@ struct Rights {
     server_version_num: i32,
     superuser: bool,
     create_role: bool,
+    inherit: bool,
     signal_backend: bool,
+    signal_backend_member: bool,
 }
 
 async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
@@ -102,7 +105,9 @@ async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
                     current_setting('server_version_num')::int,
                     rolsuper,
                     rolcreaterole,
-                    pg_has_role(current_user, 'pg_signal_backend', 'USAGE')
+                    rolinherit,
+                    pg_has_role(current_user, 'pg_signal_backend', 'USAGE'),
+                    pg_has_role(current_user, 'pg_signal_backend', 'MEMBER')
              FROM pg_roles
              WHERE rolname = current_user",
             &[],
@@ -113,7 +118,9 @@ async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
         server_version_num: row.get(1),
         superuser: row.get(2),
         create_role: row.get(3),
-        signal_backend: row.get(4),
+        inherit: row.get(4),
+        signal_backend: row.get(5),
+        signal_backend_member: row.get(6),
     })
 }
 
@@ -144,39 +151,55 @@ fn create_role_check(user: &str, rights: &Rights) -> Check {
 
 fn end_sessions_check(user: &str, rights: &Rights) -> Check {
     if rights.superuser {
-        Check::passed(format!(
+        return Check::passed(format!(
             "`{user}` can end other roles' sessions, as a superuser"
-        ))
-    } else if rights.signal_backend {
-        Check::passed(format!(
+        ));
+    }
+    if rights.signal_backend {
+        return Check::passed(format!(
             "`{user}` can end other roles' sessions, through pg_signal_backend"
-        ))
-    } else if rights.create_role && rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-        Check::passed(format!(
+        ));
+    }
+    if rights.create_role && rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+        return Check::passed(format!(
             "`{user}` can end the sessions of logins it creates, \
              because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
-        ))
-    } else if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-        let quoted = quote_ident(user);
-        Check::failed(format!(
-            "`{user}` can't end other roles' sessions: \
-             as a superuser, run ALTER ROLE {quoted} CREATEROLE, \
-             or GRANT pg_signal_backend TO {quoted}"
-        ))
-    } else {
-        let quoted = quote_ident(user);
-        Check::failed(format!(
-            "`{user}` can't end other roles' sessions: \
-             as a superuser, run GRANT pg_signal_backend TO {quoted}"
-        ))
+        ));
     }
+    let quoted = quote_ident(user);
+    if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+        let grant_fix = if rights.signal_backend_member || !rights.inherit {
+            format!("GRANT pg_signal_backend TO {quoted} WITH INHERIT TRUE")
+        } else {
+            format!("GRANT pg_signal_backend TO {quoted}")
+        };
+        return Check::failed(format!(
+            "`{user}` can't end other roles' sessions: \
+             as a superuser, run ALTER ROLE {quoted} CREATEROLE, or {grant_fix}"
+        ));
+    }
+    let prefix = if rights.create_role {
+        ""
+    } else {
+        "as a superuser, "
+    };
+    let fix = if !rights.inherit && rights.signal_backend_member {
+        format!("ALTER ROLE {quoted} INHERIT")
+    } else if !rights.inherit {
+        format!("GRANT pg_signal_backend TO {quoted} and ALTER ROLE {quoted} INHERIT")
+    } else {
+        format!("GRANT pg_signal_backend TO {quoted}")
+    };
+    Check::failed(format!(
+        "`{user}` can't end other roles' sessions: {prefix}run {fix}"
+    ))
 }
 
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-async fn connect(admin: &AdminLogin) -> Result<Client, String> {
+async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, String> {
     let endpoint = admin.endpoint();
     if endpoint.tls() == Tls::VerifyFull {
         return Err("TLS connections aren't supported yet: \
@@ -193,42 +216,122 @@ async fn connect(admin: &AdminLogin) -> Result<Client, String> {
         .connect_timeout(ADMIN_CONNECT_TIMEOUT)
         .connect(NoTls)
         .await
-        .map_err(|err| describe(&err))?;
+        .map_err(|err| describe_connect_error(alias, admin, &err))?;
     tokio::spawn(connection);
     Ok(client)
 }
 
-/// tokio-postgres's own message is generic ("db error"); the server's reason is its source.
-fn describe(err: &tokio_postgres::Error) -> String {
-    match err.source() {
-        Some(cause) => format!("{err}: {cause}"),
-        None => err.to_string(),
+/// Never prints the server's raw error text, because it can quote input fields.
+fn describe_connect_error(
+    alias: &DatabaseAlias,
+    admin: &AdminLogin,
+    err: &tokio_postgres::Error,
+) -> String {
+    if let Some(db) = err.as_db_error() {
+        return describe_db_connect_error(alias, admin.user(), db.code(), db.message());
     }
+    if let Some(io_err) = find_io_error(err) {
+        return format!(
+            "{io_err}: check that PostgreSQL is running and reachable, \
+             or run `dbvalet login {alias}` with the right host and port"
+        );
+    }
+    format!(
+        "couldn't establish a PostgreSQL session: check that PostgreSQL is running, \
+         or run `dbvalet login {alias}` again"
+    )
+}
+
+fn describe_db_connect_error(
+    alias: &DatabaseAlias,
+    user: &str,
+    code: &SqlState,
+    server_message: &str,
+) -> String {
+    let quoted = quote_ident(user);
+    if *code == SqlState::INVALID_PASSWORD {
+        return format!(
+            "password authentication failed: run `dbvalet login {alias}` again with the \
+             right password, or as a superuser run ALTER ROLE {quoted} VALID UNTIL 'infinity'"
+        );
+    }
+    if *code == SqlState::INVALID_AUTHORIZATION_SPECIFICATION {
+        if server_message.contains("not permitted to log in") {
+            return format!(
+                "role isn't permitted to log in: as a superuser, run ALTER ROLE {quoted} LOGIN"
+            );
+        }
+        if server_message.contains("does not exist") {
+            return format!(
+                "role doesn't exist: check the user name and run `dbvalet login {alias}` again"
+            );
+        }
+        return format!(
+            "the server rejected the login (SQLSTATE {}): check pg_hba.conf or run \
+             `dbvalet login {alias}` again",
+            code.code()
+        );
+    }
+    if *code == SqlState::INVALID_CATALOG_NAME {
+        return format!(
+            "database doesn't exist: run `dbvalet login {alias}` with an existing database \
+             in the connection string (when omitted, it defaults to the user name)"
+        );
+    }
+    format!(
+        "the server refused the connection (SQLSTATE {}): check the server logs or run \
+         `dbvalet login {alias}` again",
+        code.code()
+    )
+}
+
+fn describe_query_error(err: &tokio_postgres::Error) -> String {
+    if let Some(db) = err.as_db_error() {
+        return format!(
+            "the server returned SQLSTATE {}: check the admin role's access to pg_roles",
+            db.code().code()
+        );
+    }
+    "the connection ended before PostgreSQL answered: try running `dbvalet doctor` again".to_owned()
+}
+
+fn find_io_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a io::Error> {
+    let mut current = err.source();
+    while let Some(source) = current {
+        if let Some(io_err) = source.downcast_ref::<io::Error>() {
+            return Some(io_err);
+        }
+        current = source.source();
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn rights(
-        server_version: &str,
-        server_version_num: i32,
-        superuser: bool,
-        create_role: bool,
-        signal_backend: bool,
-    ) -> Rights {
+    fn pg(server_version: &str, server_version_num: i32) -> Rights {
         Rights {
             server_version: server_version.to_owned(),
             server_version_num,
-            superuser,
-            create_role,
-            signal_backend,
+            superuser: false,
+            create_role: false,
+            inherit: true,
+            signal_backend: false,
+            signal_backend_member: false,
         }
+    }
+
+    fn alias() -> DatabaseAlias {
+        "app".parse().unwrap()
     }
 
     #[test]
     fn postgresql_13_fails_the_version_check_and_names_14() {
-        let check = version_check(&rights("13.18", 130018, true, false, false));
+        let check = version_check(&Rights {
+            superuser: true,
+            ..pg("13.18", 130018)
+        });
         assert!(!check.passed);
         assert_eq!(
             check.message,
@@ -238,31 +341,43 @@ mod tests {
 
     #[test]
     fn postgresql_14_passes_the_version_check() {
-        let check = version_check(&rights("14.0", 140000, true, false, false));
+        let check = version_check(&Rights {
+            superuser: true,
+            ..pg("14.0", 140000)
+        });
         assert!(check.passed);
         assert_eq!(check.message, "PostgreSQL 14.0 is 14 or later");
     }
 
     #[test]
     fn a_superuser_passes_the_create_role_check() {
-        let check = create_role_check("admin", &rights("16.4", 160004, true, false, false));
+        let check = create_role_check(
+            "admin",
+            &Rights {
+                superuser: true,
+                ..pg("16.4", 160004)
+            },
+        );
         assert!(check.passed);
         assert_eq!(check.message, "`admin` is a superuser");
     }
 
     #[test]
     fn a_createrole_admin_passes_the_create_role_check() {
-        let check = create_role_check("admin", &rights("16.4", 160004, false, true, false));
+        let check = create_role_check(
+            "admin",
+            &Rights {
+                create_role: true,
+                ..pg("16.4", 160004)
+            },
+        );
         assert!(check.passed);
         assert_eq!(check.message, "`admin` has CREATEROLE");
     }
 
     #[test]
     fn an_admin_without_createrole_fails_with_a_quoted_alter_role_command() {
-        let check = create_role_check(
-            "postgres.proj-1",
-            &rights("16.4", 160004, false, false, false),
-        );
+        let check = create_role_check("postgres.proj-1", &pg("16.4", 160004));
         assert!(!check.passed);
         assert_eq!(
             check.message,
@@ -273,7 +388,13 @@ mod tests {
 
     #[test]
     fn a_superuser_can_end_sessions() {
-        let check = end_sessions_check("admin", &rights("14.12", 140012, true, false, false));
+        let check = end_sessions_check(
+            "admin",
+            &Rights {
+                superuser: true,
+                ..pg("14.12", 140012)
+            },
+        );
         assert!(check.passed);
         assert_eq!(
             check.message,
@@ -283,7 +404,15 @@ mod tests {
 
     #[test]
     fn an_admin_with_pg_signal_backend_can_end_sessions_before_postgresql_16() {
-        let check = end_sessions_check("admin", &rights("14.12", 140012, false, true, true));
+        let check = end_sessions_check(
+            "admin",
+            &Rights {
+                create_role: true,
+                signal_backend: true,
+                signal_backend_member: true,
+                ..pg("14.12", 140012)
+            },
+        );
         assert!(check.passed);
         assert_eq!(
             check.message,
@@ -293,7 +422,13 @@ mod tests {
 
     #[test]
     fn a_createrole_admin_on_postgresql_16_can_end_sessions() {
-        let check = end_sessions_check("admin", &rights("16.0", 160000, false, true, false));
+        let check = end_sessions_check(
+            "admin",
+            &Rights {
+                create_role: true,
+                ..pg("16.0", 160000)
+            },
+        );
         assert!(check.passed);
         assert_eq!(
             check.message,
@@ -304,18 +439,62 @@ mod tests {
 
     #[test]
     fn a_createrole_admin_before_postgresql_16_without_pg_signal_backend_is_told_to_grant_it() {
-        let check = end_sessions_check("app-admin", &rights("14.12", 140012, false, true, false));
+        let check = end_sessions_check(
+            "app-admin",
+            &Rights {
+                create_role: true,
+                ..pg("14.12", 140012)
+            },
+        );
         assert!(!check.passed);
         assert_eq!(
             check.message,
             "`app-admin` can't end other roles' sessions: \
-             as a superuser, run GRANT pg_signal_backend TO \"app-admin\""
+             run GRANT pg_signal_backend TO \"app-admin\""
+        );
+    }
+
+    #[test]
+    fn a_noinherit_createrole_admin_holding_pg_signal_backend_before_16_is_told_to_enable_inherit()
+    {
+        let check = end_sessions_check(
+            "app-admin",
+            &Rights {
+                create_role: true,
+                inherit: false,
+                signal_backend_member: true,
+                ..pg("14.12", 140012)
+            },
+        );
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`app-admin` can't end other roles' sessions: \
+             run ALTER ROLE \"app-admin\" INHERIT"
+        );
+    }
+
+    #[test]
+    fn a_noinherit_plain_admin_before_16_is_told_as_superuser_to_grant_and_enable_inherit() {
+        let check = end_sessions_check(
+            "plain",
+            &Rights {
+                inherit: false,
+                ..pg("14.12", 140012)
+            },
+        );
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`plain` can't end other roles' sessions: \
+             as a superuser, run GRANT pg_signal_backend TO \"plain\" \
+             and ALTER ROLE \"plain\" INHERIT"
         );
     }
 
     #[test]
     fn an_admin_without_createrole_on_postgresql_16_is_told_to_add_createrole_first() {
-        let check = end_sessions_check("Db\"Admin", &rights("16.4", 160004, false, false, false));
+        let check = end_sessions_check("Db\"Admin", &pg("16.4", 160004));
         assert!(!check.passed);
         assert_eq!(
             check.message,
@@ -323,5 +502,56 @@ mod tests {
              as a superuser, run ALTER ROLE \"Db\"\"Admin\" CREATEROLE, \
              or GRANT pg_signal_backend TO \"Db\"\"Admin\""
         );
+    }
+
+    #[test]
+    fn a_noinherit_admin_without_createrole_on_postgresql_16_is_told_grant_with_inherit_true() {
+        let check = end_sessions_check(
+            "plain",
+            &Rights {
+                inherit: false,
+                signal_backend_member: true,
+                ..pg("17.0", 170000)
+            },
+        );
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`plain` can't end other roles' sessions: \
+             as a superuser, run ALTER ROLE \"plain\" CREATEROLE, \
+             or GRANT pg_signal_backend TO \"plain\" WITH INHERIT TRUE"
+        );
+    }
+
+    #[test]
+    fn connect_errors_name_fixes_without_echoing_raw_server_text() {
+        let wrong_pw = describe_db_connect_error(
+            &alias(),
+            "admin",
+            &SqlState::INVALID_PASSWORD,
+            "password authentication failed for user \"leaked-raw\"",
+        );
+        assert!(wrong_pw.contains("dbvalet login app"));
+        assert!(wrong_pw.contains("ALTER ROLE \"admin\" VALID UNTIL 'infinity'"));
+        assert!(!wrong_pw.contains("leaked-raw"));
+
+        let nologin = describe_db_connect_error(
+            &alias(),
+            "admin",
+            &SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+            "role \"leaked-raw\" is not permitted to log in",
+        );
+        assert!(nologin.contains("ALTER ROLE \"admin\" LOGIN"));
+        assert!(!nologin.contains("leaked-raw"));
+
+        let missing_db = describe_db_connect_error(
+            &alias(),
+            "admin",
+            &SqlState::INVALID_CATALOG_NAME,
+            "database \"leaked-raw\" does not exist",
+        );
+        assert!(missing_db.contains("dbvalet login app"));
+        assert!(missing_db.contains("defaults to the user name"));
+        assert!(!missing_db.contains("leaked-raw"));
     }
 }

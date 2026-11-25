@@ -6,7 +6,7 @@ use keyring_core::{CredentialStore, Entry};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::DatabaseAlias;
-use crate::endpoint::{Endpoint, EndpointError};
+use crate::endpoint::{self, Endpoint, EndpointError};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("dbvalet supports macOS and Linux only");
@@ -40,7 +40,7 @@ impl AdminLogin {
     }
 }
 
-/// No variant carries any part of the connection string beyond its host and user.
+/// No variant carries any part of the connection string beyond a validated host.
 #[derive(Debug, thiserror::Error)]
 pub enum KeychainError {
     #[error("no admin login is stored for `{alias}`: run `dbvalet login {alias}`")]
@@ -109,10 +109,21 @@ fn parse(
         alias: alias.clone(),
         problem,
     };
-    let config: tokio_postgres::Config = connection_string
-        .expose_secret()
+    let raw = connection_string.expose_secret();
+    if raw.chars().any(|c| c.is_control() || c == '\u{FFFD}') {
+        return Err(bad("it contains control or invalid characters"));
+    }
+    let url_has_userinfo = validate_url(raw).map_err(bad)?;
+
+    let config: tokio_postgres::Config = raw
         .parse()
         .map_err(|_| bad("it isn't a PostgreSQL connection string"))?;
+
+    if url_has_userinfo == Some(false) && config.get_password().is_some() {
+        return Err(bad(
+            "put the password before `@` (percent-encoded), not as a query parameter",
+        ));
+    }
 
     let host = match config.get_hosts() {
         [tokio_postgres::config::Host::Tcp(host)] if !host.is_empty() => host.clone(),
@@ -120,6 +131,9 @@ fn parse(
         [_] => return Err(bad("a Unix socket isn't supported, name a TCP host")),
         _ => return Err(bad("it names more than one host")),
     };
+    if !endpoint::is_valid_host(&host) {
+        return Err(bad("its host isn't a valid hostname or IP address"));
+    }
     if !config.get_hostaddrs().is_empty() {
         return Err(bad(
             "`hostaddr` isn't supported, name the address as the host",
@@ -145,12 +159,56 @@ fn parse(
         Some(database) => database,
         None => user,
     };
+    if !endpoint::is_valid_database(database) {
+        return Err(bad("its database name isn't valid"));
+    }
 
     Ok(AdminLogin {
         endpoint: Endpoint::new(host, port, database.to_owned(), allow_plaintext)?,
         user: user.to_owned(),
         password: SecretString::from(password),
     })
+}
+
+/// Checks URL structure before tokio-postgres parses it, because tokio-postgres splits
+/// credentials at the first `@` across the whole string. Returns `Some(has_userinfo)` for URLs.
+fn validate_url(raw: &str) -> Result<Option<bool>, &'static str> {
+    let Some(rest) = raw
+        .strip_prefix("postgres://")
+        .or_else(|| raw.strip_prefix("postgresql://"))
+    else {
+        return Ok(None);
+    };
+    let (before_query, query) = match rest.split_once('?') {
+        Some((before, after)) => (before, Some(after)),
+        None => (rest, None),
+    };
+    if let Some(query) = query {
+        if query.contains('@') {
+            return Err("percent-encode `@` as `%40` in the connection string");
+        }
+        for pair in query.split('&') {
+            if pair
+                .split_once('=')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("password") || key.contains('%'))
+            {
+                return Err(
+                    "put the password before `@` (percent-encoded), not as a query parameter",
+                );
+            }
+        }
+    }
+    let at_count = before_query.bytes().filter(|&b| b == b'@').count();
+    if at_count > 1 {
+        return Err("it has more than one `@`: percent-encode `@` as `%40` in the password");
+    }
+    if let Some((creds, _)) = before_query.split_once('@') {
+        if creds.contains('/') {
+            return Err("percent-encode `/` as `%2F` in the user or password");
+        }
+        return Ok(Some(true));
+    }
+    Ok(Some(false))
 }
 
 /// Drops the payloads of keyring errors that carry the stored secret's bytes.
@@ -326,5 +384,79 @@ mod tests {
             }
         ));
         assert_hides_password(&multiple_ports);
+    }
+
+    #[test]
+    fn a_password_with_an_unencoded_at_sign_is_refused_without_printing_it() {
+        let err = parse_error("postgresql://admin:se@pw-unit-7f3a9c@localhost:5432/postgres");
+        assert!(matches!(err, KeychainError::BadConnectionString { .. }));
+        assert_hides_password(&err);
+    }
+
+    #[test]
+    fn a_password_with_an_unencoded_at_and_slash_is_refused_without_printing_it() {
+        let err = parse_error("postgresql://admin:se@thr/pw-unit-7f3a9c@localhost:5432/postgres");
+        assert!(matches!(err, KeychainError::BadConnectionString { .. }));
+        assert_hides_password(&err);
+    }
+
+    #[test]
+    fn a_password_in_a_url_query_parameter_is_refused_without_printing_it() {
+        let with_at = parse_error(
+            "postgresql://localhost:5432/postgres?user=admin&password=pw-unit-7f3a9c@x",
+        );
+        assert!(matches!(with_at, KeychainError::BadConnectionString { .. }));
+        assert_hides_password(&with_at);
+
+        let plain =
+            parse_error("postgresql://localhost:5432/postgres?user=admin&password=pw-unit-7f3a9c");
+        assert!(matches!(plain, KeychainError::BadConnectionString { .. }));
+        assert_hides_password(&plain);
+    }
+
+    #[test]
+    fn a_host_or_database_with_invalid_characters_is_refused() {
+        let bad_host = parse_error("host='bad host' user=admin password=pw-unit-7f3a9c");
+        assert!(matches!(
+            bad_host,
+            KeychainError::BadConnectionString { .. }
+        ));
+        assert_hides_password(&bad_host);
+
+        let slash_db =
+            parse_error("host=localhost dbname='bad/db' user=admin password=pw-unit-7f3a9c");
+        assert!(matches!(
+            slash_db,
+            KeychainError::BadConnectionString { .. }
+        ));
+        assert_hides_password(&slash_db);
+
+        let newline_db = parse_error(
+            "host=localhost dbname='postgres\nsecond' user=admin password=pw-unit-7f3a9c",
+        );
+        assert!(matches!(
+            newline_db,
+            KeychainError::BadConnectionString { .. }
+        ));
+        assert_hides_password(&newline_db);
+    }
+
+    #[test]
+    fn a_connection_string_containing_a_replacement_character_is_refused() {
+        let err = parse_error("postgresql://admin:pw-unit-7f3a9c\u{FFFD}@localhost:5432/postgres");
+        assert!(matches!(err, KeychainError::BadConnectionString { .. }));
+        assert_hides_password(&err);
+    }
+
+    #[test]
+    fn percent_encoded_at_and_slash_in_a_password_are_accepted() {
+        let login = parse(
+            &alias(),
+            &SecretString::from("postgresql://admin:se%40cr%2Fet@localhost:5432/postgres"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(login.endpoint().to_string(), "localhost:5432/postgres");
+        assert_eq!(login.password().expose_secret(), "se@cr/et");
     }
 }
