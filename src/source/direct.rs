@@ -62,17 +62,37 @@ impl CredentialSource for DirectSource {
                     "SELECT current_setting('server_version'),
                             current_setting('server_version_num')::int,
                             to_char((now() + interval '{LEASE_AHEAD}') AT TIME ZONE 'UTC',
-                                    'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                            rolsuper,
+                            rolinherit
+                     FROM pg_roles
+                     WHERE rolname = current_user"
                 ),
                 &[],
             )
             .await
             .map_err(create_failed)?;
-        let (version, version_num, valid_until): (String, i32, String) =
-            (server.get(0), server.get(1), server.get(2));
-        if version_num < MINIMUM_SERVER_VERSION_NUM {
-            return Err(SourceError::TooOld { version });
-        }
+        let (version, version_num, valid_until, superuser, inherit): (
+            String,
+            i32,
+            String,
+            bool,
+            bool,
+        ) = (
+            server.get(0),
+            server.get(1),
+            server.get(2),
+            server.get(3),
+            server.get(4),
+        );
+        check_mint_prerequisites(
+            &self.alias,
+            self.admin.user(),
+            &version,
+            version_num,
+            superuser,
+            inherit,
+        )?;
 
         let user = new_login_name().map_err(SourceError::Random)?;
         let password = random_base32(LOGIN_PASSWORD_BYTES).map_err(SourceError::Random)?;
@@ -110,8 +130,34 @@ impl CredentialSource for DirectSource {
             alias: self.alias.clone(),
             admin: Arc::clone(&self.admin),
             member_of: grant.member_of.clone(),
+            read_only: grant.read_only,
         })
     }
+}
+
+/// Refuses versions and admin settings under which dbvalet can't drop the login it creates.
+fn check_mint_prerequisites(
+    alias: &DatabaseAlias,
+    user: &str,
+    version: &str,
+    version_num: i32,
+    superuser: bool,
+    inherit: bool,
+) -> Result<(), SourceError> {
+    if version_num < MINIMUM_SERVER_VERSION_NUM {
+        return Err(SourceError::TooOld {
+            version: version.to_owned(),
+        });
+    }
+    if !superuser && version_num < CREATEROLE_SELF_GRANT_VERSION_NUM && !inherit {
+        return Err(SourceError::AdminNoInherit {
+            alias: alias.clone(),
+            user: user.to_owned(),
+            quoted: quote_ident(user),
+            version: version.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// `dbvalet_` and 16 lowercase base32 characters, safe unquoted in SQL.
@@ -122,12 +168,13 @@ fn new_login_name() -> Result<String, getrandom::Error> {
     ))
 }
 
-/// Ends the login's sessions, hands anything it owns to its group role, and drops it.
+/// Ends the login's sessions, clears or reassigns what it owns, and drops it.
 pub(super) async fn drop_login(
     alias: &DatabaseAlias,
     admin: &AdminLogin,
     user: &str,
     member_of: &str,
+    read_only: bool,
 ) -> Result<(), SourceError> {
     let drop_failed = |reason| SourceError::DropLogin {
         login: user.to_owned(),
@@ -155,16 +202,29 @@ pub(super) async fn drop_login(
             "{remaining} of its sessions didn't end within {SESSION_END_TIMEOUT_MS} ms"
         )));
     }
-    let login = quote_ident(user);
     client
-        .batch_execute(&format!(
-            "REASSIGN OWNED BY {login} TO {group};
-             DROP OWNED BY {login};
-             DROP ROLE {login};",
-            group = quote_ident(member_of),
-        ))
+        .batch_execute(&drop_login_sql(user, member_of, read_only))
         .await
         .map_err(|err| drop_failed(describe_sql_error(&err)))
+}
+
+fn drop_login_sql(user: &str, member_of: &str, read_only: bool) -> String {
+    let login = quote_ident(user);
+    if read_only {
+        // Read-only runs never transfer objects to the group role, so anything created
+        // despite read-only defaults (such as large objects before PostgreSQL 16) is dropped.
+        format!(
+            "DROP OWNED BY {login};
+             DROP ROLE {login};"
+        )
+    } else {
+        let group = quote_ident(member_of);
+        format!(
+            "REASSIGN OWNED BY {login} TO {group};
+             DROP OWNED BY {login};
+             DROP ROLE {login};"
+        )
+    }
 }
 
 /// One line of `dbvalet doctor`'s report.
@@ -727,5 +787,56 @@ mod tests {
         assert!(missing_db.contains("dbvalet login app"));
         assert!(missing_db.contains("defaults to the user name"));
         assert!(!missing_db.contains("leaked-raw"));
+    }
+
+    #[test]
+    fn mint_refuses_a_noinherit_non_superuser_before_postgresql_16() {
+        let err = check_mint_prerequisites(&alias(), "app-admin", "15.8", 150008, false, false)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, SourceError::AdminNoInherit { .. }));
+        assert!(
+            message.contains("ALTER ROLE \"app-admin\" INHERIT"),
+            "{message}"
+        );
+        assert!(message.contains("dbvalet doctor app"), "{message}");
+    }
+
+    #[test]
+    fn mint_allows_a_noinherit_admin_when_superuser_or_on_postgresql_16_or_later() {
+        assert!(check_mint_prerequisites(&alias(), "super", "14.12", 140012, true, false).is_ok());
+        assert!(check_mint_prerequisites(&alias(), "admin", "14.12", 140012, false, true).is_ok());
+        assert!(check_mint_prerequisites(&alias(), "admin", "16.0", 160000, false, false).is_ok());
+    }
+
+    #[test]
+    fn dropping_a_read_only_login_skips_reassign_owned() {
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_reader", true);
+        assert!(!sql.contains("REASSIGN OWNED"), "{sql}");
+        assert!(
+            sql.contains("DROP OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP ROLE \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_writable_login_reassigns_owned_objects_to_its_group() {
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_writer", false);
+        assert!(
+            sql.contains("REASSIGN OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\" TO \"dbvalet_writer\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP ROLE \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
     }
 }

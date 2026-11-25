@@ -1,7 +1,7 @@
 //! One run: a temporary login, the proxy in front of it, and the child behind the proxy.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitStatus;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -45,7 +45,7 @@ pub async fn run<S: CredentialSource>(
     let lease = source.mint(grant).await?;
     let finished = run_child(lease.login(), upstream, command).await;
     if let Err(err) = lease.release().await {
-        eprintln!("dbvalet: {err}");
+        let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
     finished
 }

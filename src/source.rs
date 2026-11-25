@@ -37,6 +37,16 @@ pub enum SourceError {
     },
     #[error("PostgreSQL {version} is too old: dbvalet needs 14 or later")]
     TooOld { version: String },
+    #[error(
+        "the admin login `{user}` has NOINHERIT on PostgreSQL {version}, so it can't drop \
+         temporary logins it creates: run ALTER ROLE {quoted} INHERIT, or run `dbvalet doctor {alias}`"
+    )]
+    AdminNoInherit {
+        alias: DatabaseAlias,
+        user: String,
+        quoted: String,
+        version: String,
+    },
     #[error("couldn't create a temporary login: {reason}")]
     CreateLogin { reason: String },
     #[error(
@@ -63,6 +73,7 @@ pub struct Lease {
     alias: DatabaseAlias,
     admin: Arc<AdminLogin>,
     member_of: String,
+    read_only: bool,
 }
 
 impl Lease {
@@ -72,7 +83,14 @@ impl Lease {
 
     /// Ends the login's sessions and drops it.
     pub async fn release(self) -> Result<(), SourceError> {
-        direct::drop_login(&self.alias, &self.admin, self.login.user(), &self.member_of).await
+        direct::drop_login(
+            &self.alias,
+            &self.admin,
+            self.login.user(),
+            &self.member_of,
+            self.read_only,
+        )
+        .await
     }
 }
 

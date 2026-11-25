@@ -814,3 +814,198 @@ fn a_teardown_failure_is_printed_and_the_child_exit_code_is_still_returned() {
         "{stderr}"
     );
 }
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_noinherit_createrole_admin_before_postgresql_16_is_refused_without_creating_a_login() {
+    if server_version_num() >= 160000 {
+        return;
+    }
+    superuser_sql(
+        "DROP ROLE IF EXISTS e2e_run_noinherit_old;
+         DROP ROLE IF EXISTS e2e_noinherit_old_group;
+         CREATE ROLE e2e_noinherit_old_group NOLOGIN;
+         CREATE ROLE e2e_run_noinherit_old LOGIN CREATEROLE NOINHERIT
+             PASSWORD 'pw-e2e-run-noinherit-old-admin';
+         GRANT e2e_noinherit_old_group TO e2e_run_noinherit_old WITH ADMIN OPTION;",
+    );
+    let stored = login(
+        "e2e-run-noinherit-old",
+        "postgresql://e2e_run_noinherit_old:pw-e2e-run-noinherit-old-admin@localhost:5432/postgres",
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-run-noinherit-old");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-run-noinherit-old.roles]\n\
+         reader = { member_of = \"e2e_noinherit_old_group\", read_only = true }\n",
+    )
+    .unwrap();
+
+    let output = run_in(&dir, &["sh", "-c", "echo \"$PGUSER\""]);
+
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "child should not run, stdout: {}",
+        text(&output.stdout)
+    );
+    assert!(
+        stderr.contains("ALTER ROLE \"e2e_run_noinherit_old\" INHERIT"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("dbvalet doctor"), "stderr: {stderr}");
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*)
+             FROM pg_roles r
+             JOIN pg_auth_members m ON m.member = r.oid
+             JOIN pg_roles g ON g.oid = m.roleid
+             WHERE g.rolname = $1 AND r.rolname LIKE 'dbvalet_%'",
+            "e2e_noinherit_old_group"
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_noinherit_createrole_admin_on_postgresql_16_or_later_runs_and_drops_its_login() {
+    if server_version_num() < 160000 {
+        return;
+    }
+    let dir = project_with_reader_and_admin("e2e-run-noinherit-16", "CREATEROLE NOINHERIT");
+
+    let output = run_in(
+        &dir,
+        &["sh", "-c", "echo \"$PGUSER\"; psql -qAtc 'SELECT 1'"],
+    );
+
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    let login_name = stdout.lines().next().unwrap().to_owned();
+    assert_eq!(stdout, format!("{login_name}\n1\n"));
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_teardown_failure_with_a_closed_stderr_pipe_still_returns_the_child_exit_code() {
+    let dir = project_with_reader("e2e-run-closed-stderr");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg("echo \"login=$PGUSER\"; read line; exit 7")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first_line = String::new();
+    BufReader::new(run.stdout.take().unwrap())
+        .read_line(&mut first_line)
+        .unwrap();
+    let login_name = first_line.trim().strip_prefix("login=").unwrap().to_owned();
+
+    // Close dbvalet's stderr pipe so printing the teardown failure hits BrokenPipe.
+    drop(run.stderr.take());
+    superuser_sql("ALTER ROLE e2e_run_closed_stderr NOLOGIN;");
+    run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let status = run.wait().unwrap();
+    superuser_sql(&format!("DROP ROLE {login_name};"));
+
+    assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_read_only_run_leaves_no_large_objects_after_teardown() {
+    let dir = project_with_reader_and_admin("e2e-run-read-only-lo", "CREATEROLE");
+
+    let output = run_in(
+        &dir,
+        &[
+            "sh",
+            "-c",
+            "echo \"login=$PGUSER\"; \
+             psql -v ON_ERROR_STOP=1 -qAtc \
+             \"SELECT lo_from_bytea(0, 'written by a read-only run')\"",
+        ],
+    );
+
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    let mut lines = stdout.lines();
+    let login_name = lines
+        .next()
+        .unwrap()
+        .strip_prefix("login=")
+        .unwrap()
+        .to_owned();
+
+    if server_version_num() < 160000 {
+        assert!(output.status.success(), "stderr: {stderr}");
+        assert!(stderr.is_empty(), "stderr: {stderr}");
+        let oid: u32 = lines.next().unwrap().parse().unwrap();
+        let remaining_lo: i64 = runtime().block_on(async {
+            let (client, connection) =
+                tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
+                    .await
+                    .unwrap();
+            tokio::spawn(connection);
+            client
+                .query_one(
+                    "SELECT count(*) FROM pg_largeobject_metadata WHERE oid = $1",
+                    &[&oid],
+                )
+                .await
+                .unwrap()
+                .get(0)
+        });
+        assert_eq!(remaining_lo, 0, "large object {oid} survived teardown");
+    } else {
+        assert!(!output.status.success(), "stdout: {stdout}");
+        assert!(
+            stderr.contains("cannot execute lo_from_bytea() in a read-only transaction"),
+            "stderr: {stderr}"
+        );
+        let remaining_lo: i64 = runtime().block_on(async {
+            let (client, connection) =
+                tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
+                    .await
+                    .unwrap();
+            tokio::spawn(connection);
+            client
+                .query_one("SELECT count(*) FROM pg_largeobject_metadata", &[])
+                .await
+                .unwrap()
+                .get(0)
+        });
+        assert_eq!(remaining_lo, 0);
+    }
+
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+}
