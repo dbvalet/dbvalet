@@ -1,4 +1,6 @@
-//! The binary's behaviour that needs neither a database nor a keychain.
+//! The binary's behaviour that needs no database.
+//!
+//! `login` tests use only `cli-test-*` aliases and inputs refused before anything is stored.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -19,7 +21,7 @@ fn version_prints_the_crate_version_and_exits_zero() {
 #[test]
 fn login_with_a_malformed_connection_string_fails_without_printing_the_password() {
     let mut login = Command::new(DBVALET)
-        .args(["login", "app"])
+        .args(["login", "cli-test-malformed"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
