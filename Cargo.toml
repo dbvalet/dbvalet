@@ -7,7 +7,13 @@ rust-version = "1.98"
 license = "Apache-2.0"
 description = "Run an AI coding agent with a temporary PostgreSQL login it never sees."
 repository = "https://github.com/dbvalet/dbvalet"
+homepage = "https://github.com/dbvalet/dbvalet"
 publish = false
+
+# Releases ship as binaries and a Homebrew formula, so dist must build this
+# package even though `publish = false` keeps it off crates.io.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 
@@ -16,3 +22,8 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
