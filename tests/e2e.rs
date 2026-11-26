@@ -1332,6 +1332,43 @@ fn a_ledger_entry_whose_login_was_never_created_is_removed_by_gc() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_keeps_the_ledger_until_the_creation_transaction_finishes() {
+    let dir = project_with_reader("e2e-gc-unsettled-creation");
+    let _sweeping = sweeping();
+    let login = "dbvalet_pendingcreationa";
+    superuser_sql("DROP ROLE IF EXISTS dbvalet_pendingcreationa;");
+    let rt = runtime();
+    let creator = rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client.batch_execute("BEGIN").await.unwrap();
+        client
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&login],
+            )
+            .await
+            .unwrap();
+        client
+    });
+    let entry = ledger_entry(&dir, "e2e-gc-unsettled-creation", login);
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, "read-only\n").unwrap();
+
+    let swept = gc_in(&dir);
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert!(entry.exists());
+
+    rt.block_on(creator.batch_execute("ROLLBACK")).unwrap();
+    let swept = gc_in(&dir);
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert!(!entry.exists());
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
     let dir = project_with_reader("e2e-gc-expired-read-only");
     let _alone = sweeping_alone();

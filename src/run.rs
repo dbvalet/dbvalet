@@ -10,7 +10,7 @@ use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
 use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT, WaitOutcome};
-use crate::source::{CredentialSource, SourceError, UpstreamLogin};
+use crate::source::{CredentialSource, MintOutcome, SourceError, UpstreamLogin};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -54,7 +54,10 @@ pub async fn run<S: CredentialSource>(
     if let Some(signal) = signals.poll_pending().await {
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
-    let lease = source.mint(grant).await?;
+    let lease = match source.mint(grant, signals.next_signal()).await? {
+        MintOutcome::Created(lease) => lease,
+        MintOutcome::Interrupted(signal) => return Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
+    };
     let finished = match signals.poll_pending().await {
         Some(signal) => Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
         None => run_child(&mut signals, lease.login(), upstream, command).await,

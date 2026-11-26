@@ -119,11 +119,18 @@ impl RunSignals {
         tokio::task::yield_now().await;
         tokio::select! {
             biased;
-
-            Some(()) = self.terminate.recv() => Some(Signal::SIGTERM as i32),
-            Some(()) = self.hangup.recv() => Some(Signal::SIGHUP as i32),
-            Some(()) = self.interrupt.recv() => Some(Signal::SIGINT as i32),
+            signal = self.next_signal() => Some(signal),
             () = std::future::ready(()) => None,
+        }
+    }
+
+    pub(crate) async fn next_signal(&mut self) -> i32 {
+        tokio::select! {
+            biased;
+            Some(()) = self.terminate.recv() => Signal::SIGTERM as i32,
+            Some(()) = self.hangup.recv() => Signal::SIGHUP as i32,
+            Some(()) = self.interrupt.recv() => Signal::SIGINT as i32,
+            else => std::future::pending().await,
         }
     }
 
