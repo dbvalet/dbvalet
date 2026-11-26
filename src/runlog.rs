@@ -421,9 +421,17 @@ fn redact_uri_passwords(text: &str) -> String {
     while let Some(rel_sep) = text[cursor..].find("://") {
         let authority_start = cursor + rel_sep + 3;
         out.push_str(&text[cursor..authority_start]);
-        let authority_end = text[authority_start..]
-            .find(|c: char| c.is_whitespace() || c == '/')
-            .map_or(text.len(), |offset| authority_start + offset);
+        let rest = &text[authority_start..];
+        // Stop before any following `://` as well as `/` or whitespace so a pathless URI
+        // never swallows the scheme separator of a second URI in the same argument or string.
+        let authority_end = [
+            rest.find(|c: char| c.is_whitespace() || c == '/'),
+            rest.find("://"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(text.len(), |offset| authority_start + offset);
         let authority = &text[authority_start..authority_end];
         if let Some(at) = authority.rfind('@')
             && let Some(colon) = authority[..at].find(':')
@@ -1653,5 +1661,32 @@ mod tests {
         );
         assert!(!combined.contains("pw-dbg-99"), "{combined}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_uri_without_whitespace_in_a_command_argument_is_redacted() {
+        let secrets = sample_secrets();
+        let cmd = vec![
+            OsString::from("psql"),
+            OsString::from("-c"),
+            OsString::from("SELECT dblink('postgresql://a','postgresql://u:pw-r2-20@h/db')"),
+        ];
+        let formatted = format_command(&cmd, &secrets);
+        assert_eq!(
+            formatted,
+            "psql -c \"SELECT dblink('postgresql://a','postgresql://u:[REDACTED]@h/db')\""
+        );
+    }
+
+    #[test]
+    fn a_second_uri_without_whitespace_in_a_sql_literal_is_redacted() {
+        assert_eq!(
+            redact_sql("SELECT 'postgresql://a,postgresql://u:pw-r2-11@h/db'"),
+            "SELECT 'postgresql://a,postgresql://u:[REDACTED]@h/db'"
+        );
+        assert_eq!(
+            redact_sql("SELECT 'postgresql://u1:pw1@h1,postgresql://u2:pw2@h2/db'"),
+            "SELECT 'postgresql://u1:[REDACTED]@h1,postgresql://u2:[REDACTED]@h2/db'"
+        );
     }
 }
