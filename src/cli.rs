@@ -298,6 +298,10 @@ mod tests {
         use crate::signals::TerminationSignal;
 
         assert_eq!(
+            exit_code(WaitOutcome::TimedOut(TerminationSignal::Interrupt)),
+            ExitCode::from(130)
+        );
+        assert_eq!(
             exit_code(WaitOutcome::TimedOut(TerminationSignal::Terminate)),
             ExitCode::from(143)
         );

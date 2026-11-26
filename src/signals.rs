@@ -1,9 +1,15 @@
 //! Signal handling and parent-death wiring for a run's child process.
 //!
 //! dbvalet and its child share the terminal's process group:
-//! - On `SIGINT`, dbvalet keeps waiting for the child (which received `SIGINT` too).
+//! - On the first `SIGINT`, dbvalet prints a short hint on stderr and keeps waiting for
+//!   the child (which received `SIGINT` too). A second `SIGINT` (from the process group
+//!   or sent to dbvalet's PID alone) forwards `SIGTERM` to the child and starts the same
+//!   [`SIGNAL_WAIT_TIMEOUT`] deadline as `SIGTERM` (exiting with the child's code, or
+//!   `130` on timeout).
 //! - On `SIGTERM` or `SIGHUP`, dbvalet forwards the signal to the child, waits up to
-//!   [`SIGNAL_WAIT_TIMEOUT`], and lets teardown proceed whether or not the child exited.
+//!   [`SIGNAL_WAIT_TIMEOUT`], and lets teardown proceed whether or not the child exited
+//!   (exiting with the child's code, or `143` / `129` on timeout). Earlier deadlines are
+//!   never extended by subsequent signals.
 //! - On Linux, the child receives `PR_SET_PDEATHSIG(SIGTERM)` via an internal self-exec
 //!   shim so it exits if dbvalet is killed with `SIGKILL`. macOS has no equivalent kernel
 //!   mechanism; an orphaned child there keeps running without database access once the
@@ -12,9 +18,7 @@
 #[cfg(any(target_os = "linux", test))]
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::io;
-#[cfg(target_os = "linux")]
-use std::io::Write;
+use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::pin::Pin;
@@ -44,9 +48,10 @@ const SELF_EXE: &str = "/proc/self/exe";
 #[cfg(target_os = "linux")]
 static PDEATHSIG_SHIM_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Signals that dbvalet forwards to the child before running a bounded-wait teardown.
+/// Signals that can trigger a bounded-wait teardown of the run's child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminationSignal {
+    Interrupt,
     Terminate,
     Hangup,
 }
@@ -62,6 +67,7 @@ impl TerminationSignal {
 
     fn as_nix(self) -> Signal {
         match self {
+            Self::Interrupt => Signal::SIGINT,
             Self::Terminate => Signal::SIGTERM,
             Self::Hangup => Signal::SIGHUP,
         }
@@ -73,7 +79,7 @@ impl TerminationSignal {
 pub enum WaitOutcome {
     /// The child exited before any teardown deadline elapsed.
     Exited(ExitStatus),
-    /// A signal arrived after minting the login and before spawning the child.
+    /// A signal arrived before the child was spawned.
     SignalledBeforeSpawn(i32),
     /// dbvalet forwarded the signal and the child didn't exit within the grace period.
     TimedOut(TerminationSignal),
@@ -136,9 +142,10 @@ impl RunSignals {
 
     /// Waits for `child` to exit while handling `SIGINT`, `SIGTERM` and `SIGHUP`.
     ///
-    /// On `SIGINT`, waits for `child` without forwarding a second signal. On `SIGTERM` or
-    /// `SIGHUP`, forwards the signal to `child` and returns [`WaitOutcome::TimedOut`] if
-    /// `child` hasn't exited within `timeout`.
+    /// On the first `SIGINT`, prints a hint and waits for `child` without forwarding a
+    /// duplicate signal. On a second `SIGINT`, forwards `SIGTERM` to `child` and starts
+    /// `timeout` (returning `TimedOut(Interrupt)` if `child` doesn't exit in time). On
+    /// `SIGTERM` or `SIGHUP`, forwards the signal to `child` and starts `timeout`.
     pub async fn wait(&mut self, child: &mut Child, timeout: Duration) -> io::Result<WaitOutcome> {
         // Capture the PID before polling `wait()` to completion: until `waitpid` reaps the
         // child, its PID stays reserved in the process table and cannot be reused.
@@ -149,6 +156,7 @@ impl RunSignals {
         let child_exit = child.wait();
         tokio::pin!(child_exit);
 
+        let mut interrupted_once = false;
         let mut triggered: Option<TerminationSignal> = None;
         let mut deadline: Option<Pin<Box<Sleep>>> = None;
 
@@ -164,17 +172,32 @@ impl RunSignals {
                     return Ok(WaitOutcome::TimedOut(signal));
                 }
                 Some(()) = self.interrupt.recv() => {
-                    // dbvalet and the child share the terminal's process group, so Ctrl-C
-                    // already reached the child; keep waiting until it exits.
+                    if triggered.is_some() {
+                        // A teardown deadline is already running; don't print the first-Ctrl-C
+                        // hint or extend the existing deadline.
+                    } else if !interrupted_once {
+                        // dbvalet and the child share the terminal's process group, so Ctrl-C
+                        // already reached the child; wait for it to exit cleanly.
+                        interrupted_once = true;
+                        let _ = writeln!(
+                            io::stderr(),
+                            "dbvalet: waiting for the command to exit; press Ctrl-C again to stop it and drop the temporary login"
+                        );
+                    } else {
+                        // A second SIGINT (from the group or sent to dbvalet's PID alone)
+                        // forces teardown the same way SIGTERM does.
+                        forward_signal(child_pid, Signal::SIGTERM);
+                        arm_deadline(&mut triggered, &mut deadline, TerminationSignal::Interrupt, timeout);
+                    }
                 }
                 Some(()) = self.terminate.recv() => {
-                    forward_signal(child_pid, TerminationSignal::Terminate);
+                    forward_signal(child_pid, Signal::SIGTERM);
                     arm_deadline(&mut triggered, &mut deadline, TerminationSignal::Terminate, timeout);
                 }
                 Some(()) = self.hangup.recv() => {
                     // Forward SIGHUP directly too, so a SIGHUP sent only to dbvalet's PID
                     // reaches the child before the grace-period teardown runs.
-                    forward_signal(child_pid, TerminationSignal::Hangup);
+                    forward_signal(child_pid, Signal::SIGHUP);
                     arm_deadline(&mut triggered, &mut deadline, TerminationSignal::Hangup, timeout);
                 }
             }
@@ -189,10 +212,10 @@ async fn wait_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
-fn forward_signal(child_pid: Option<Pid>, sig: TerminationSignal) {
+fn forward_signal(child_pid: Option<Pid>, sig: Signal) {
     if let Some(pid) = child_pid {
         // `ESRCH` means the child already exited and `child.wait()` is about to return it.
-        let _ = signal::kill(pid, sig.as_nix());
+        let _ = signal::kill(pid, sig);
     }
 }
 
@@ -408,6 +431,115 @@ mod tests {
             WaitOutcome::Exited(status) => assert_eq!(status.code(), Some(7)),
             other => panic!("SIGINT should wait for exit, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_sigint_forwards_sigterm_to_the_child_and_returns_its_exit_status() {
+        let (mut signals, int, _term, _hup) = test_signals();
+        let mut child = tokio::process::Command::new("python3")
+            .args([
+                "-c",
+                "import signal, sys; \
+                 signal.signal(signal.SIGTERM, lambda *_: sys.exit(44)); \
+                 print('READY', flush=True); \
+                 signal.pause()",
+            ])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        wait_for_ready(&mut child).await;
+
+        int.send(()).unwrap();
+        let second = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = int.send(());
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            signals.wait(&mut child, Duration::from_secs(1)),
+        )
+        .await
+        .expect("child should exit promptly after the second SIGINT forwards SIGTERM")
+        .unwrap();
+        second.await.unwrap();
+
+        match outcome {
+            WaitOutcome::Exited(status) => assert_eq!(status.code(), Some(44)),
+            other => panic!("expected child to exit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_sigint_to_a_child_that_ignores_sigterm_times_out_with_interrupt() {
+        let (mut signals, int, _term, _hup) = test_signals();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; echo READY; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        wait_for_ready(&mut child).await;
+
+        int.send(()).unwrap();
+        let second = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = int.send(());
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            signals.wait(&mut child, Duration::from_millis(150)),
+        )
+        .await
+        .expect("wait should return after the grace period on a second SIGINT")
+        .unwrap();
+        second.await.unwrap();
+
+        assert_eq!(outcome, WaitOutcome::TimedOut(TerminationSignal::Interrupt));
+        drop(stdin);
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_after_sigterm_does_not_extend_the_deadline_or_replace_the_signal() {
+        let (mut signals, int, term, _hup) = test_signals();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' INT TERM; echo READY; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        wait_for_ready(&mut child).await;
+
+        let started = Instant::now();
+        term.send(()).unwrap();
+        let follow_ups = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = int.send(());
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = int.send(());
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            signals.wait(&mut child, Duration::from_millis(500)),
+        )
+        .await
+        .expect("wait should keep the original SIGTERM deadline")
+        .unwrap();
+        follow_ups.await.unwrap();
+
+        assert_eq!(outcome, WaitOutcome::TimedOut(TerminationSignal::Terminate));
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "SIGINT after SIGTERM extended the deadline: {:?}",
+            started.elapsed()
+        );
+        drop(stdin);
+        let _ = child.wait().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
