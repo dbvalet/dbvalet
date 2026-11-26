@@ -23,8 +23,6 @@ pub enum RunError {
     Proxy(#[from] ProxyError),
     #[error("couldn't install signal handlers")]
     Signals(#[source] io::Error),
-    #[error("couldn't locate the dbvalet executable")]
-    CurrentExe(#[source] io::Error),
     #[error("couldn't start `{program}`")]
     Spawn {
         program: String,
@@ -50,8 +48,17 @@ pub async fn run<S: CredentialSource>(
     for err in source.sweep().await?.failures {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
+    // Install signal handlers before minting so SIGINT, SIGTERM or SIGHUP can't kill
+    // dbvalet while CREATE ROLE is in flight and release the ledger lock early.
+    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
+    if let Some(signal) = signals.poll_pending().await {
+        return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
+    }
     let lease = source.mint(grant).await?;
-    let finished = run_child(lease.login(), upstream, command).await;
+    let finished = match signals.poll_pending().await {
+        Some(signal) => Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
+        None => run_child(&mut signals, lease.login(), upstream, command).await,
+    };
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
@@ -59,16 +66,16 @@ pub async fn run<S: CredentialSource>(
 }
 
 async fn run_child(
+    signals: &mut RunSignals,
     login: &UpstreamLogin,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<WaitOutcome, RunError> {
-    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
     let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
     let finished = spawn_and_wait(
-        &mut signals,
+        signals,
         command,
         login.user(),
         &token,
@@ -100,8 +107,7 @@ async fn spawn_and_wait(
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
     let program = command[0].to_string_lossy().into_owned();
-    let mut child =
-        child_command(command, user, token, port, database).map_err(RunError::CurrentExe)?;
+    let mut child = child_command(command, user, token, port, database);
     let mut running = child
         .spawn()
         .map_err(|source| RunError::Spawn { program, source })?;
@@ -119,8 +125,8 @@ fn child_command(
     token: &SecretString,
     port: u16,
     database: &str,
-) -> io::Result<tokio::process::Command> {
-    let mut child = signals::child_command_base(command)?;
+) -> tokio::process::Command {
+    let mut child = signals::child_command_base(command);
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"PG") || name == "DATABASE_URL" {
             child.env_remove(name);
@@ -143,7 +149,7 @@ fn child_command(
                 url_encoded(database)
             ),
         );
-    Ok(child)
+    child
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.

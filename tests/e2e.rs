@@ -2368,3 +2368,217 @@ fn sigkill_of_dbvalet_on_linux_ends_the_child() {
         "child should exit via PR_SET_PDEATHSIG(SIGTERM) when dbvalet is SIGKILLed"
     );
 }
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_signal_during_mint_holds_the_ledger_lock_and_drops_the_login_without_spawning_the_child() {
+    let dir = project_with_reader("e2e-run-signal-during-mint");
+    let _alone = sweeping_alone();
+
+    // Hold an exclusive lock on pg_authid so CREATE ROLE blocks after the ledger entry is written.
+    let blocker_rt = runtime();
+    let blocker = blocker_rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client
+            .batch_execute("BEGIN; LOCK TABLE pg_catalog.pg_authid IN EXCLUSIVE MODE;")
+            .await
+            .unwrap();
+        client
+    });
+
+    let run = Command::new("python3")
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args([
+            "-c",
+            "import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
+            DBVALET,
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD_RAN",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait until mint writes the ledger entry before CREATE ROLE blocks on pg_authid.
+    let ledger_dir = dir.join("state/dbvalet/ledger");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let login_name = loop {
+        if let Ok(entries) = std::fs::read_dir(&ledger_dir)
+            && let Some(login) = entries.flatten().find_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix("e2e-run-signal-during-mint.")
+                    .map(str::to_owned)
+            })
+        {
+            break login;
+        }
+        assert!(Instant::now() < deadline, "ledger entry never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Send SIGINT while CREATE ROLE is blocked; dbvalet must stay alive holding the ledger lock.
+    signal::killpg(pid_of(&run), Signal::SIGINT).unwrap();
+
+    // Run gc while the lock is still held: dbvalet must still hold the ledger entry so gc
+    // can't delete it before CREATE ROLE commits.
+    let gc_during_lock = gc_command(&dir).output().unwrap();
+    let entry_kept_during_lock =
+        ledger_entry(&dir, "e2e-run-signal-during-mint", &login_name).exists();
+
+    // Release pg_authid so CREATE ROLE commits and dbvalet can drop the login and exit.
+    blocker_rt.block_on(async {
+        let _ = blocker.batch_execute("ROLLBACK;").await;
+    });
+    drop(blocker);
+    drop(blocker_rt);
+
+    let output = run.wait_with_output().unwrap();
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    let roles_left = superuser_count(
+        "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+        &login_name,
+    );
+    let sessions_left = superuser_count(
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+        &login_name,
+    );
+    // Clean up if the assertion below fails so the suite stays clean.
+    if roles_left > 0 {
+        superuser_sql(&format!("DROP ROLE IF EXISTS {login_name};"));
+    }
+
+    assert!(
+        gc_during_lock.status.success(),
+        "gc stderr: {}",
+        text(&gc_during_lock.stderr)
+    );
+    assert!(
+        entry_kept_during_lock,
+        "gc removed the ledger entry while CREATE ROLE was still queued; gc stdout: {}",
+        text(&gc_during_lock.stdout)
+    );
+    assert_eq!(output.status.code(), Some(130), "stderr: {stderr}");
+    assert!(!stdout.contains("CHILD_RAN"), "stdout: {stdout}");
+    assert!(!stderr.contains("dbvalet:"), "stderr: {stderr}");
+    assert!(!ledger_entry(&dir, "e2e-run-signal-during-mint", &login_name).exists());
+    assert_eq!(
+        roles_left, 0,
+        "leftover login {login_name} remained in pg_roles"
+    );
+    assert_eq!(sessions_left, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_run_still_starts_its_child_after_the_dbvalet_binary_is_replaced_in_place() {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    create_reader_group();
+    let alias = "e2e-run-upgrade-linux";
+    let admin = alias.replace('-', "_");
+    superuser_sql(&format!(
+        "DROP ROLE IF EXISTS {admin};
+         CREATE ROLE {admin} LOGIN SUPERUSER PASSWORD 'pw-{alias}-admin';
+         GRANT dbvalet_reader TO {admin} WITH ADMIN OPTION;"
+    ));
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(alias);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        format!(
+            "[databases.{alias}.roles]\n\
+             reader = {{ member_of = \"dbvalet_reader\", read_only = true }}\n"
+        ),
+    )
+    .unwrap();
+
+    let bin = dir.join("dbvalet-copy");
+    std::fs::copy(DBVALET, &bin).unwrap();
+
+    // Intercept the first admin connection (before child spawn) to atomically replace `bin`,
+    // matching what `cargo install` or a package manager does during an upgrade.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let gate_port = listener.local_addr().unwrap().port();
+    let bin_for_gate = bin.clone();
+    let staged_for_gate = dir.join("dbvalet-copy.new");
+    let replaced = Arc::new(AtomicBool::new(false));
+    let replaced_for_gate = Arc::clone(&replaced);
+    std::thread::spawn(move || {
+        for incoming in listener.incoming().flatten() {
+            if !replaced_for_gate.swap(true, Ordering::SeqCst) {
+                std::fs::copy(DBVALET, &staged_for_gate).unwrap();
+                std::fs::rename(&staged_for_gate, &bin_for_gate).unwrap();
+            }
+            let Ok(upstream) = TcpStream::connect("127.0.0.1:5432") else {
+                continue;
+            };
+            let Ok(mut in_r) = incoming.try_clone() else {
+                continue;
+            };
+            let Ok(mut out_w) = upstream.try_clone() else {
+                continue;
+            };
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut in_r, &mut out_w);
+            });
+            std::thread::spawn(move || {
+                let mut out_r = upstream;
+                let mut in_w = incoming;
+                let _ = std::io::copy(&mut out_r, &mut in_w);
+            });
+        }
+    });
+
+    let stored = login(
+        alias,
+        &format!("postgresql://{admin}:pw-{alias}-admin@127.0.0.1:{gate_port}/postgres"),
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+
+    let _sweeping = sweeping();
+    let output = Command::new(&bin)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo \"login=$PGUSER\"; echo child-ran",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert!(replaced.load(Ordering::SeqCst), "binary was never replaced");
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("child-ran\n"), "stdout: {stdout}");
+    let login_name = line_value(&stdout, "login=");
+    assert!(!ledger_entry(&dir, alias, &login_name).exists());
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+}

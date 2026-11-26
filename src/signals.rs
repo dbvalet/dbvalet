@@ -36,6 +36,9 @@ pub const SIGNAL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "linux", test))]
 const PDEATHSIG_SHIM_ARG: &str = "__dbvalet-pdeathsig-exec";
 
+#[cfg(target_os = "linux")]
+const SELF_EXE: &str = "/proc/self/exe";
+
 /// Only `main()` enables the self-exec shim so library unit tests on Linux don't re-exec
 /// the `cargo test` harness binary.
 #[cfg(target_os = "linux")]
@@ -110,8 +113,10 @@ impl RunSignals {
     }
 
     /// Returns the signal number if `SIGTERM`, `SIGHUP` or `SIGINT` already arrived since
-    /// [`Self::install`], without waiting.
+    /// [`Self::install`], without waiting for a future signal.
     pub async fn poll_pending(&mut self) -> Option<i32> {
+        // Let tokio's signal driver drain any OS signal delivered right before this check.
+        tokio::task::yield_now().await;
         tokio::select! {
             biased;
 
@@ -249,18 +254,20 @@ pub fn init_parent_death_shim() {
 ///
 /// The caller must spawn on the process's main thread (`current_thread` runtime), because
 /// Linux delivers `PR_SET_PDEATHSIG` when the spawning thread exits rather than the process.
-pub(crate) fn child_command_base(command: &[OsString]) -> io::Result<tokio::process::Command> {
+pub(crate) fn child_command_base(command: &[OsString]) -> tokio::process::Command {
     let (program, args) = command.split_first().expect("run needs a command");
     #[cfg(target_os = "linux")]
     if PDEATHSIG_SHIM_ENABLED.load(Ordering::Relaxed) {
-        let exe = std::env::current_exe()?;
-        let mut shim = tokio::process::Command::new(exe);
+        // Execute /proc/self/exe directly rather than reading its symlink path: after an
+        // in-place binary upgrade, readlink returns "... (deleted)" and fails with ENOENT,
+        // whereas /proc/self/exe resolves to the running binary's open inode.
+        let mut shim = tokio::process::Command::new(SELF_EXE);
         shim.args(pdeathsig_shim_args(std::process::id(), command));
-        return Ok(shim);
+        return shim;
     }
     let mut child = tokio::process::Command::new(program);
     child.args(args);
-    Ok(child)
+    child
 }
 
 #[cfg(any(target_os = "linux", test))]
