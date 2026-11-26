@@ -369,20 +369,20 @@ fn end_sessions_check(user: &str, rights: &Rights) -> Check {
             "`{user}` can end other roles' sessions, through pg_signal_backend"
         ));
     }
-    if rights.create_role && rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-        return Check::passed(format!(
-            "`{user}` can end the sessions of logins it creates, \
-             because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
-        ));
-    }
-    if rights.create_role && rights.inherit {
-        return Check::passed(format!(
-            "`{user}` can end the sessions of logins it creates, \
-             because dbvalet adds it as a member of each login"
-        ));
-    }
     let quoted = quote_ident(user);
     if rights.create_role {
+        if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+            return Check::passed(format!(
+                "`{user}` can end the sessions of logins it creates, \
+                 because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
+            ));
+        }
+        if rights.inherit {
+            return Check::passed(format!(
+                "`{user}` can end the sessions of logins it creates, \
+                 because dbvalet adds it as a member of each login"
+            ));
+        }
         return Check::failed(format!(
             "`{user}` can't end the sessions of logins it creates because it has NOINHERIT: \
              run ALTER ROLE {quoted} INHERIT"

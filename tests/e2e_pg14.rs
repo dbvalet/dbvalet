@@ -155,7 +155,7 @@ fn run_against_postgresql_14_is_refused_before_creating_a_login() {
     assert!(!stderr.contains("pw-e2e-pg14-run-3c4d"));
     assert_eq!(
         superuser_count(
-            "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'dbvalet_%' AND rolcanlogin"
+            "SELECT count(*) FROM pg_roles WHERE starts_with(rolname, 'dbvalet_') AND rolcanlogin"
         ),
         0
     );
