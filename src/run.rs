@@ -2,7 +2,6 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::ExitStatus;
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -10,7 +9,10 @@ use crate::config::RoleGrant;
 use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
+use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT};
 use crate::source::{CredentialSource, SourceError, UpstreamLogin};
+
+pub use crate::signals::WaitOutcome as RunOutcome;
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -21,6 +23,8 @@ pub enum RunError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Proxy(#[from] ProxyError),
+    #[error("couldn't install signal handlers")]
+    Signals(#[source] io::Error),
     #[error("couldn't start `{program}`")]
     Spawn {
         program: String,
@@ -40,7 +44,7 @@ pub async fn run<S: CredentialSource>(
     grant: &RoleGrant,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<ExitStatus, RunError> {
+) -> Result<RunOutcome, RunError> {
     assert!(!command.is_empty(), "run needs a command");
     let lease = source.mint(grant).await?;
     let finished = run_child(lease.login(), upstream, command).await;
@@ -54,20 +58,44 @@ async fn run_child(
     login: &UpstreamLogin,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<ExitStatus, RunError> {
+) -> Result<RunOutcome, RunError> {
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
     let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
-    let mut child = child_command(command, login.user(), &token, proxy.port(), &database);
-    let finished = match child.spawn() {
-        Ok(mut running) => running.wait().await.map_err(RunError::Wait),
-        Err(source) => Err(RunError::Spawn {
-            program: command[0].to_string_lossy().into_owned(),
-            source,
-        }),
-    };
+    let finished = spawn_and_wait(command, login.user(), &token, proxy.port(), &database).await;
+    if let Ok(RunOutcome::TimedOut(signal)) = finished {
+        let _ = writeln!(
+            io::stderr(),
+            "dbvalet: child didn't exit within {}s after {}; tearing down the temporary login",
+            SIGNAL_WAIT_TIMEOUT.as_secs(),
+            signal.name()
+        );
+    }
     proxy.stop().await;
     finished
+}
+
+async fn spawn_and_wait(
+    command: &[OsString],
+    user: &str,
+    token: &SecretString,
+    port: u16,
+    database: &str,
+) -> Result<RunOutcome, RunError> {
+    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
+    let program = command[0].to_string_lossy().into_owned();
+    let mut child =
+        child_command(command, user, token, port, database).map_err(|source| RunError::Spawn {
+            program: program.clone(),
+            source,
+        })?;
+    let mut running = child
+        .spawn()
+        .map_err(|source| RunError::Spawn { program, source })?;
+    signals
+        .wait(&mut running, SIGNAL_WAIT_TIMEOUT)
+        .await
+        .map_err(RunError::Wait)
 }
 
 /// The child inherits dbvalet's environment minus every `PG*` variable and `DATABASE_URL`,
@@ -78,10 +106,8 @@ fn child_command(
     token: &SecretString,
     port: u16,
     database: &str,
-) -> tokio::process::Command {
-    let (program, args) = command.split_first().expect("the CLI requires a command");
-    let mut child = tokio::process::Command::new(program);
-    child.args(args);
+) -> io::Result<tokio::process::Command> {
+    let mut child = signals::child_command_base(command)?;
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"PG") || name == "DATABASE_URL" {
             child.env_remove(name);
@@ -104,7 +130,7 @@ fn child_command(
                 url_encoded(database)
             ),
         );
-    child
+    Ok(child)
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.

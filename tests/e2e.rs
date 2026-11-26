@@ -8,6 +8,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+
 const DBVALET: &str = env!("CARGO_BIN_EXE_dbvalet");
 const SUPERUSER_URL: &str = "postgresql://postgres:e2e-throwaway@localhost:5432/postgres";
 
@@ -1007,5 +1010,296 @@ fn a_read_only_run_leaves_no_large_objects_after_teardown() {
             &login_name
         ),
         0
+    );
+}
+
+fn read_until_ready(stdout: &mut BufReader<std::process::ChildStdout>) -> String {
+    let mut seen = String::new();
+    while !seen.ends_with("READY\n") {
+        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
+    }
+    seen
+}
+
+fn line_value(text: &str, prefix: &str) -> String {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("missing `{prefix}` in:\n{text}"))
+        .to_owned()
+}
+
+fn pid_of(child: &std::process::Child) -> Pid {
+    Pid::from_raw(i32::try_from(child.id()).unwrap())
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn sigint_to_dbvalet_waits_for_the_child_drops_the_login_and_returns_its_exit_code() {
+    let dir = project_with_reader("e2e-run-sigint-trap");
+    let mut run = Command::new("python3")
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
+            DBVALET,
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "trap 'kill \"$p\" 2>/dev/null; echo \"after-sigint=$(psql -qAtc \"SELECT 1\")\"; exit 42' INT; \
+             echo \"login=$PGUSER\"; \
+             psql -qAtc 'SELECT 1' >/dev/null; \
+             sleep 60 >/dev/null 2>&1 & p=$!; \
+             echo READY; \
+             wait \"$p\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut stderr = run.stderr.take().unwrap();
+    let seen = read_until_ready(&mut stdout);
+    let login_name = line_value(&seen, "login=");
+
+    signal::killpg(pid_of(&run), Signal::SIGINT).unwrap();
+
+    let status = run.wait().unwrap();
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).unwrap();
+
+    assert_eq!(status.code(), Some(42), "stderr: {stderr_text}");
+    assert!(rest.contains("after-sigint=1"), "stdout: {seen}{rest}");
+    assert!(stderr_text.is_empty(), "stderr: {stderr_text}");
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn sigint_to_dbvalet_with_an_untrapped_child_drops_the_login_and_returns_130() {
+    let dir = project_with_reader("e2e-run-sigint-default");
+    let mut run = Command::new("python3")
+        .current_dir(&dir)
+        .args([
+            "-c",
+            "import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])",
+            DBVALET,
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo \"login=$PGUSER\"; psql -qAtc 'SELECT 1' >/dev/null; echo READY; exec cat",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _stdin = run.stdin.take().unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut stderr = run.stderr.take().unwrap();
+    let seen = read_until_ready(&mut stdout);
+    let login_name = line_value(&seen, "login=");
+
+    signal::killpg(pid_of(&run), Signal::SIGINT).unwrap();
+
+    let status = run.wait().unwrap();
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).unwrap();
+
+    assert_eq!(status.code(), Some(130), "stderr: {stderr_text}");
+    assert!(stderr_text.is_empty(), "stderr: {stderr_text}");
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn sigterm_to_dbvalet_with_a_child_that_ignores_it_tears_down_after_the_timeout() {
+    let dir = project_with_reader("e2e-run-sigterm-ignore");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg(
+            "trap '' TERM; echo \"login=$PGUSER\"; echo \"child_pid=$$\"; \
+             psql -qAtc 'SELECT 1' >/dev/null; echo READY; read line",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = run.stdin.take().unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut stderr = run.stderr.take().unwrap();
+    let seen = read_until_ready(&mut stdout);
+    let login_name = line_value(&seen, "login=");
+    let child_pid = Pid::from_raw(line_value(&seen, "child_pid=").parse().unwrap());
+
+    signal::kill(pid_of(&run), Signal::SIGTERM).unwrap();
+
+    let status = run.wait().unwrap();
+    let child_still_alive = signal::kill(child_pid, None).is_ok();
+    // Close stdin so the child that ignored SIGTERM exits and releases the stderr pipe.
+    drop(stdin);
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).unwrap();
+
+    assert_eq!(status.code(), Some(143), "stderr: {stderr_text}");
+    assert!(
+        child_still_alive,
+        "child should still have been running after ignoring SIGTERM"
+    );
+    assert!(stderr_text.contains("SIGTERM"), "stderr: {stderr_text}");
+    assert!(
+        !stderr_text.contains("pw-e2e-run-sigterm-ignore-admin"),
+        "stderr: {stderr_text}"
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn sighup_to_dbvalet_with_a_child_that_ignores_it_tears_down_after_the_timeout() {
+    let dir = project_with_reader("e2e-run-sighup-ignore");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg(
+            "trap '' HUP; echo \"login=$PGUSER\"; echo \"child_pid=$$\"; \
+             psql -qAtc 'SELECT 1' >/dev/null; echo READY; read line",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = run.stdin.take().unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut stderr = run.stderr.take().unwrap();
+    let seen = read_until_ready(&mut stdout);
+    let login_name = line_value(&seen, "login=");
+    let child_pid = Pid::from_raw(line_value(&seen, "child_pid=").parse().unwrap());
+
+    signal::kill(pid_of(&run), Signal::SIGHUP).unwrap();
+
+    let status = run.wait().unwrap();
+    let child_still_alive = signal::kill(child_pid, None).is_ok();
+    drop(stdin);
+    let mut stderr_text = String::new();
+    stderr.read_to_string(&mut stderr_text).unwrap();
+
+    assert_eq!(status.code(), Some(129), "stderr: {stderr_text}");
+    assert!(
+        child_still_alive,
+        "child should still have been running after ignoring SIGHUP"
+    );
+    assert!(stderr_text.contains("SIGHUP"), "stderr: {stderr_text}");
+    assert!(
+        !stderr_text.contains("pw-e2e-run-sighup-ignore-admin"),
+        "stderr: {stderr_text}"
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &login_name
+        ),
+        0
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn sigkill_of_dbvalet_on_linux_ends_the_child() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = project_with_reader("e2e-run-sigkill-linux");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg("echo \"login=$PGUSER\"; psql -qAtc 'SELECT 1' >/dev/null; echo READY; exec cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Keep stdin open so `cat` stays blocked unless PR_SET_PDEATHSIG ends it.
+    let _stdin = run.stdin.take().unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let seen = read_until_ready(&mut stdout);
+    let login_name = line_value(&seen, "login=");
+
+    signal::kill(pid_of(&run), Signal::SIGKILL).unwrap();
+    let status = run.wait().unwrap();
+    assert_eq!(status.signal(), Some(Signal::SIGKILL as i32));
+
+    // Once dbvalet is gone, `cat` is the only process holding stdout open; EOF proves it died.
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        let _ = done_tx.send(());
+    });
+    let child_ended = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+    // SIGKILL skips teardown, so clean up the temporary login for the rest of the suite.
+    superuser_sql(&format!("DROP ROLE IF EXISTS {login_name};"));
+
+    assert!(
+        child_ended,
+        "child should exit via PR_SET_PDEATHSIG(SIGTERM) when dbvalet is SIGKILLed"
     );
 }

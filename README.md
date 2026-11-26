@@ -11,6 +11,7 @@ dbvalet gives an AI coding agent (Claude Code, Codex, Cursor, or any command) a 
 - The agent connects through a local proxy with a per-run token. The real password never enters its environment or its conversation.
 - The login is read-only unless your repository's `dbvalet.toml` allows more.
 - When the agent exits, its sessions end and the login is dropped.
+- On Linux, if `dbvalet` is killed with `SIGKILL`, the child receives `SIGTERM` via `PR_SET_PDEATHSIG`. On macOS, an orphaned child keeps running, but loses database access because the local proxy is gone.
 - Every run is logged locally, including the SQL it ran.
 
 **Status: not usable yet.** First release planned for December 2026.

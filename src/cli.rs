@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{ExitCode, ExitStatus};
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
@@ -12,7 +12,7 @@ use crate::DatabaseAlias;
 use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
 use crate::policy::{self, PolicyError};
-use crate::run::{self, RunError};
+use crate::run::{self, RunError, RunOutcome};
 use crate::source::direct::{self, DirectSource};
 
 const INITIAL_STDIN_CAPACITY: usize = 256;
@@ -110,18 +110,21 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
             let source = DirectSource::new(alias.clone(), admin);
-            let status = run::run(&source, grant, upstream, &command).await?;
-            Ok(exit_code(status))
+            let outcome = run::run(&source, grant, upstream, &command).await?;
+            Ok(exit_code(outcome))
         }
     }
 }
 
-/// The child's exit code, or 128 plus the signal that killed it, as a shell reports it.
-fn exit_code(status: ExitStatus) -> ExitCode {
-    let code = status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .unwrap_or(1);
+/// The child's exit code, or 128 plus the signal that ended the run, as a shell reports it.
+fn exit_code(outcome: RunOutcome) -> ExitCode {
+    let code = match outcome {
+        RunOutcome::Exited(status) => status
+            .code()
+            .or_else(|| status.signal().map(|signal| 128 + signal))
+            .unwrap_or(1),
+        RunOutcome::TimedOut(signal) => 128 + signal.number(),
+    };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
 
@@ -204,5 +207,19 @@ mod tests {
         assert!(matches!(err, CliError::InvalidUtf8));
         assert!(!format!("{err}").contains("pw-prompt-9c1"));
         assert!(!format!("{err:?}").contains("pw-prompt-9c1"));
+    }
+
+    #[test]
+    fn exit_code_reports_128_plus_signal_when_teardown_timed_out_after_a_signal() {
+        use crate::signals::TerminationSignal;
+
+        assert_eq!(
+            exit_code(RunOutcome::TimedOut(TerminationSignal::Terminate)),
+            ExitCode::from(143)
+        );
+        assert_eq!(
+            exit_code(RunOutcome::TimedOut(TerminationSignal::Hangup)),
+            ExitCode::from(129)
+        );
     }
 }

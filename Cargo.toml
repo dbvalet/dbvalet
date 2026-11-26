@@ -21,13 +21,14 @@ bytes = "1.12.2"
 clap = { version = "4.6.10", features = ["derive"] }
 getrandom = "0.4.3"
 keyring-core = "1.1.0"
+nix = { version = "0.32.0", default-features = false, features = ["process", "signal"] }
 postgres-protocol = "0.6.12"
 rpassword = "7.5.5"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 subtle = "2.6.1"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "net", "io-util", "process", "sync"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
 toml = { version = "1.2.3", default-features = false, features = ["parse", "serde", "std"] }
 
