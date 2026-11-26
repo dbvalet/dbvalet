@@ -7,6 +7,7 @@ use secrecy::SecretString;
 use crate::DatabaseAlias;
 use crate::config::RoleGrant;
 use crate::keychain::AdminLogin;
+use crate::ledger::{self, LedgerError};
 
 pub mod direct;
 
@@ -35,7 +36,7 @@ pub enum SourceError {
         alias: DatabaseAlias,
         reason: String,
     },
-    #[error("PostgreSQL {version} is too old: dbvalet needs 14 or later")]
+    #[error("PostgreSQL {version} is end-of-life: dbvalet needs 15 or later")]
     TooOld { version: String },
     #[error(
         "the admin login `{user}` has NOINHERIT on PostgreSQL {version}, so it can't drop \
@@ -54,6 +55,12 @@ pub enum SourceError {
          It stops accepting new connections within 15 minutes"
     )]
     DropLogin { login: String, reason: String },
+    #[error("couldn't drop the leftover login `{login}`: {reason}")]
+    DropLeftoverLogin { login: String, reason: String },
+    #[error("couldn't list the expired temporary logins: {reason}")]
+    ListExpiredLogins { reason: String },
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
     #[error("the OS random number generator failed")]
     Random(#[source] getrandom::Error),
 }
@@ -63,7 +70,19 @@ pub enum SourceError {
     reason = "run is generic over the source on a single-threaded runtime, so no Send bound is needed"
 )]
 pub trait CredentialSource {
+    /// Drops the logins that ended runs left behind. A failure on one login doesn't stop the rest.
+    async fn sweep(&self) -> Result<SweepReport, SourceError>;
     async fn mint(&self, grant: &RoleGrant) -> Result<Lease, SourceError>;
+}
+
+/// What a sweep cleaned up, and what it couldn't.
+#[derive(Debug, Default)]
+pub struct SweepReport {
+    /// Leftover logins the sweep dropped.
+    pub dropped: Vec<String>,
+    /// Logins whose ledger entry the sweep removed because the login no longer existed.
+    pub already_gone: Vec<String>,
+    pub failures: Vec<SourceError>,
 }
 
 /// A temporary login that exists until [`Lease::release`] drops it.
@@ -74,6 +93,7 @@ pub struct Lease {
     admin: Arc<AdminLogin>,
     member_of: String,
     read_only: bool,
+    ledger_entry: ledger::Entry,
 }
 
 impl Lease {
@@ -81,7 +101,7 @@ impl Lease {
         &self.login
     }
 
-    /// Ends the login's sessions and drops it.
+    /// Ends the login's sessions and drops it. On failure the ledger entry stays for the next sweep.
     pub async fn release(self) -> Result<(), SourceError> {
         direct::drop_login(
             &self.alias,
@@ -90,7 +110,9 @@ impl Lease {
             &self.member_of,
             self.read_only,
         )
-        .await
+        .await?;
+        self.ledger_entry.remove()?;
+        Ok(())
     }
 }
 

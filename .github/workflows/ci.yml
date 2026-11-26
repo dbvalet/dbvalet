@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["14", "16", "17"]
+        postgres: ["15", "16", "17", "18", "19"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}
@@ -55,8 +55,21 @@ jobs:
           --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install gnome-keyring, the D-Bus headers and psql for the run tests
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring dbus libdbus-1-dev pkg-config postgresql-client
+      - name: Install gnome-keyring, the D-Bus headers and PostgreSQL ${{ matrix.postgres }} psql
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-keyring dbus libdbus-1-dev pkg-config postgresql-common ca-certificates
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-${{ matrix.postgres }}
+          echo "/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_PATH"
+      - name: Check that psql matches PostgreSQL ${{ matrix.postgres }}
+        run: |
+          version=$(psql --version)
+          echo "$version"
+          case "$version" in
+            "psql (PostgreSQL) ${{ matrix.postgres }}."*) ;;
+            *) echo "expected psql ${{ matrix.postgres }}.x, got: $version" >&2; exit 1 ;;
+          esac
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal
@@ -68,6 +81,38 @@ jobs:
           dbus-run-session -- sh -c
           'printf e2e-throwaway | gnome-keyring-daemon --unlock --components=secrets >/dev/null
           && cargo test --locked --test e2e -- --ignored'
+
+  e2e-pg14:
+    name: e2e (PostgreSQL 14 refusal)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          # Throwaway superuser password for this job's database; tests/e2e_pg14.rs uses it too.
+          POSTGRES_PASSWORD: e2e-throwaway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install gnome-keyring and the D-Bus headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-keyring dbus libdbus-1-dev pkg-config
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Run the PostgreSQL 14 refusal e2e tests against the real Secret Service
+        # The keyring password is a throwaway for this runner's empty login keyring.
+        run: >-
+          dbus-run-session -- sh -c
+          'printf e2e-throwaway | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+          && cargo test --locked --test e2e_pg14 -- --ignored'
 
   deny:
     runs-on: ubuntu-latest

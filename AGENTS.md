@@ -10,7 +10,7 @@ An open-source Rust CLI (Apache-2.0) that runs an AI coding agent or any command
 - Lint: `cargo clippy --all-targets --locked -- -D warnings`
 - Test: `cargo test --locked`
 - Licences and advisories: `cargo deny check` (CI runs it; install with `cargo install --locked cargo-deny`)
-- End-to-end tests run against real PostgreSQL 14, 16 and 17 in Docker. Never mock the database in a test that claims to prove a login was created, refused or dropped.
+- End-to-end tests run against real PostgreSQL 15 through 19 in Docker (plus PostgreSQL 14 for refusal checks). Never mock the database in a test that claims to prove a login was created, refused or dropped.
 - Prove a change before handing it back: run all of the above and say which you ran.
 
 ## Promises the code must never break

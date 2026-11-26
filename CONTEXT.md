@@ -10,5 +10,5 @@
 - **Expiry push:** while a run lives, dbvalet moves the login's `VALID UNTIL` forward, never past the database's `max_ttl`.
 - **Teardown:** end of a run: terminate the login's sessions, then drop it.
 - **Sweep:** cleanup of leftover `dbvalet_` logins after a crash, done at the start of every run and by `dbvalet gc`.
-- **Ledger:** the local file listing temporary logins a run created and hasn't yet confirmed dropped.
+- **Ledger:** the local files, one per temporary login a run created and hasn't yet confirmed dropped, each locked while its run lives.
 - **Run log:** the local per-run file with the time, command, role, lease and the SQL text. Never a password or token.
