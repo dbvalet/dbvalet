@@ -1205,11 +1205,13 @@ fn sigterm_to_dbvalet_with_a_child_that_ignores_it_tears_down_after_the_timeout(
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn sighup_to_dbvalet_with_a_child_that_ignores_it_tears_down_after_the_timeout() {
     let dir = project_with_reader("e2e-run-sighup-ignore");
+    // Ignore TERM as well as HUP so Linux PR_SET_PDEATHSIG(SIGTERM) doesn't kill the
+    // child when dbvalet exits before we check that the child outlived the SIGHUP timeout.
     let mut run = Command::new(DBVALET)
         .current_dir(&dir)
         .args(["run", "--allow-plaintext", "--", "sh", "-c"])
         .arg(
-            "trap '' HUP; echo \"login=$PGUSER\"; echo \"child_pid=$$\"; \
+            "trap '' HUP TERM; echo \"login=$PGUSER\"; echo \"child_pid=$$\"; \
              psql -qAtc 'SELECT 1' >/dev/null; echo READY; read line",
         )
         .stdin(Stdio::piped())

@@ -9,10 +9,8 @@ use crate::config::RoleGrant;
 use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
-use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT};
+use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT, WaitOutcome};
 use crate::source::{CredentialSource, SourceError, UpstreamLogin};
-
-pub use crate::signals::WaitOutcome as RunOutcome;
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -25,6 +23,8 @@ pub enum RunError {
     Proxy(#[from] ProxyError),
     #[error("couldn't install signal handlers")]
     Signals(#[source] io::Error),
+    #[error("couldn't locate the dbvalet executable")]
+    CurrentExe(#[source] io::Error),
     #[error("couldn't start `{program}`")]
     Spawn {
         program: String,
@@ -44,7 +44,7 @@ pub async fn run<S: CredentialSource>(
     grant: &RoleGrant,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<RunOutcome, RunError> {
+) -> Result<WaitOutcome, RunError> {
     assert!(!command.is_empty(), "run needs a command");
     let lease = source.mint(grant).await?;
     let finished = run_child(lease.login(), upstream, command).await;
@@ -58,12 +58,21 @@ async fn run_child(
     login: &UpstreamLogin,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<RunOutcome, RunError> {
+) -> Result<WaitOutcome, RunError> {
+    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
     let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
-    let finished = spawn_and_wait(command, login.user(), &token, proxy.port(), &database).await;
-    if let Ok(RunOutcome::TimedOut(signal)) = finished {
+    let finished = spawn_and_wait(
+        &mut signals,
+        command,
+        login.user(),
+        &token,
+        proxy.port(),
+        &database,
+    )
+    .await;
+    if let Ok(WaitOutcome::TimedOut(signal)) = finished {
         let _ = writeln!(
             io::stderr(),
             "dbvalet: child didn't exit within {}s after {}; tearing down the temporary login",
@@ -76,19 +85,19 @@ async fn run_child(
 }
 
 async fn spawn_and_wait(
+    signals: &mut RunSignals,
     command: &[OsString],
     user: &str,
     token: &SecretString,
     port: u16,
     database: &str,
-) -> Result<RunOutcome, RunError> {
-    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
+) -> Result<WaitOutcome, RunError> {
+    if let Some(signal) = signals.poll_pending().await {
+        return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
+    }
     let program = command[0].to_string_lossy().into_owned();
     let mut child =
-        child_command(command, user, token, port, database).map_err(|source| RunError::Spawn {
-            program: program.clone(),
-            source,
-        })?;
+        child_command(command, user, token, port, database).map_err(RunError::CurrentExe)?;
     let mut running = child
         .spawn()
         .map_err(|source| RunError::Spawn { program, source })?;

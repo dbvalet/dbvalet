@@ -50,10 +50,7 @@ pub enum TerminationSignal {
 
 impl TerminationSignal {
     pub fn name(self) -> &'static str {
-        match self {
-            Self::Terminate => "SIGTERM",
-            Self::Hangup => "SIGHUP",
-        }
+        self.as_nix().as_str()
     }
 
     pub fn number(self) -> i32 {
@@ -68,11 +65,13 @@ impl TerminationSignal {
     }
 }
 
-/// Result of waiting for the run's child process.
+/// Result of waiting for a run's child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     /// The child exited before any teardown deadline elapsed.
     Exited(ExitStatus),
+    /// A signal arrived after minting the login and before spawning the child.
+    SignalledBeforeSpawn(i32),
     /// dbvalet forwarded the signal and the child didn't exit within the grace period.
     TimedOut(TerminationSignal),
 }
@@ -93,8 +92,8 @@ impl SignalStream {
     }
 }
 
-/// Active signal handlers for a single run. Must be installed before spawning the child
-/// so a signal arriving right after spawn isn't missed.
+/// Active signal handlers for a single run. Must be installed before starting the proxy
+/// and spawning the child so a signal arriving during startup isn't missed.
 pub struct RunSignals {
     interrupt: SignalStream,
     terminate: SignalStream,
@@ -108,6 +107,19 @@ impl RunSignals {
             terminate: SignalStream::Os(unix::signal(SignalKind::terminate())?),
             hangup: SignalStream::Os(unix::signal(SignalKind::hangup())?),
         })
+    }
+
+    /// Returns the signal number if `SIGTERM`, `SIGHUP` or `SIGINT` already arrived since
+    /// [`Self::install`], without waiting.
+    pub async fn poll_pending(&mut self) -> Option<i32> {
+        tokio::select! {
+            biased;
+
+            Some(()) = self.terminate.recv() => Some(Signal::SIGTERM as i32),
+            Some(()) = self.hangup.recv() => Some(Signal::SIGHUP as i32),
+            Some(()) = self.interrupt.recv() => Some(Signal::SIGINT as i32),
+            () = std::future::ready(()) => None,
+        }
     }
 
     /// Waits for `child` to exit while handling `SIGINT`, `SIGTERM` and `SIGHUP`.
@@ -148,6 +160,8 @@ impl RunSignals {
                     arm_deadline(&mut triggered, &mut deadline, TerminationSignal::Terminate, timeout);
                 }
                 Some(()) = self.hangup.recv() => {
+                    // Forward SIGHUP directly too, so a SIGHUP sent only to dbvalet's PID
+                    // reaches the child before the grace-period teardown runs.
                     forward_signal(child_pid, TerminationSignal::Hangup);
                     arm_deadline(&mut triggered, &mut deadline, TerminationSignal::Hangup, timeout);
                 }
@@ -184,13 +198,14 @@ fn arm_deadline(
 }
 
 /// On Linux, handles the internal self-exec invocation that sets `PR_SET_PDEATHSIG(SIGTERM)`
-/// without `unsafe` before `exec`ing the child command. Must be called at the start of
-/// `main()` before starting the async runtime. No-op on other platforms.
-pub fn maybe_exec_with_pdeathsig() {
+/// without `unsafe`, and otherwise enables the shim for child processes spawned by this binary.
+/// Must be called at the start of `main()` before starting the async runtime. No-op elsewhere.
+pub fn init_parent_death_shim() {
     #[cfg(target_os = "linux")]
     {
         let args: Vec<OsString> = std::env::args_os().collect();
         let Some(parsed) = parse_pdeathsig_shim_args(&args) else {
+            PDEATHSIG_SHIM_ENABLED.store(true, Ordering::Relaxed);
             return;
         };
         let exec = match parsed {
@@ -224,21 +239,18 @@ pub fn maybe_exec_with_pdeathsig() {
             "dbvalet: couldn't start `{}`: {err}",
             exec.program.to_string_lossy()
         );
+        // Exit 1 to match `RunError::Spawn` on platforms that spawn the child directly.
         std::process::exit(1);
     }
 }
 
-/// Enables the Linux `PR_SET_PDEATHSIG` self-exec shim for child commands spawned by `run`.
-/// Called by `main()` right after [`maybe_exec_with_pdeathsig`]. No-op on other platforms.
-pub fn enable_pdeathsig_shim() {
-    #[cfg(target_os = "linux")]
-    PDEATHSIG_SHIM_ENABLED.store(true, Ordering::Relaxed);
-}
-
 /// Builds the base `Command` for the run's child. On Linux (when running through `main`),
 /// wraps it with the self-exec shim so the child gets `PR_SET_PDEATHSIG(SIGTERM)`.
+///
+/// The caller must spawn on the process's main thread (`current_thread` runtime), because
+/// Linux delivers `PR_SET_PDEATHSIG` when the spawning thread exits rather than the process.
 pub(crate) fn child_command_base(command: &[OsString]) -> io::Result<tokio::process::Command> {
-    assert!(!command.is_empty(), "run needs a command");
+    let (program, args) = command.split_first().expect("run needs a command");
     #[cfg(target_os = "linux")]
     if PDEATHSIG_SHIM_ENABLED.load(Ordering::Relaxed) {
         let exe = std::env::current_exe()?;
@@ -246,7 +258,6 @@ pub(crate) fn child_command_base(command: &[OsString]) -> io::Result<tokio::proc
         shim.args(pdeathsig_shim_args(std::process::id(), command));
         return Ok(shim);
     }
-    let (program, args) = command.split_first().expect("run needs a command");
     let mut child = tokio::process::Command::new(program);
     child.args(args);
     Ok(child)
@@ -336,6 +347,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn poll_pending_returns_none_when_no_signal_arrived() {
+        let (mut signals, _int, _term, _hup) = test_signals();
+        assert_eq!(signals.poll_pending().await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_pending_returns_a_signal_that_arrived_before_spawn() {
+        let (mut signals, int, term, _hup) = test_signals();
+        int.send(()).unwrap();
+        assert_eq!(signals.poll_pending().await, Some(Signal::SIGINT as i32));
+
+        term.send(()).unwrap();
+        assert_eq!(signals.poll_pending().await, Some(Signal::SIGTERM as i32));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn sigint_waits_for_the_child_without_forwarding_a_duplicate_signal() {
         let (mut signals, int, _term, _hup) = test_signals();
         let mut child = tokio::process::Command::new("sh")
@@ -365,7 +392,7 @@ mod tests {
 
         match outcome {
             WaitOutcome::Exited(status) => assert_eq!(status.code(), Some(7)),
-            WaitOutcome::TimedOut(sig) => panic!("SIGINT should not time out, got {sig:?}"),
+            other => panic!("SIGINT should wait for exit, got {other:?}"),
         }
     }
 
@@ -397,7 +424,7 @@ mod tests {
 
         match outcome {
             WaitOutcome::Exited(status) => assert_eq!(status.code(), Some(42)),
-            WaitOutcome::TimedOut(sig) => panic!("expected child to exit, got TimedOut({sig:?})"),
+            other => panic!("expected child to exit, got {other:?}"),
         }
     }
 
@@ -458,7 +485,7 @@ mod tests {
 
         match outcome {
             WaitOutcome::Exited(status) => assert_eq!(status.code(), Some(43)),
-            WaitOutcome::TimedOut(sig) => panic!("expected child to exit, got TimedOut({sig:?})"),
+            other => panic!("expected child to exit, got {other:?}"),
         }
     }
 
@@ -505,12 +532,12 @@ mod tests {
         let started = Instant::now();
         term.send(()).unwrap();
         let second = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
             let _ = hup.send(());
         });
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
-            signals.wait(&mut child, Duration::from_millis(200)),
+            signals.wait(&mut child, Duration::from_millis(500)),
         )
         .await
         .expect("wait should keep the original deadline")
@@ -518,8 +545,9 @@ mod tests {
         second.await.unwrap();
 
         assert_eq!(outcome, WaitOutcome::TimedOut(TerminationSignal::Terminate));
+        // A reset deadline would expire at ~850 ms (350 + 500); the original ends at ~500 ms.
         assert!(
-            started.elapsed() < Duration::from_millis(300),
+            started.elapsed() < Duration::from_millis(750),
             "second signal extended the deadline: {:?}",
             started.elapsed()
         );
@@ -528,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn pdeathsig_shim_arguments_round_trip_and_preserve_child_dashes() {
+    fn pdeathsig_shim_arguments_round_trip_with_child_dashes() {
         let command = vec![
             OsString::from("psql"),
             OsString::from("--"),
@@ -555,10 +583,13 @@ mod tests {
     }
 
     #[test]
-    fn pdeathsig_shim_parser_ignores_normal_invocations_and_rejects_malformed_shim_args() {
+    fn pdeathsig_shim_parser_ignores_normal_invocations() {
         let normal = vec![OsString::from("dbvalet"), OsString::from("run")];
         assert!(parse_pdeathsig_shim_args(&normal).is_none());
+    }
 
+    #[test]
+    fn pdeathsig_shim_parser_rejects_malformed_shim_args() {
         let missing_pid = vec![
             OsString::from("dbvalet"),
             OsString::from(PDEATHSIG_SHIM_ARG),

@@ -12,7 +12,8 @@ use crate::DatabaseAlias;
 use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
 use crate::policy::{self, PolicyError};
-use crate::run::{self, RunError, RunOutcome};
+use crate::run::{self, RunError};
+use crate::signals::WaitOutcome;
 use crate::source::direct::{self, DirectSource};
 
 const INITIAL_STDIN_CAPACITY: usize = 256;
@@ -117,13 +118,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 }
 
 /// The child's exit code, or 128 plus the signal that ended the run, as a shell reports it.
-fn exit_code(outcome: RunOutcome) -> ExitCode {
+fn exit_code(outcome: WaitOutcome) -> ExitCode {
     let code = match outcome {
-        RunOutcome::Exited(status) => status
+        WaitOutcome::Exited(status) => status
             .code()
             .or_else(|| status.signal().map(|signal| 128 + signal))
             .unwrap_or(1),
-        RunOutcome::TimedOut(signal) => 128 + signal.number(),
+        WaitOutcome::SignalledBeforeSpawn(signal) => 128 + signal,
+        WaitOutcome::TimedOut(signal) => 128 + signal.number(),
     };
     ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX))
 }
@@ -210,16 +212,20 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_reports_128_plus_signal_when_teardown_timed_out_after_a_signal() {
+    fn exit_code_reports_128_plus_signal_for_signal_ended_runs() {
         use crate::signals::TerminationSignal;
 
         assert_eq!(
-            exit_code(RunOutcome::TimedOut(TerminationSignal::Terminate)),
+            exit_code(WaitOutcome::TimedOut(TerminationSignal::Terminate)),
             ExitCode::from(143)
         );
         assert_eq!(
-            exit_code(RunOutcome::TimedOut(TerminationSignal::Hangup)),
+            exit_code(WaitOutcome::TimedOut(TerminationSignal::Hangup)),
             ExitCode::from(129)
+        );
+        assert_eq!(
+            exit_code(WaitOutcome::SignalledBeforeSpawn(2)),
+            ExitCode::from(130)
         );
     }
 }
