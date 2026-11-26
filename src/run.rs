@@ -110,10 +110,10 @@ async fn spawn_and_wait(
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
     let program = command[0].to_string_lossy().into_owned();
-    let mut child = child_command(command, user, token, port, database);
-    let mut running = child
-        .spawn()
-        .map_err(|source| RunError::Spawn { program, source })?;
+    let child = child_command(command, user, token, port, database);
+    // Spawn on the current-thread runtime's main thread so PR_SET_PDEATHSIG fires only when dbvalet exits.
+    let mut running =
+        signals::spawn_child(child).map_err(|source| RunError::Spawn { program, source })?;
     signals
         .wait(&mut running, SIGNAL_WAIT_TIMEOUT)
         .await
@@ -129,7 +129,9 @@ fn child_command(
     port: u16,
     database: &str,
 ) -> tokio::process::Command {
-    let mut child = signals::child_command_base(command);
+    let (program, args) = command.split_first().expect("run needs a command");
+    let mut child = tokio::process::Command::new(program);
+    child.args(args);
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"PG") || name == "DATABASE_URL" {
             child.env_remove(name);

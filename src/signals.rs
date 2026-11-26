@@ -12,21 +12,17 @@
 //!   when it exits, or after [`SIGNAL_WAIT_TIMEOUT`] if it hasn't (returning the child's
 //!   code, or `143` / `129` on timeout). Earlier deadlines are never extended by
 //!   subsequent signals.
-//! - On Linux, the child receives `PR_SET_PDEATHSIG(SIGTERM)` via an internal self-exec
-//!   shim so it exits if dbvalet is killed with `SIGKILL`. macOS has no equivalent kernel
-//!   mechanism; an orphaned child there keeps running without database access once the
-//!   proxy is gone.
+//! - On Linux, the child receives `PR_SET_PDEATHSIG(SIGTERM)` via `process-wrap`'s
+//!   `PropagateThreadDeath` so it exits if dbvalet is killed with `SIGKILL`. A set-user-ID
+//!   or file-capability child, or a grandchild, isn't killed when dbvalet is `SIGKILL`ed;
+//!   it still loses database access when the proxy stops, and `gc` or the next run drops
+//!   the login. macOS has no equivalent kernel mechanism, so an orphaned child there keeps
+//!   running without database access once the proxy is gone, and `gc` or the next run drops
+//!   the login.
 
-#[cfg(any(target_os = "linux", test))]
-use std::ffi::OsStr;
-use std::ffi::OsString;
 use std::io::{self, Write};
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::ExitStatus;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
@@ -38,17 +34,6 @@ use tokio::time::Sleep;
 /// How long dbvalet waits for the child to exit after a second `SIGINT`, `SIGTERM` or
 /// `SIGHUP` before tearing down the proxy and dropping the temporary login anyway.
 pub const SIGNAL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(any(target_os = "linux", test))]
-const PDEATHSIG_SHIM_ARG: &str = "__dbvalet-pdeathsig-exec";
-
-#[cfg(target_os = "linux")]
-const SELF_EXE: &str = "/proc/self/exe";
-
-/// Only `main()` enables the self-exec shim so library unit tests on Linux don't re-exec
-/// the `cargo test` harness binary.
-#[cfg(target_os = "linux")]
-static PDEATHSIG_SHIM_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Signals that can trigger a bounded-wait teardown of the run's child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +71,59 @@ pub enum WaitOutcome {
     /// dbvalet forwarded a stop signal (`SIGTERM` or `SIGHUP`) and the child didn't exit
     /// within the grace period.
     TimedOut(TerminationSignal),
+}
+
+/// A running child process spawned by [`spawn_child`].
+pub struct SpawnedChild {
+    #[cfg(target_os = "linux")]
+    inner: Box<dyn process_wrap::tokio::ChildWrapper>,
+    #[cfg(not(target_os = "linux"))]
+    inner: Child,
+}
+
+impl SpawnedChild {
+    pub fn id(&self) -> Option<u32> {
+        self.inner.id()
+    }
+
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.inner.wait().await
+    }
+}
+
+impl From<Child> for SpawnedChild {
+    fn from(child: Child) -> Self {
+        #[cfg(target_os = "linux")]
+        let inner: Box<dyn process_wrap::tokio::ChildWrapper> = Box::new(child);
+        #[cfg(not(target_os = "linux"))]
+        let inner = child;
+        Self { inner }
+    }
+}
+
+/// Spawns `command`. On Linux, attaches `PR_SET_PDEATHSIG(SIGTERM)` through `process-wrap`'s
+/// `PropagateThreadDeath`, including its spawning-thread check.
+///
+/// Must be called from the `current_thread` runtime's main thread (never from
+/// `spawn_blocking` or `block_in_place`), because Linux delivers `PR_SET_PDEATHSIG` when the
+/// spawning thread exits rather than when the process exits.
+pub fn spawn_child(command: tokio::process::Command) -> io::Result<SpawnedChild> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut wrapped = process_wrap::tokio::CommandWrap::from(command);
+        wrapped.wrap(process_wrap::tokio::PropagateThreadDeath::default());
+        // Spawn on the current-thread runtime's main thread so PR_SET_PDEATHSIG fires only when dbvalet exits.
+        Ok(SpawnedChild {
+            inner: wrapped.spawn()?,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut command = command;
+        Ok(SpawnedChild {
+            inner: command.spawn()?,
+        })
+    }
 }
 
 enum SignalStream {
@@ -149,7 +187,11 @@ impl RunSignals {
     /// duplicate signal. On a second `SIGINT`, forwards `SIGTERM` to `child` and starts
     /// `timeout` (returning `TimedOut(Interrupt)` if `child` doesn't exit in time). On
     /// `SIGTERM` or `SIGHUP`, forwards the signal to `child` and starts `timeout`.
-    pub async fn wait(&mut self, child: &mut Child, timeout: Duration) -> io::Result<WaitOutcome> {
+    pub async fn wait(
+        &mut self,
+        child: &mut SpawnedChild,
+        timeout: Duration,
+    ) -> io::Result<WaitOutcome> {
         // Capture the PID before polling `wait()` to completion: until `waitpid` reaps the
         // child, its PID stays reserved in the process table and cannot be reused.
         let child_pid = child
@@ -235,119 +277,6 @@ fn arm_deadline(
     }
 }
 
-/// On Linux, handles the internal self-exec invocation that sets `PR_SET_PDEATHSIG(SIGTERM)`
-/// without `unsafe`, and otherwise enables the shim for child processes spawned by this binary.
-/// Must be called at the start of `main()` before starting the async runtime. No-op elsewhere.
-pub fn init_parent_death_shim() {
-    #[cfg(target_os = "linux")]
-    {
-        let args: Vec<OsString> = std::env::args_os().collect();
-        let Some(parsed) = parse_pdeathsig_shim_args(&args) else {
-            PDEATHSIG_SHIM_ENABLED.store(true, Ordering::Relaxed);
-            return;
-        };
-        let exec = match parsed {
-            Ok(exec) => exec,
-            Err(reason) => {
-                let _ = writeln!(
-                    io::stderr(),
-                    "dbvalet: invalid internal exec arguments: {reason}"
-                );
-                std::process::exit(1);
-            }
-        };
-        if let Err(err) = nix::sys::prctl::set_pdeathsig(Signal::SIGTERM) {
-            let _ = writeln!(
-                io::stderr(),
-                "dbvalet: couldn't set PR_SET_PDEATHSIG: {err}"
-            );
-            std::process::exit(1);
-        }
-        // Close the fork-to-prctl race: if dbvalet died before PR_SET_PDEATHSIG took
-        // effect, we were already reparented and won't receive the death signal.
-        if nix::unistd::getppid() != Pid::from_raw(exec.parent_pid) {
-            let _ = signal::raise(Signal::SIGTERM);
-            std::process::exit(128 + Signal::SIGTERM as i32);
-        }
-        let err = std::process::Command::new(exec.program)
-            .args(exec.args)
-            .exec();
-        let _ = writeln!(
-            io::stderr(),
-            "dbvalet: couldn't start `{}`: {err}",
-            exec.program.to_string_lossy()
-        );
-        // Exit 1 to match `RunError::Spawn` on platforms that spawn the child directly.
-        std::process::exit(1);
-    }
-}
-
-/// Builds the base `Command` for the run's child. On Linux (when running through `main`),
-/// wraps it with the self-exec shim so the child gets `PR_SET_PDEATHSIG(SIGTERM)`.
-///
-/// The caller must spawn on the process's main thread (`current_thread` runtime), because
-/// Linux delivers `PR_SET_PDEATHSIG` when the spawning thread exits rather than the process.
-pub(crate) fn child_command_base(command: &[OsString]) -> tokio::process::Command {
-    let (program, args) = command.split_first().expect("run needs a command");
-    #[cfg(target_os = "linux")]
-    if PDEATHSIG_SHIM_ENABLED.load(Ordering::Relaxed) {
-        // Execute /proc/self/exe directly rather than reading its symlink path: after an
-        // in-place binary upgrade, readlink returns "... (deleted)" and fails with ENOENT,
-        // whereas /proc/self/exe resolves to the running binary's open inode.
-        let mut shim = tokio::process::Command::new(SELF_EXE);
-        shim.args(pdeathsig_shim_args(std::process::id(), command));
-        return shim;
-    }
-    let mut child = tokio::process::Command::new(program);
-    child.args(args);
-    child
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn pdeathsig_shim_args(parent_pid: u32, command: &[OsString]) -> Vec<OsString> {
-    let mut args = Vec::with_capacity(command.len() + 3);
-    args.push(OsString::from(PDEATHSIG_SHIM_ARG));
-    args.push(OsString::from(parent_pid.to_string()));
-    args.push(OsString::from("--"));
-    args.extend(command.iter().cloned());
-    args
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, PartialEq, Eq)]
-struct PdeathsigExec<'a> {
-    parent_pid: i32,
-    program: &'a OsStr,
-    args: &'a [OsString],
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_pdeathsig_shim_args(args: &[OsString]) -> Option<Result<PdeathsigExec<'_>, &'static str>> {
-    if args.get(1).and_then(|arg| arg.to_str()) != Some(PDEATHSIG_SHIM_ARG) {
-        return None;
-    }
-    let Some(pid_arg) = args.get(2).and_then(|arg| arg.to_str()) else {
-        return Some(Err("missing parent PID"));
-    };
-    let Ok(parent_pid) = pid_arg.parse::<i32>() else {
-        return Some(Err("parent PID is not an integer"));
-    };
-    if parent_pid <= 0 {
-        return Some(Err("parent PID must be positive"));
-    }
-    if args.get(3).and_then(|arg| arg.to_str()) != Some("--") {
-        return Some(Err("missing `--` separator"));
-    }
-    let Some((program, child_args)) = args.get(4..)?.split_first() else {
-        return Some(Err("missing child command"));
-    };
-    Some(Ok(PdeathsigExec {
-        parent_pid,
-        program: program.as_os_str(),
-        args: child_args,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
@@ -414,6 +343,7 @@ mod tests {
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         int.send(()).unwrap();
         let release_child = tokio::spawn(async move {
@@ -452,6 +382,7 @@ mod tests {
             .spawn()
             .unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         int.send(()).unwrap();
         let second = tokio::spawn(async move {
@@ -485,6 +416,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         int.send(()).unwrap();
         let second = tokio::spawn(async move {
@@ -517,6 +449,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         let started = Instant::now();
         term.send(()).unwrap();
@@ -561,6 +494,7 @@ mod tests {
             .spawn()
             .unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         term.send(()).unwrap();
         let outcome = tokio::time::timeout(
@@ -589,6 +523,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         term.send(()).unwrap();
         let outcome = tokio::time::timeout(
@@ -622,6 +557,7 @@ mod tests {
             .spawn()
             .unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         hup.send(()).unwrap();
         let outcome = tokio::time::timeout(
@@ -650,6 +586,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         hup.send(()).unwrap();
         let outcome = tokio::time::timeout(
@@ -677,6 +614,7 @@ mod tests {
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         wait_for_ready(&mut child).await;
+        let mut child = SpawnedChild::from(child);
 
         let started = Instant::now();
         term.send(()).unwrap();
@@ -704,78 +642,45 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn pdeathsig_shim_arguments_round_trip_with_child_dashes() {
-        let command = vec![
-            OsString::from("psql"),
-            OsString::from("--"),
-            OsString::from("-c"),
-            OsString::from("SELECT 1"),
-        ];
-        let mut argv = vec![OsString::from("/usr/local/bin/dbvalet")];
-        argv.extend(pdeathsig_shim_args(12345, &command));
+    fn spawn_child_on_linux_ends_the_child_when_the_spawning_thread_exits() {
+        use std::io::{BufRead, Read};
 
-        let exec = parse_pdeathsig_shim_args(&argv)
-            .expect("shim marker should be recognized")
-            .expect("valid shim invocation should parse");
+        let (read_end, write_end) = std::io::pipe().unwrap();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let spawner = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.args(["-c", "echo READY; exec sleep 60"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(write_end));
+                let _child = spawn_child(cmd).unwrap();
+                let _ = exit_rx.recv();
+            });
+        });
 
-        assert_eq!(exec.parent_pid, 12345);
-        assert_eq!(exec.program, OsStr::new("psql"));
-        assert_eq!(
-            exec.args,
-            &[
-                OsString::from("--"),
-                OsString::from("-c"),
-                OsString::from("SELECT 1"),
-            ]
-        );
-    }
+        let mut reader = std::io::BufReader::new(read_end);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "READY\n");
 
-    #[test]
-    fn pdeathsig_shim_parser_ignores_normal_invocations() {
-        let normal = vec![OsString::from("dbvalet"), OsString::from("run")];
-        assert!(parse_pdeathsig_shim_args(&normal).is_none());
-    }
+        exit_tx.send(()).unwrap();
+        spawner.join().unwrap();
 
-    #[test]
-    fn pdeathsig_shim_parser_rejects_malformed_shim_args() {
-        let missing_pid = vec![
-            OsString::from("dbvalet"),
-            OsString::from(PDEATHSIG_SHIM_ARG),
-        ];
-        assert!(parse_pdeathsig_shim_args(&missing_pid).unwrap().is_err());
-
-        let zero_pid = vec![
-            OsString::from("dbvalet"),
-            OsString::from(PDEATHSIG_SHIM_ARG),
-            OsString::from("0"),
-            OsString::from("--"),
-            OsString::from("true"),
-        ];
-        assert!(parse_pdeathsig_shim_args(&zero_pid).unwrap().is_err());
-
-        let missing_separator = vec![
-            OsString::from("dbvalet"),
-            OsString::from(PDEATHSIG_SHIM_ARG),
-            OsString::from("42"),
-            OsString::from("true"),
-        ];
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = eof_tx.send(());
+        });
         assert!(
-            parse_pdeathsig_shim_args(&missing_separator)
-                .unwrap()
-                .is_err()
-        );
-
-        let missing_command = vec![
-            OsString::from("dbvalet"),
-            OsString::from(PDEATHSIG_SHIM_ARG),
-            OsString::from("42"),
-            OsString::from("--"),
-        ];
-        assert!(
-            parse_pdeathsig_shim_args(&missing_command)
-                .unwrap()
-                .is_err()
+            eof_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "child should exit via PR_SET_PDEATHSIG(SIGTERM) when the spawning thread exits"
         );
     }
 }

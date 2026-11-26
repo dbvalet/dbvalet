@@ -43,6 +43,7 @@ apple-native-keyring-store = { version = "1.0.3", features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+process-wrap = { version = "11.0.0", default-features = false, features = ["tokio1", "propagate-thread-death"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

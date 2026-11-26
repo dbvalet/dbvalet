@@ -2626,6 +2626,69 @@ fn a_run_still_starts_its_child_after_the_dbvalet_binary_is_replaced_in_place() 
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_run_started_through_the_dynamic_loader_runs_the_child_and_exits_zero() {
+    let dir = project_with_reader("e2e-run-ldso-linux");
+    let _sweeping = sweeping();
+    let mut loaders: Vec<PathBuf> = ["/lib", "/lib64"]
+        .into_iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ld-linux-") && name.contains(".so."))
+        })
+        .collect();
+    loaders.sort();
+    let loader = loaders.into_iter().next().expect(
+        "expected a dynamic loader matching /lib/ld-linux-*.so.* or /lib64/ld-linux-*.so.*",
+    );
+
+    let output = Command::new(&loader)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args([
+            DBVALET,
+            "run",
+            "--allow-plaintext",
+            "--",
+            "echo",
+            "child-ran",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    let ledger_dir = dir.join("state/dbvalet/ledger");
+    let ledger_entries: Vec<_> = std::fs::read_dir(&ledger_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "loader={} stderr: {stderr}",
+        loader.display()
+    );
+    assert_eq!(stdout, "child-ran\n", "stderr: {stderr}");
+    assert!(
+        ledger_dir.exists(),
+        "mint never created the ledger directory"
+    );
+    assert!(
+        ledger_entries.is_empty(),
+        "unexpected ledger entries: {ledger_entries:?}"
+    );
+}
+
 /// Reads lines from `stderr` on a background thread until one contains `needle`, then keeps
 /// draining `stderr` to EOF so the child never blocks on a full pipe.
 fn wait_for_stderr_line(
