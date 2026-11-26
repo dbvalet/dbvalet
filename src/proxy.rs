@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::{Endpoint, Tls};
-use crate::runlog::{MAX_OBSERVED_QUERY_BYTES, RunLog, StatementKind};
+use crate::runlog::{MAX_LOGGED_QUERY_BYTES, RunLog, StatementKind};
 use crate::source::UpstreamLogin;
 
 /// PostgreSQL refuses longer startup packets too.
@@ -400,7 +400,7 @@ impl FrameObserver {
 }
 
 fn push_query_bytes(buf: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
-    let available = MAX_OBSERVED_QUERY_BYTES.saturating_sub(buf.len());
+    let available = MAX_LOGGED_QUERY_BYTES.saturating_sub(buf.len());
     if chunk.len() <= available {
         buf.extend_from_slice(chunk);
     } else {
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn an_oversized_query_is_marked_truncated_and_later_queries_still_log() {
-        let huge = format!("SELECT '{}'\0", "a".repeat(MAX_OBSERVED_QUERY_BYTES + 100));
+        let huge = format!("SELECT '{}'\0", "a".repeat(MAX_LOGGED_QUERY_BYTES + 100));
         let mut wire = frame(b'Q', huge.as_bytes());
         wire.extend(frame(b'Q', b"SELECT 'after-huge'\0"));
 
@@ -729,7 +729,7 @@ mod tests {
         });
 
         assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].1.len(), MAX_OBSERVED_QUERY_BYTES);
+        assert_eq!(seen[0].1.len(), MAX_LOGGED_QUERY_BYTES);
         assert!(seen[0].2);
         assert_eq!(
             seen[1],

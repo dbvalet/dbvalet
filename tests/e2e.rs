@@ -2191,7 +2191,7 @@ fn a_run_with_no_sql_log_records_the_header_and_no_statements() {
     let state = isolated_state_home("e2e-log-no-sql");
 
     let _sweeping = sweeping();
-    let mut run = Command::new(DBVALET)
+    let output = Command::new(DBVALET)
         .current_dir(&dir)
         .env("XDG_STATE_HOME", &state)
         .args([
@@ -2200,19 +2200,11 @@ fn a_run_with_no_sql_log_records_the_header_and_no_statements() {
             "--no-sql-log",
             "--",
             "psql",
-            "-At",
+            "-Atc",
+            "SELECT 'no-sql-log-marker-4a1f';",
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    run.stdin
-        .take()
-        .unwrap()
-        .write_all(b"SELECT 'no-sql-log-marker-4a1f';\n")
-        .unwrap();
-    let output = run.wait_with_output().unwrap();
+        .output()
+        .expect("run psql");
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "no-sql-log-marker-4a1f\n");
 
@@ -2238,7 +2230,7 @@ fn a_run_with_no_sql_log_records_the_header_and_no_statements() {
     assert!(log.contains("database: e2e-log-no-sql\n"), "{log}");
     assert!(log.contains("role: reader\n"), "{log}");
     assert!(log.contains("sql_log: disabled (--no-sql-log)\n"), "{log}");
-    assert!(log.contains("command: psql -At\n"), "{log}");
+    assert!(log.contains("command: psql\n"), "{log}");
     assert!(!log.contains("no-sql-log-marker-4a1f"), "{log}");
     assert!(!log.contains(" [Q] "), "{log}");
     assert!(!log.contains(" [P] "), "{log}");

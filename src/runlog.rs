@@ -55,13 +55,10 @@ const SECONDS_PER_HOUR: u64 = 3_600;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REDACTED_LITERAL: &str = "'[REDACTED]'";
 const REDACTED_SECRET: &str = "[REDACTED]";
-const TRUNCATED_MARKER: &str = " /* truncated */";
+const TRUNCATED_MARKER: &str = "/* truncated */";
 
 /// Maximum byte length of a single logged statement line before the truncation marker.
 pub(crate) const MAX_LOGGED_QUERY_BYTES: usize = 64 * 1024;
-/// Extra lookahead past [`MAX_LOGGED_QUERY_BYTES`] so a 32-byte run token or temporary login
-/// password straddling the truncation boundary is still scrubbed in full before truncating.
-pub(crate) const MAX_OBSERVED_QUERY_BYTES: usize = MAX_LOGGED_QUERY_BYTES + 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
@@ -229,26 +226,27 @@ impl RunLog {
     /// Redacts passwords and runtime secrets from `sql`, normalizes it onto one line,
     /// truncates if needed, and writes it to the run log file.
     pub fn statement(&self, kind: StatementKind, sql: &str, truncated: bool) {
-        if sql.trim().is_empty() {
-            return;
-        }
-        // Scrub runtime secrets before truncating so a secret straddling the 64 KiB boundary
-        // is removed in full, and discard the extra lookahead before redaction/collapsing can
-        // shrink the prefix and pull a partial secret back under the 64 KiB limit.
-        let mut scrubbed = self.inner.secrets.scrub(sql);
-        if truncated {
-            truncate_utf8(&mut scrubbed, MAX_LOGGED_QUERY_BYTES);
-        }
-        let redacted = redact_sql(&scrubbed);
-        let scrubbed = self.inner.secrets.scrub(&redacted);
-        let mut single_line = sanitize_single_line(&scrubbed);
-        if single_line.trim().is_empty() {
-            return;
-        }
-        if truncated || single_line.len() > MAX_LOGGED_QUERY_BYTES {
-            truncate_utf8(&mut single_line, MAX_LOGGED_QUERY_BYTES);
-            single_line.push_str(TRUNCATED_MARKER);
-        }
+        let single_line = if truncated {
+            // An incomplete statement can omit the context needed to identify a credential.
+            TRUNCATED_MARKER.to_owned()
+        } else {
+            if sql.trim().is_empty() {
+                return;
+            }
+            let scrubbed = self.inner.secrets.scrub(sql);
+            let redacted = redact_sql(&scrubbed);
+            let scrubbed = self.inner.secrets.scrub(&redacted);
+            let mut line = sanitize_single_line(&scrubbed);
+            if line.trim().is_empty() {
+                return;
+            }
+            if line.len() > MAX_LOGGED_QUERY_BYTES {
+                truncate_utf8(&mut line, MAX_LOGGED_QUERY_BYTES);
+                line.push(' ');
+                line.push_str(TRUNCATED_MARKER);
+            }
+            line
+        };
         let line = format!(
             "{} [{}] {single_line}\n",
             format_utc_rfc3339(SystemTime::now()),
@@ -339,7 +337,12 @@ fn format_header(header: &RunHeader, secrets: &RunSecrets) -> String {
     } else {
         "disabled (--no-sql-log)"
     };
-    let command = format_command(&header.command, secrets);
+    let command = if header.sql_log {
+        header.command.as_slice()
+    } else {
+        &header.command[..header.command.len().min(1)]
+    };
+    let command = format_command(command, secrets);
     format!(
         "run_id: {}\n\
          started_at: {}\n\
@@ -1503,34 +1506,29 @@ mod tests {
     }
 
     #[test]
-    fn a_token_straddling_the_truncation_boundary_is_scrubbed_before_truncating() {
-        let dir = temp_runs_dir("truncate-boundary");
+    fn an_incomplete_statement_records_only_the_truncation_marker() {
+        let dir = temp_runs_dir("omit-incomplete-statement");
         let header = sample_header("aaaaaaaaaaaaaaaa", 1_795_688_130, &["psql"], true);
         let log = open_in(&dir, &header, sample_secrets()).unwrap();
-        let padding = "x".repeat(MAX_LOGGED_QUERY_BYTES - 10);
-        let sql = format!("SELECT '{padding}toksecret1234567890abcdef1234567'");
-        log.statement(StatementKind::Query, &sql, true);
+
+        log.statement(StatementKind::Query, "SELECT 'unfinished text", true);
 
         let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
-        assert!(!content.contains("toksecret"), "{content}");
-        assert!(content.contains(" /* truncated */\n"), "{content}");
+        assert!(content.ends_with("[Q] /* truncated */\n"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_partial_token_at_the_observer_cap_does_not_survive_when_newlines_collapse() {
-        let dir = temp_runs_dir("truncate-shrink");
-        let header = sample_header("aaaaaaaaaaaaaaaa", 1_795_688_130, &["psql"], true);
-        let log = open_in(&dir, &header, sample_secrets()).unwrap();
-        let newlines = "\n".repeat(MAX_LOGGED_QUERY_BYTES + 40);
-        // Simulates the observer cutting 20 chars into the 32-char token at 64 KiB + 64.
-        let sql = format!("SELECT 1{newlines}toksecret1234567890a");
-        log.statement(StatementKind::Query, &sql, true);
+    fn a_header_with_sql_logging_disabled_records_only_the_executable() {
+        let header = sample_header(
+            "aaaaaaaaaaaaaaaa",
+            1_795_688_130,
+            &["psql", "-c", "SELECT 'private note'"],
+            false,
+        );
+        let text = format_header(&header, &sample_secrets());
 
-        let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
-        assert!(!content.contains("toksecret"), "{content}");
-        assert!(content.contains(" /* truncated */\n"), "{content}");
-        let _ = fs::remove_dir_all(&dir);
+        assert!(text.ends_with("command: psql\n\n"));
     }
 
     #[test]

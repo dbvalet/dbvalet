@@ -52,7 +52,7 @@ enum Command {
         /// Connect without TLS. Allowed only for a database on localhost.
         #[arg(long)]
         allow_plaintext: bool,
-        /// Record only the run header in the run log, omitting SQL statements.
+        /// Record only the run header, without command arguments or SQL statements.
         #[arg(long)]
         no_sql_log: bool,
         /// The command and its arguments, after `--`.
@@ -64,6 +64,7 @@ enum Command {
     /// The run token and temporary login password are always scrubbed. SQL password redaction
     /// (such as `ALTER ROLE ... PASSWORD '[REDACTED]'`) is lexical and best-effort; use
     /// `dbvalet run --no-sql-log` when query text must stay off disk.
+    /// Statements over the 64 KiB capture limit are recorded as a truncation marker.
     Log {
         /// The run ID to print. Omit to list recent runs.
         run_id: Option<String>,
