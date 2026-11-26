@@ -1,6 +1,6 @@
 //! Temporary logins created with the admin login, over admin SQL.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -15,17 +15,16 @@ use super::{CredentialSource, Lease, SourceError, SweepReport, UpstreamLogin};
 use crate::config::RoleGrant;
 use crate::endpoint::Tls;
 use crate::keychain::{self, AdminLogin};
-use crate::ledger;
-use crate::{DatabaseAlias, random_base32};
+use crate::ledger::{self, State};
+use crate::{DatabaseAlias, LOGIN_PREFIX, RUN_ID_BYTES, is_login_name, random_base32};
 
+/// For the whole admin connection: TCP, startup and authentication.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// So a lock someone else holds on what a login owns fails that drop instead of stalling it.
+const ADMIN_LOCK_TIMEOUT: &str = "10s";
 const MINIMUM_SERVER_VERSION_NUM: i32 = 150000;
 /// From this version a CREATEROLE admin can inherit the roles it creates.
 const CREATEROLE_SELF_GRANT_VERSION_NUM: i32 = 160000;
-const LOGIN_PREFIX: &str = "dbvalet_";
-/// 80 random bits, written as the 16 base32 characters after [`LOGIN_PREFIX`].
-const RUN_ID_BYTES: usize = 10;
-const RUN_ID_CHARS: usize = RUN_ID_BYTES * 8 / 5;
 const LOGIN_PASSWORD_BYTES: usize = 20;
 /// How far ahead of the database's clock a new login's `VALID UNTIL` is set.
 const LEASE_AHEAD: &str = "15 minutes";
@@ -62,7 +61,8 @@ impl DirectSource {
 
 impl CredentialSource for DirectSource {
     async fn sweep(&self) -> Result<SweepReport, SourceError> {
-        let orphans = ledger::orphans(&self.alias)?;
+        let mut report = SweepReport::default();
+        let found = ledger::scan();
         let client =
             connect(&self.alias, &self.admin)
                 .await
@@ -70,25 +70,38 @@ impl CredentialSource for DirectSource {
                     alias: self.alias.clone(),
                     reason,
                 })?;
-        let mut report = SweepReport::default();
-        // Retried without its ledger entry, a read-only login could be taken for a writable one.
-        let mut tried = BTreeSet::new();
-        for entry in orphans {
-            // Only names dbvalet makes: anything else in the ledger is left alone.
-            if !is_login_name(entry.login()) {
-                continue;
+        let found = match found {
+            Ok(found) => found,
+            Err(err) => {
+                // Without the ledger, pass (b) can't tell a read-only login from a writable one.
+                report.failures.push(err.into());
+                return Ok(report);
             }
-            let login = entry.login().to_owned();
-            tried.insert(login.clone());
-            match drop_leftover_login(&client, &login, entry.read_only()).await {
-                Ok(existed) => match entry.remove() {
-                    Ok(()) if existed => report.dropped.push(login),
-                    Ok(()) => report.already_gone.push(login),
-                    Err(err) => report.failures.push(err.into()),
-                },
-                Err(reason) => report
-                    .failures
-                    .push(SourceError::DropLeftoverLogin { login, reason }),
+        };
+
+        // Pass (b) leaves these alone: this alias's entries are pass (a)'s, and an entry that is
+        // held or unreadable may belong to a live run.
+        let mut handled = BTreeSet::new();
+        let mut other_orphans = BTreeMap::new();
+        for found in found {
+            let own = found.alias == self.alias;
+            match found.state {
+                State::Orphan(entry) if own => {
+                    handled.insert(found.login);
+                    sweep_orphan(&client, entry, &mut report).await;
+                }
+                State::Orphan(entry) => {
+                    other_orphans.insert(found.login, entry);
+                }
+                State::Held => {
+                    handled.insert(found.login);
+                }
+                State::Unreadable(err) => {
+                    handled.insert(found.login);
+                    if own {
+                        report.failures.push(err.into());
+                    }
+                }
             }
         }
 
@@ -103,10 +116,15 @@ impl CredentialSource for DirectSource {
         };
         for row in expired {
             let login: String = row.get(0);
-            if !is_login_name(&login) || tried.contains(&login) {
+            if !is_login_name(&login) || handled.contains(&login) {
                 continue;
             }
-            match drop_leftover_login(&client, &login, false).await {
+            // An entry under another alias on the same database still knows how the run began.
+            if let Some(entry) = other_orphans.remove(&login) {
+                sweep_orphan(&client, entry, &mut report).await;
+                continue;
+            }
+            match drop_leftover_login(&client, &login, None).await {
                 Ok(true) => report.dropped.push(login),
                 Ok(false) => {}
                 Err(reason) => report
@@ -243,16 +261,6 @@ fn new_login_name() -> Result<String, getrandom::Error> {
     ))
 }
 
-/// Whether [`new_login_name`] could have made `name`: `^dbvalet_[a-z2-7]{16}$`.
-fn is_login_name(name: &str) -> bool {
-    name.strip_prefix(LOGIN_PREFIX).is_some_and(|run_id| {
-        run_id.len() == RUN_ID_CHARS
-            && run_id
-                .bytes()
-                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
-    })
-}
-
 /// Ends the login's sessions, clears or reassigns what it owns, and drops it.
 pub(super) async fn drop_login(
     alias: &DatabaseAlias,
@@ -274,12 +282,28 @@ pub(super) async fn drop_login(
         .map_err(drop_failed)
 }
 
+/// Drops the login of an entry whose run has ended, then removes the entry.
+async fn sweep_orphan(client: &Client, entry: ledger::Entry, report: &mut SweepReport) {
+    let login = entry.login().to_owned();
+    match drop_leftover_login(client, &login, entry.read_only()).await {
+        Ok(existed) => match entry.remove() {
+            Ok(()) if existed => report.dropped.push(login),
+            Ok(()) => report.already_gone.push(login),
+            Err(err) => report.failures.push(err.into()),
+        },
+        Err(reason) => report
+            .failures
+            .push(SourceError::DropLeftoverLogin { login, reason }),
+    }
+}
+
 /// Drops a login an ended run left behind, reading from the database what its lease knew.
-/// Returns whether the login still existed.
+/// `ledger_read_only` is the ledger entry's word, when there is one. Returns whether the
+/// login still existed.
 async fn drop_leftover_login(
     client: &Client,
     user: &str,
-    ledger_read_only: bool,
+    ledger_read_only: Option<bool>,
 ) -> Result<bool, String> {
     let Some(role) = client
         .query_opt(
@@ -296,8 +320,8 @@ async fn drop_leftover_login(
     else {
         return Ok(false);
     };
-    // The login can reset its own settings but not the ledger, so either one marking it counts.
-    let read_only = ledger_read_only || role.get::<_, bool>(0);
+    // The login can change its own settings in either direction, but not the ledger.
+    let read_only = ledger_read_only.unwrap_or_else(|| role.get(0));
     let groups: Vec<String> = role.get(1);
     let reassign_to = match (read_only, groups.as_slice()) {
         (true, _) => None,
@@ -603,18 +627,29 @@ async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, St
                     use --allow-plaintext with a database on localhost"
             .to_owned());
     }
-    let (client, connection) = tokio_postgres::Config::new()
+    let mut config = tokio_postgres::Config::new();
+    config
         .host(endpoint.host())
         .port(endpoint.port())
         .dbname(endpoint.database())
         .user(admin.user())
         .password(admin.password().expose_secret())
-        .ssl_mode(SslMode::Disable)
-        .connect_timeout(ADMIN_CONNECT_TIMEOUT)
-        .connect(NoTls)
+        .ssl_mode(SslMode::Disable);
+    let (client, connection) = tokio::time::timeout(ADMIN_CONNECT_TIMEOUT, config.connect(NoTls))
         .await
+        .map_err(|_| {
+            format!(
+                "no answer within {} s: check that the host and port in \
+                     `dbvalet login {alias}` are a PostgreSQL server's",
+                ADMIN_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
         .map_err(|err| describe_connect_error(alias, admin, &err))?;
     tokio::spawn(connection);
+    client
+        .batch_execute(&format!("SET lock_timeout = '{ADMIN_LOCK_TIMEOUT}'"))
+        .await
+        .map_err(|err| describe_sql_error(&err))?;
     Ok(client)
 }
 

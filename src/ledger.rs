@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use crate::DatabaseAlias;
+use crate::{DatabaseAlias, is_login_name};
 
 const READ_ONLY: &str = "read-only\n";
 const WRITABLE: &str = "writable\n";
@@ -34,7 +34,7 @@ pub enum LedgerError {
 pub struct Entry {
     path: PathBuf,
     login: String,
-    read_only: bool,
+    read_only: Option<bool>,
     _lock: File,
 }
 
@@ -43,7 +43,8 @@ impl Entry {
         &self.login
     }
 
-    pub fn read_only(&self) -> bool {
+    /// Whether the run that wrote the entry was read-only, or `None` if the entry can't say.
+    pub fn read_only(&self) -> Option<bool> {
         self.read_only
     }
 
@@ -81,42 +82,78 @@ pub fn create(alias: &DatabaseAlias, login: &str, read_only: bool) -> Result<Ent
     Ok(Entry {
         path,
         login: login.to_owned(),
-        read_only,
+        read_only: Some(read_only),
         _lock: file,
     })
 }
 
-/// The entries for `alias` whose run has ended, each now locked by the caller.
-pub fn orphans(alias: &DatabaseAlias) -> Result<Vec<Entry>, LedgerError> {
-    let mut orphans = Vec::new();
-    for (entry_alias, login, path) in entries(&ledger_dir()?)? {
-        if entry_alias != *alias {
-            continue;
-        }
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(reason) => return Err(io_error("read the ledger entry", &path, reason)),
+/// One entry [`scan`] found.
+#[derive(Debug)]
+pub struct Found {
+    pub alias: DatabaseAlias,
+    pub login: String,
+    pub state: State,
+}
+
+#[derive(Debug)]
+pub enum State {
+    /// Its run has ended, and the caller now holds its lock.
+    Orphan(Entry),
+    /// Another process holds its lock: its run is still going, or another sweep has it.
+    Held,
+    /// It couldn't be opened, locked or read.
+    Unreadable(LedgerError),
+}
+
+/// Every entry in the ledger, under any alias. Only a ledger that can't be listed is an error.
+pub fn scan() -> Result<Vec<Found>, LedgerError> {
+    let mut found = Vec::new();
+    for (alias, login, path) in entries(&ledger_dir()?)? {
+        let state = match lock(&path, &login) {
+            Ok(Some(entry)) => State::Orphan(entry),
+            Ok(None) => State::Held,
+            // Its run removed it between the listing and now.
+            Err(err) if is_not_found(&err) => continue,
+            Err(err) => State::Unreadable(err),
         };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => continue,
-            Err(TryLockError::Error(reason)) => {
-                return Err(io_error("lock the ledger entry", &path, reason));
-            }
-        }
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .map_err(|reason| io_error("read the ledger entry", &path, reason))?;
-        orphans.push(Entry {
-            path,
+        found.push(Found {
+            alias,
             login,
-            // Anything unreadable counts as writable, so a sweep reassigns objects, never drops them.
-            read_only: contents == READ_ONLY.as_bytes(),
-            _lock: file,
+            state,
         });
     }
-    Ok(orphans)
+    Ok(found)
+}
+
+/// Opens, locks and reads one entry. `None` means another process holds its lock.
+fn lock(path: &Path, login: &str) -> Result<Option<Entry>, LedgerError> {
+    let mut file =
+        File::open(path).map_err(|reason| io_error("read the ledger entry", path, reason))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(reason)) => {
+            return Err(io_error("lock the ledger entry", path, reason));
+        }
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|reason| io_error("read the ledger entry", path, reason))?;
+    let read_only = match contents.as_slice() {
+        bytes if bytes == READ_ONLY.as_bytes() => Some(true),
+        bytes if bytes == WRITABLE.as_bytes() => Some(false),
+        _ => None,
+    };
+    Ok(Some(Entry {
+        path: path.to_owned(),
+        login: login.to_owned(),
+        read_only,
+        _lock: file,
+    }))
+}
+
+fn is_not_found(err: &LedgerError) -> bool {
+    matches!(err, LedgerError::Io { reason, .. } if reason.kind() == io::ErrorKind::NotFound)
 }
 
 /// Every database alias with at least one entry, live or not.
@@ -136,21 +173,24 @@ fn entries(dir: &Path) -> Result<Vec<(DatabaseAlias, String, PathBuf)>, LedgerEr
     let mut entries = Vec::new();
     for file in listing {
         let file = file.map_err(|reason| io_error("read the ledger", dir, reason))?;
-        if !file
-            .file_type()
-            .map_err(|reason| io_error("read the ledger", dir, reason))?
-            .is_file()
-        {
-            continue;
-        }
         let name = file.file_name();
-        // No alias contains `.` or starts with one, so staging files fail to parse here.
+        // Anything else in the directory, such as a README, is never opened. No alias starts
+        // with `.`, so staging files are skipped too.
         let Some((alias, login)) = name.to_str().and_then(|name| name.split_once('.')) else {
             continue;
         };
         let Ok(alias) = alias.parse() else {
             continue;
         };
+        if !is_login_name(login) {
+            continue;
+        }
+        match file.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(reason) => return Err(io_error("read the ledger", dir, reason)),
+        }
         entries.push((alias, login.to_owned(), file.path()));
     }
     Ok(entries)

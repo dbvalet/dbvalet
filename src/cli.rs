@@ -1,6 +1,8 @@
 //! The command line, mapped onto library calls.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitCode, ExitStatus};
@@ -11,7 +13,7 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use crate::DatabaseAlias;
 use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
-use crate::ledger::{self, LedgerError};
+use crate::ledger;
 use crate::policy::{self, PolicyError};
 use crate::run::{self, RunError};
 use crate::source::CredentialSource;
@@ -82,8 +84,6 @@ pub enum CliError {
     Policy(#[from] PolicyError),
     #[error(transparent)]
     Run(#[from] RunError),
-    #[error(transparent)]
-    Ledger(#[from] LedgerError),
 }
 
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -127,19 +127,24 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Command::Gc { allow_plaintext } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
-            let mut aliases = ledger::aliases()?;
+            let mut all_swept = true;
+            // A ledger that can't be listed still leaves dbvalet.toml's databases to sweep.
+            let mut aliases = ledger::aliases().unwrap_or_else(|err| {
+                let _ = writeln!(io::stderr(), "dbvalet: {err}");
+                all_swept = false;
+                BTreeSet::new()
+            });
             match config::find_and_load(&cwd) {
                 Ok(config) => aliases.extend(config.databases.into_keys()),
                 Err(ConfigError::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
-            if aliases.is_empty() {
-                println!(
+            if aliases.is_empty() && all_swept {
+                print_line(format_args!(
                     "nothing to clean up: no database in the ledger or in {}",
                     config::FILE_NAME
-                );
+                ));
             }
-            let mut all_swept = true;
             for alias in &aliases {
                 all_swept &= gc(alias, allow_plaintext).await;
             }
@@ -169,18 +174,27 @@ async fn gc(alias: &DatabaseAlias, allow_plaintext: bool) -> bool {
         }
     };
     for login in &report.dropped {
-        println!("`{alias}`: dropped the leftover login `{login}`");
+        print_line(format_args!(
+            "`{alias}`: dropped the leftover login `{login}`"
+        ));
     }
     for login in &report.already_gone {
-        println!("`{alias}`: removed the ledger entry for `{login}`, whose login was already gone");
+        print_line(format_args!(
+            "`{alias}`: removed the ledger entry for `{login}`, whose login was already gone"
+        ));
     }
     for err in &report.failures {
         let _ = writeln!(io::stderr(), "dbvalet: `{alias}`: {err}");
     }
     if report.dropped.is_empty() && report.already_gone.is_empty() && report.failures.is_empty() {
-        println!("`{alias}`: nothing to clean up");
+        print_line(format_args!("`{alias}`: nothing to clean up"));
     }
     report.failures.is_empty()
+}
+
+/// Prints a line of `gc`'s report. A closed stdout mustn't stop the sweep of the next database.
+fn print_line(line: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout(), "{line}");
 }
 
 /// The child's exit code, or 128 plus the signal that killed it, as a shell reports it.
