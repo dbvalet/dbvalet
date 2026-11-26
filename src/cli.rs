@@ -1,6 +1,5 @@
 //! The command line, mapped onto library calls.
 
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
@@ -127,24 +126,26 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
         Command::Gc { allow_plaintext } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
-            let mut all_swept = true;
-            // A ledger that can't be listed still leaves dbvalet.toml's databases to sweep.
-            let mut aliases = ledger::aliases().unwrap_or_else(|err| {
-                let _ = writeln!(io::stderr(), "dbvalet: {err}");
-                all_swept = false;
-                BTreeSet::new()
-            });
+            // Without the ledger no database can be swept safely, so none is tried.
+            let mut aliases = match ledger::aliases() {
+                Ok(aliases) => aliases,
+                Err(err) => {
+                    let _ = writeln!(io::stderr(), "dbvalet: {err}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
             match config::find_and_load(&cwd) {
                 Ok(config) => aliases.extend(config.databases.into_keys()),
                 Err(ConfigError::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
-            if aliases.is_empty() && all_swept {
+            if aliases.is_empty() {
                 print_line(format_args!(
                     "nothing to clean up: no database in the ledger or in {}",
                     config::FILE_NAME
                 ));
             }
+            let mut all_swept = true;
             for alias in &aliases {
                 all_swept &= gc(alias, allow_plaintext).await;
             }

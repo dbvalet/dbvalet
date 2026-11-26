@@ -1,6 +1,6 @@
 //! Temporary logins created with the admin login, over admin SQL.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::keychain::{self, AdminLogin};
 use crate::ledger::{self, State};
 use crate::{DatabaseAlias, LOGIN_PREFIX, RUN_ID_BYTES, is_login_name, random_base32};
 
-/// For the whole admin connection: TCP, startup and authentication.
+/// For the whole admin connection: TCP, startup, authentication and its first setting.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// So a lock someone else holds on what a login owns fails that drop instead of stalling it.
 const ADMIN_LOCK_TIMEOUT: &str = "10s";
@@ -62,7 +62,14 @@ impl DirectSource {
 impl CredentialSource for DirectSource {
     async fn sweep(&self) -> Result<SweepReport, SourceError> {
         let mut report = SweepReport::default();
-        let found = ledger::scan();
+        let listed = match ledger::list() {
+            Ok(listed) => listed,
+            Err(err) => {
+                // Without the ledger, pass (b) can't tell a live login, or a read-only one.
+                report.failures.push(err.into());
+                return Ok(report);
+            }
+        };
         let client =
             connect(&self.alias, &self.admin)
                 .await
@@ -70,38 +77,20 @@ impl CredentialSource for DirectSource {
                     alias: self.alias.clone(),
                     reason,
                 })?;
-        let found = match found {
-            Ok(found) => found,
-            Err(err) => {
-                // Without the ledger, pass (b) can't tell a read-only login from a writable one.
-                report.failures.push(err.into());
-                return Ok(report);
-            }
-        };
 
-        // Pass (b) leaves these alone: this alias's entries are pass (a)'s, and an entry that is
-        // held or unreadable may belong to a live run.
-        let mut handled = BTreeSet::new();
-        let mut other_orphans = BTreeMap::new();
-        for found in found {
-            let own = found.alias == self.alias;
-            match found.state {
-                State::Orphan(entry) if own => {
-                    handled.insert(found.login);
-                    sweep_orphan(&client, entry, &mut report).await;
-                }
-                State::Orphan(entry) => {
-                    other_orphans.insert(found.login, entry);
-                }
-                State::Held => {
-                    handled.insert(found.login);
-                }
-                State::Unreadable(err) => {
-                    handled.insert(found.login);
-                    if own {
-                        report.failures.push(err.into());
-                    }
-                }
+        // Pass (b) leaves every login with an entry alone. This alias's entries are pass (a)'s.
+        // Another alias's are that alias's sweep's, which connects to the database holding the
+        // login's objects and never has its entries locked by this sweep.
+        let mut has_entry = BTreeSet::new();
+        for listed in listed {
+            has_entry.insert(listed.login.clone());
+            if listed.alias != self.alias {
+                continue;
+            }
+            match listed.lock() {
+                Some(State::Orphan(entry)) => sweep_orphan(&client, entry, &mut report).await,
+                Some(State::Held) | None => {}
+                Some(State::Unreadable(err)) => report.failures.push(err.into()),
             }
         }
 
@@ -116,12 +105,7 @@ impl CredentialSource for DirectSource {
         };
         for row in expired {
             let login: String = row.get(0);
-            if !is_login_name(&login) || handled.contains(&login) {
-                continue;
-            }
-            // An entry under another alias on the same database still knows how the run began.
-            if let Some(entry) = other_orphans.remove(&login) {
-                sweep_orphan(&client, entry, &mut report).await;
+            if !is_login_name(&login) || has_entry.contains(&login) {
                 continue;
             }
             match drop_leftover_login(&client, &login, None).await {
@@ -635,22 +619,27 @@ async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, St
         .user(admin.user())
         .password(admin.password().expose_secret())
         .ssl_mode(SslMode::Disable);
-    let (client, connection) = tokio::time::timeout(ADMIN_CONNECT_TIMEOUT, config.connect(NoTls))
+    let connecting = async {
+        let (client, connection) = config
+            .connect(NoTls)
+            .await
+            .map_err(|err| describe_connect_error(alias, admin, &err))?;
+        tokio::spawn(connection);
+        client
+            .batch_execute(&format!("SET lock_timeout = '{ADMIN_LOCK_TIMEOUT}'"))
+            .await
+            .map_err(|err| describe_sql_error(&err))?;
+        Ok(client)
+    };
+    tokio::time::timeout(ADMIN_CONNECT_TIMEOUT, connecting)
         .await
         .map_err(|_| {
             format!(
                 "no answer within {} s: check that the host and port in \
-                     `dbvalet login {alias}` are a PostgreSQL server's",
+                 `dbvalet login {alias}` are a PostgreSQL server's",
                 ADMIN_CONNECT_TIMEOUT.as_secs()
             )
         })?
-        .map_err(|err| describe_connect_error(alias, admin, &err))?;
-    tokio::spawn(connection);
-    client
-        .batch_execute(&format!("SET lock_timeout = '{ADMIN_LOCK_TIMEOUT}'"))
-        .await
-        .map_err(|err| describe_sql_error(&err))?;
-    Ok(client)
 }
 
 /// Never prints the server's raw error text, because it can quote input fields.

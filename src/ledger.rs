@@ -87,12 +87,24 @@ pub fn create(alias: &DatabaseAlias, login: &str, read_only: bool) -> Result<Ent
     })
 }
 
-/// One entry [`scan`] found.
+/// One entry [`list`] found, not yet opened.
 #[derive(Debug)]
-pub struct Found {
+pub struct Listed {
     pub alias: DatabaseAlias,
     pub login: String,
-    pub state: State,
+    path: PathBuf,
+}
+
+impl Listed {
+    /// Opens and locks the entry. `None` means its run removed it after it was listed.
+    pub fn lock(self) -> Option<State> {
+        match lock(&self.path, &self.login) {
+            Ok(Some(entry)) => Some(State::Orphan(entry)),
+            Ok(None) => Some(State::Held),
+            Err(err) if is_not_found(&err) => None,
+            Err(err) => Some(State::Unreadable(err)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,24 +117,9 @@ pub enum State {
     Unreadable(LedgerError),
 }
 
-/// Every entry in the ledger, under any alias. Only a ledger that can't be listed is an error.
-pub fn scan() -> Result<Vec<Found>, LedgerError> {
-    let mut found = Vec::new();
-    for (alias, login, path) in entries(&ledger_dir()?)? {
-        let state = match lock(&path, &login) {
-            Ok(Some(entry)) => State::Orphan(entry),
-            Ok(None) => State::Held,
-            // Its run removed it between the listing and now.
-            Err(err) if is_not_found(&err) => continue,
-            Err(err) => State::Unreadable(err),
-        };
-        found.push(Found {
-            alias,
-            login,
-            state,
-        });
-    }
-    Ok(found)
+/// Every entry in the ledger, under any alias, without opening any of them.
+pub fn list() -> Result<Vec<Listed>, LedgerError> {
+    entries(&ledger_dir()?)
 }
 
 /// Opens, locks and reads one entry. `None` means another process holds its lock.
@@ -158,13 +155,10 @@ fn is_not_found(err: &LedgerError) -> bool {
 
 /// Every database alias with at least one entry, live or not.
 pub fn aliases() -> Result<BTreeSet<DatabaseAlias>, LedgerError> {
-    Ok(entries(&ledger_dir()?)?
-        .into_iter()
-        .map(|(alias, _, _)| alias)
-        .collect())
+    Ok(list()?.into_iter().map(|listed| listed.alias).collect())
 }
 
-fn entries(dir: &Path) -> Result<Vec<(DatabaseAlias, String, PathBuf)>, LedgerError> {
+fn entries(dir: &Path) -> Result<Vec<Listed>, LedgerError> {
     let listing = match fs::read_dir(dir) {
         Ok(listing) => listing,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -191,7 +185,11 @@ fn entries(dir: &Path) -> Result<Vec<(DatabaseAlias, String, PathBuf)>, LedgerEr
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(reason) => return Err(io_error("read the ledger", dir, reason)),
         }
-        entries.push((alias, login.to_owned(), file.path()));
+        entries.push(Listed {
+            alias,
+            login: login.to_owned(),
+            path: file.path(),
+        });
     }
     Ok(entries)
 }
