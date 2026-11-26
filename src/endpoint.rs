@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -9,13 +10,31 @@ pub struct Endpoint {
     port: u16,
     database: String,
     tls: Tls,
+    channel_binding: ChannelBinding,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tls {
-    VerifyFull,
+    VerifyFull(TrustRoot),
     /// Only ever chosen for a loopback host.
     Plaintext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TrustRoot {
+    /// The OS trust store, used when `sslrootcert` is omitted or set to `system`.
+    #[default]
+    System,
+    /// PEM-encoded CA certificates loaded from the path named by `sslrootcert`.
+    PemFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelBinding {
+    Disable,
+    #[default]
+    Prefer,
+    Require,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +55,25 @@ impl Endpoint {
         database: String,
         allow_plaintext: bool,
     ) -> Result<Self, EndpointError> {
+        Self::with_tls_options(
+            host,
+            port,
+            database,
+            allow_plaintext,
+            TrustRoot::System,
+            ChannelBinding::Prefer,
+        )
+    }
+
+    /// Like [`Endpoint::new`], with an explicit trust root and SCRAM channel-binding mode.
+    pub fn with_tls_options(
+        host: String,
+        port: u16,
+        database: String,
+        allow_plaintext: bool,
+        trust_root: TrustRoot,
+        channel_binding: ChannelBinding,
+    ) -> Result<Self, EndpointError> {
         if !is_valid_host(&host) {
             return Err(EndpointError::InvalidHost);
         }
@@ -43,7 +81,7 @@ impl Endpoint {
             return Err(EndpointError::InvalidDatabase);
         }
         let tls = match allow_plaintext {
-            false => Tls::VerifyFull,
+            false => Tls::VerifyFull(trust_root),
             true if is_loopback(&host) => Tls::Plaintext,
             true => return Err(EndpointError::PlaintextNotLoopback { host }),
         };
@@ -52,6 +90,7 @@ impl Endpoint {
             port,
             database,
             tls,
+            channel_binding,
         })
     }
 
@@ -67,8 +106,16 @@ impl Endpoint {
         &self.database
     }
 
-    pub fn tls(&self) -> Tls {
-        self.tls
+    pub fn tls(&self) -> &Tls {
+        &self.tls
+    }
+
+    pub fn channel_binding(&self) -> ChannelBinding {
+        self.channel_binding
+    }
+
+    pub fn is_loopback(&self) -> bool {
+        is_loopback(&self.host)
     }
 }
 
@@ -128,22 +175,26 @@ mod tests {
 
     #[test]
     fn plaintext_is_allowed_for_localhost_and_loopback_addresses() {
-        assert_eq!(with_plaintext("localhost").unwrap().tls(), Tls::Plaintext);
-        assert_eq!(with_plaintext("127.0.0.1").unwrap().tls(), Tls::Plaintext);
-        assert_eq!(with_plaintext("::1").unwrap().tls(), Tls::Plaintext);
+        assert_eq!(with_plaintext("localhost").unwrap().tls(), &Tls::Plaintext);
+        assert_eq!(with_plaintext("LOCALHOST").unwrap().tls(), &Tls::Plaintext);
+        assert_eq!(with_plaintext("127.0.0.1").unwrap().tls(), &Tls::Plaintext);
+        assert_eq!(with_plaintext("::1").unwrap().tls(), &Tls::Plaintext);
     }
 
     #[test]
     fn plaintext_is_refused_for_any_other_host() {
         assert!(with_plaintext("db.example.com").is_err());
         assert!(with_plaintext("10.0.0.5").is_err());
+        assert!(with_plaintext("192.168.1.1").is_err());
+        assert!(with_plaintext("0.0.0.0").is_err());
+        assert!(with_plaintext("::").is_err());
         assert!(with_plaintext("localhost.example.com").is_err());
     }
 
     #[test]
     fn without_allow_plaintext_every_host_needs_verified_tls() {
         let endpoint = Endpoint::new("localhost".to_owned(), 5432, "postgres".to_owned(), false);
-        assert_eq!(endpoint.unwrap().tls(), Tls::VerifyFull);
+        assert_eq!(endpoint.unwrap().tls(), &Tls::VerifyFull(TrustRoot::System));
     }
 
     #[test]

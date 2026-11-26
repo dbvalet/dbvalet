@@ -14,6 +14,7 @@ pub mod policy;
 pub mod proxy;
 pub mod run;
 pub mod source;
+pub mod tls;
 
 /// Every temporary login's name starts with this.
 pub(crate) const LOGIN_PREFIX: &str = "dbvalet_";

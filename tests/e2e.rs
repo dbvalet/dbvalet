@@ -2047,3 +2047,65 @@ fn a_sweep_of_another_database_never_holds_this_databases_ledger_entries() {
     );
     assert_eq!(logins_after_next, 0);
 }
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn doctor_and_run_without_allow_plaintext_refuse_a_server_without_tls() {
+    let dir = project_with_reader("e2e-tls-refused");
+    let _sweeping = sweeping();
+
+    let checked = Command::new(DBVALET)
+        .args(["doctor", "e2e-tls-refused"])
+        .output()
+        .unwrap();
+    let doctor_stdout = text(&checked.stdout);
+    assert!(!checked.status.success(), "doctor: {doctor_stdout}");
+    assert!(
+        doctor_stdout.contains("the database refused TLS"),
+        "doctor: {doctor_stdout}"
+    );
+    assert!(
+        doctor_stdout.contains("--allow-plaintext"),
+        "doctor: {doctor_stdout}"
+    );
+
+    let run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args(["run", "--", "sh", "-c", "echo child-should-not-run"])
+        .output()
+        .unwrap();
+    let run_stdout = text(&run.stdout);
+    let run_stderr = text(&run.stderr);
+    assert!(!run.status.success(), "run should fail: {run_stdout}");
+    assert!(run_stdout.is_empty(), "child must not run: {run_stdout}");
+    assert!(
+        run_stderr.contains("the database refused TLS"),
+        "stderr: {run_stderr}"
+    );
+
+    let allowed = doctor("e2e-tls-refused");
+    let allowed_stdout = text(&allowed.stdout);
+    assert!(allowed.status.success(), "doctor: {allowed_stdout}");
+    assert!(
+        allowed_stdout.contains("ok   plaintext on localhost (--allow-plaintext)\n"),
+        "doctor: {allowed_stdout}"
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn login_accepts_sslmode_verify_full_and_sslrootcert() {
+    let stored = login(
+        "e2e-login-sslrootcert",
+        "postgresql://admin:pw-e2e-sslrootcert-12ab@db.example.com:5432/app\
+         ?sslmode=verify-full&sslrootcert=/etc/ssl/rds-ca.pem",
+    );
+    assert!(
+        stored.status.success(),
+        "login stderr: {}",
+        text(&stored.stderr)
+    );
+    assert!(!text(&stored.stdout).contains("pw-e2e-sslrootcert-12ab"));
+    assert!(!text(&stored.stderr).contains("pw-e2e-sslrootcert-12ab"));
+}
