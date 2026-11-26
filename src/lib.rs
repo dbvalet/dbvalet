@@ -12,6 +12,7 @@ pub mod keychain;
 pub mod policy;
 pub mod proxy;
 pub mod run;
+pub mod runlog;
 pub mod source;
 
 /// Lowercase RFC 4648 base32: safe in an unquoted SQL identifier, a URL and an environment value.

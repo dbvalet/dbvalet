@@ -3,17 +3,30 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitStatus;
+use std::time::{Duration, SystemTime};
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::DatabaseAlias;
 use crate::config::RoleGrant;
 use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
-use crate::source::{CredentialSource, SourceError, UpstreamLogin};
+use crate::runlog::{self, RunHeader, RunLogError, RunSecrets};
+use crate::source::{CredentialSource, Lease, SourceError};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
+
+/// Policy and logging inputs for one run.
+#[derive(Debug)]
+pub struct RunOptions<'a> {
+    pub database: &'a DatabaseAlias,
+    pub role: &'a str,
+    pub grant: &'a RoleGrant,
+    pub max_ttl: Option<Duration>,
+    pub sql_log: bool,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -21,6 +34,8 @@ pub enum RunError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Proxy(#[from] ProxyError),
+    #[error(transparent)]
+    RunLog(#[from] RunLogError),
     #[error("couldn't start `{program}`")]
     Spawn {
         program: String,
@@ -37,13 +52,13 @@ pub enum RunError {
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
-    grant: &RoleGrant,
+    options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
     assert!(!command.is_empty(), "run needs a command");
-    let lease = source.mint(grant).await?;
-    let finished = run_child(lease.login(), upstream, command).await;
+    let lease = source.mint(options.grant).await?;
+    let finished = run_child(&lease, options, upstream, command).await;
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
@@ -51,13 +66,35 @@ pub async fn run<S: CredentialSource>(
 }
 
 async fn run_child(
-    login: &UpstreamLogin,
+    lease: &Lease,
+    options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
+    let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
+    let header = RunHeader {
+        run_id: lease.run_id().to_owned(),
+        started_at: SystemTime::now(),
+        database: options.database.clone(),
+        role: options.role.to_owned(),
+        valid_until: lease.valid_until().to_owned(),
+        max_ttl: options.max_ttl,
+        command: command.to_vec(),
+        sql_log: options.sql_log,
+    };
+    let run_log = runlog::open(
+        &header,
+        RunSecrets::new(token.clone(), login.password().clone()),
+    )?;
     let database = upstream.database().to_owned();
-    let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
+    let proxy = proxy::start(
+        upstream,
+        login.clone(),
+        token.clone(),
+        options.sql_log.then_some(run_log),
+    )
+    .await?;
     let mut child = child_command(command, login.user(), &token, proxy.port(), &database);
     let finished = match child.spawn() {
         Ok(mut running) => running.wait().await.map_err(RunError::Wait),

@@ -1,7 +1,7 @@
 //! The command line, mapped onto library calls.
 
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitCode, ExitStatus};
 
@@ -12,7 +12,8 @@ use crate::DatabaseAlias;
 use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
 use crate::policy::{self, PolicyError};
-use crate::run::{self, RunError};
+use crate::run::{self, RunError, RunOptions};
+use crate::runlog::{self, RunLogError};
 use crate::source::direct::{self, DirectSource};
 
 const INITIAL_STDIN_CAPACITY: usize = 256;
@@ -48,9 +49,19 @@ enum Command {
         /// Connect without TLS. Allowed only for a database on localhost.
         #[arg(long)]
         allow_plaintext: bool,
+        /// Record only the run header in the run log, omitting SQL statements.
+        #[arg(long)]
+        no_sql_log: bool,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
+    },
+    /// List recent runs (newest first), or print one run's log.
+    ///
+    /// Passwords in SQL statements (such as `ALTER ROLE ... PASSWORD`) are shown as `'[REDACTED]'`.
+    Log {
+        /// The run ID to print. Omit to list recent runs.
+        run_id: Option<String>,
     },
 }
 
@@ -72,6 +83,10 @@ pub enum CliError {
     Policy(#[from] PolicyError),
     #[error(transparent)]
     Run(#[from] RunError),
+    #[error(transparent)]
+    RunLog(#[from] RunLogError),
+    #[error("couldn't write to stdout")]
+    WriteStdout(#[source] io::Error),
 }
 
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -101,6 +116,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             db,
             role,
             allow_plaintext,
+            no_sql_log,
             command,
         } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
@@ -110,9 +126,45 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
             let source = DirectSource::new(alias.clone(), admin);
-            let status = run::run(&source, grant, upstream, &command).await?;
+            let options = RunOptions {
+                database: alias,
+                role: &role,
+                grant,
+                max_ttl: database.max_ttl(),
+                sql_log: !no_sql_log,
+            };
+            let status = run::run(&source, &options, upstream, &command).await?;
             Ok(exit_code(status))
         }
+        Command::Log { run_id: None } => {
+            let runs = runlog::list()?;
+            let mut stdout = io::stdout().lock();
+            if runs.is_empty() {
+                write_stdout(&mut stdout, b"No runs logged yet.\n")?;
+            } else {
+                for summary in &runs {
+                    write_stdout(&mut stdout, format!("{summary}\n").as_bytes())?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Log {
+            run_id: Some(run_id),
+        } => {
+            let content = runlog::read(&run_id)?;
+            let mut stdout = io::stdout().lock();
+            write_stdout(&mut stdout, content.as_bytes())?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Writes to stdout, treating a closed downstream pipe (`head`, `less`) as a clean stop.
+fn write_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
+    match stdout.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(CliError::WriteStdout(err)),
     }
 }
 

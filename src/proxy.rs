@@ -1,6 +1,7 @@
 //! The local endpoint the child connects to. Each client connection must present the run
-//! token; it then gets its own upstream connection as the temporary login, and the proxy
-//! copies bytes both ways without reading them.
+//! token; it then gets its own upstream connection as the temporary login. When SQL logging
+//! is enabled, the proxy passively copies `Q` (simple query) and `P` (parse) statement text
+//! to the run log without ever blocking or modifying the wire stream (ADR-0002).
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -17,6 +18,7 @@ use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::{Endpoint, Tls};
+use crate::runlog::{RunLog, StatementKind};
 use crate::source::UpstreamLogin;
 
 /// PostgreSQL refuses longer startup packets too.
@@ -25,6 +27,14 @@ const MAX_PASSWORD_MESSAGE_LEN: usize = 1_000;
 /// Far above any authentication message, so a non-PostgreSQL peer can't make dbvalet
 /// reserve gigabytes.
 const MAX_UPSTREAM_LOGIN_MESSAGE_LEN: usize = 64 * 1024;
+/// Upper bound on bytes buffered per logged statement; larger queries are still relayed
+/// in full, with only the logged text truncated.
+const MAX_LOGGED_QUERY_BYTES: usize = 64 * 1024;
+const RELAY_BUFFER_BYTES: usize = 8 * 1024;
+const FRONTEND_HEADER_LEN: usize = 5;
+const SIMPLE_QUERY_TAG: u8 = b'Q';
+const PARSE_TAG: u8 = b'P';
+const TRUNCATED_MARKER: &str = " /* truncated */";
 /// SSL and GSS encryption requests are a length and a code, nothing more.
 const ENCRYPTION_REQUEST_LEN: usize = 8;
 const PROTOCOL_VERSION_3_0: u32 = 3 << 16;
@@ -62,6 +72,7 @@ struct Access {
     token: SecretString,
     endpoint: Endpoint,
     login: UpstreamLogin,
+    sql_log: Option<RunLog>,
 }
 
 /// Listens on a random port of 127.0.0.1 until [`Proxy::stop`].
@@ -69,6 +80,7 @@ pub async fn start(
     endpoint: Endpoint,
     login: UpstreamLogin,
     token: SecretString,
+    sql_log: Option<RunLog>,
 ) -> Result<Proxy, ProxyError> {
     if endpoint.tls() != Tls::Plaintext {
         return Err(ProxyError::TlsNotSupported);
@@ -81,6 +93,7 @@ pub async fn start(
         token,
         endpoint,
         login,
+        sql_log,
     });
     let (stop, stopped) = oneshot::channel();
     let accept_loop = tokio::spawn(accept(listener, access, stopped));
@@ -151,8 +164,255 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
     };
     client.write_all(&AUTHENTICATION_OK).await?;
     client.write_all(&unread).await?;
-    tokio::io::copy_bidirectional(client, &mut server).await?;
+    match &access.sql_log {
+        Some(log) => relay_with_log(client, &mut server, log).await?,
+        None => {
+            tokio::io::copy_bidirectional(client, &mut server).await?;
+        }
+    }
     Ok(())
+}
+
+async fn relay_with_log(
+    client: &mut TcpStream,
+    server: &mut TcpStream,
+    sql_log: &RunLog,
+) -> io::Result<()> {
+    let (mut client_read, mut client_write) = client.split();
+    let (mut server_read, mut server_write) = server.split();
+
+    let client_to_server = async {
+        let mut buf = [0u8; RELAY_BUFFER_BYTES];
+        let mut observer = FrameObserver::new();
+        loop {
+            let n = client_read.read(&mut buf).await?;
+            if n == 0 {
+                let _ = server_write.shutdown().await;
+                return Ok::<(), io::Error>(());
+            }
+            // Write to the run log before forwarding so every statement is on disk
+            // before PostgreSQL can reply and let the child exit.
+            observer.observe(&buf[..n], |kind, sql| sql_log.statement(kind, sql));
+            server_write.write_all(&buf[..n]).await?;
+        }
+    };
+
+    let server_to_client = async {
+        tokio::io::copy(&mut server_read, &mut client_write).await?;
+        let _ = client_write.shutdown().await;
+        Ok::<(), io::Error>(())
+    };
+
+    tokio::try_join!(client_to_server, server_to_client)?;
+    Ok(())
+}
+
+/// Passive, bounded-memory observer of PostgreSQL v3.0 frontend frames (`Q` and `P`).
+struct FrameObserver {
+    state: FrameState,
+}
+
+enum FrameState {
+    Header {
+        buf: [u8; FRONTEND_HEADER_LEN],
+        filled: usize,
+    },
+    QueryPayload {
+        remaining: usize,
+        buf: Vec<u8>,
+        truncated: bool,
+        nul_seen: bool,
+    },
+    ParseStmtName {
+        remaining: usize,
+    },
+    ParseQuery {
+        remaining: usize,
+        buf: Vec<u8>,
+        truncated: bool,
+    },
+    Skip {
+        remaining: usize,
+    },
+    Desynced,
+}
+
+impl FrameObserver {
+    fn new() -> Self {
+        Self {
+            state: FrameState::Header {
+                buf: [0; FRONTEND_HEADER_LEN],
+                filled: 0,
+            },
+        }
+    }
+
+    fn observe(&mut self, mut input: &[u8], mut on_statement: impl FnMut(StatementKind, &str)) {
+        while !input.is_empty() {
+            match &mut self.state {
+                FrameState::Header { buf, filled } => {
+                    let take = (FRONTEND_HEADER_LEN - *filled).min(input.len());
+                    buf[*filled..*filled + take].copy_from_slice(&input[..take]);
+                    *filled += take;
+                    input = &input[take..];
+                    if *filled < FRONTEND_HEADER_LEN {
+                        return;
+                    }
+                    let tag = buf[0];
+                    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                    if len < 4 {
+                        self.state = FrameState::Desynced;
+                        return;
+                    }
+                    let payload_len = len - 4;
+                    self.state = if payload_len == 0 {
+                        FrameState::Header {
+                            buf: [0; FRONTEND_HEADER_LEN],
+                            filled: 0,
+                        }
+                    } else if tag == SIMPLE_QUERY_TAG {
+                        FrameState::QueryPayload {
+                            remaining: payload_len,
+                            buf: Vec::new(),
+                            truncated: false,
+                            nul_seen: false,
+                        }
+                    } else if tag == PARSE_TAG {
+                        FrameState::ParseStmtName {
+                            remaining: payload_len,
+                        }
+                    } else {
+                        FrameState::Skip {
+                            remaining: payload_len,
+                        }
+                    };
+                }
+                FrameState::QueryPayload {
+                    remaining,
+                    buf,
+                    truncated,
+                    nul_seen,
+                } => {
+                    let take = (*remaining).min(input.len());
+                    let chunk = &input[..take];
+                    if !*nul_seen {
+                        if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                            push_query_bytes(buf, truncated, &chunk[..nul]);
+                            *nul_seen = true;
+                        } else {
+                            push_query_bytes(buf, truncated, chunk);
+                        }
+                    }
+                    input = &input[take..];
+                    *remaining -= take;
+                    if *remaining == 0 {
+                        let sql = format_observed_query(buf, *truncated);
+                        on_statement(StatementKind::Query, &sql);
+                        self.state = FrameState::Header {
+                            buf: [0; FRONTEND_HEADER_LEN],
+                            filled: 0,
+                        };
+                    }
+                }
+                FrameState::ParseStmtName { remaining } => {
+                    let take = (*remaining).min(input.len());
+                    let chunk = &input[..take];
+                    if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                        let consumed = nul + 1;
+                        input = &input[consumed..];
+                        let left = *remaining - consumed;
+                        self.state = if left == 0 {
+                            FrameState::Header {
+                                buf: [0; FRONTEND_HEADER_LEN],
+                                filled: 0,
+                            }
+                        } else {
+                            FrameState::ParseQuery {
+                                remaining: left,
+                                buf: Vec::new(),
+                                truncated: false,
+                            }
+                        };
+                    } else {
+                        input = &input[take..];
+                        *remaining -= take;
+                        if *remaining == 0 {
+                            self.state = FrameState::Header {
+                                buf: [0; FRONTEND_HEADER_LEN],
+                                filled: 0,
+                            };
+                        }
+                    }
+                }
+                FrameState::ParseQuery {
+                    remaining,
+                    buf,
+                    truncated,
+                } => {
+                    let take = (*remaining).min(input.len());
+                    let chunk = &input[..take];
+                    if let Some(nul) = chunk.iter().position(|&b| b == 0) {
+                        push_query_bytes(buf, truncated, &chunk[..nul]);
+                        let sql = format_observed_query(buf, *truncated);
+                        on_statement(StatementKind::Parse, &sql);
+                        let consumed = nul + 1;
+                        input = &input[consumed..];
+                        let left = *remaining - consumed;
+                        self.state = if left == 0 {
+                            FrameState::Header {
+                                buf: [0; FRONTEND_HEADER_LEN],
+                                filled: 0,
+                            }
+                        } else {
+                            FrameState::Skip { remaining: left }
+                        };
+                    } else {
+                        push_query_bytes(buf, truncated, chunk);
+                        input = &input[take..];
+                        *remaining -= take;
+                        if *remaining == 0 {
+                            let sql = format_observed_query(buf, *truncated);
+                            on_statement(StatementKind::Parse, &sql);
+                            self.state = FrameState::Header {
+                                buf: [0; FRONTEND_HEADER_LEN],
+                                filled: 0,
+                            };
+                        }
+                    }
+                }
+                FrameState::Skip { remaining } => {
+                    let take = (*remaining).min(input.len());
+                    input = &input[take..];
+                    *remaining -= take;
+                    if *remaining == 0 {
+                        self.state = FrameState::Header {
+                            buf: [0; FRONTEND_HEADER_LEN],
+                            filled: 0,
+                        };
+                    }
+                }
+                FrameState::Desynced => return,
+            }
+        }
+    }
+}
+
+fn push_query_bytes(buf: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
+    let available = MAX_LOGGED_QUERY_BYTES.saturating_sub(buf.len());
+    if chunk.len() <= available {
+        buf.extend_from_slice(chunk);
+    } else {
+        buf.extend_from_slice(&chunk[..available]);
+        *truncated = true;
+    }
+}
+
+fn format_observed_query(buf: &[u8], truncated: bool) -> String {
+    let mut text = String::from_utf8_lossy(buf).into_owned();
+    if truncated {
+        text.push_str(TRUNCATED_MARKER);
+    }
+    text
 }
 
 /// Answers each SSL or GSS encryption request with `N` until the startup message comes,
@@ -410,5 +670,69 @@ mod tests {
             &token
         ));
         assert!(!token_matches(&b"\0".to_vec().into(), &token));
+    }
+
+    fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len() + 4).unwrap();
+        let mut out = vec![tag];
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn frame_observer_extracts_simple_query_and_parse_messages_across_one_byte_chunks() {
+        let mut wire = Vec::new();
+        wire.extend(frame(b'Q', b"select 1\0"));
+        wire.extend(frame(b'B', b"\0s0\0\0\0\0\x01\0\0\0\x06secret\0\0"));
+        wire.extend(frame(b'P', b"s0\0SELECT $1::int + 1\0\0\x01\0\0\0\x17"));
+        wire.extend(frame(b'P', b"\0SELECT 2\0\0\0"));
+        wire.extend(frame(b'E', b"\0\0\0\0\0"));
+        wire.extend(frame(b'S', b""));
+        wire.extend(frame(b'd', b"copied row data\n"));
+        wire.extend(frame(b'X', b""));
+
+        let mut observer = FrameObserver::new();
+        let mut seen = Vec::new();
+        for chunk in wire.chunks(1) {
+            observer.observe(chunk, |kind, sql| seen.push((kind, sql.to_owned())));
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (crate::runlog::StatementKind::Query, "select 1".to_owned()),
+                (
+                    crate::runlog::StatementKind::Parse,
+                    "SELECT $1::int + 1".to_owned()
+                ),
+                (crate::runlog::StatementKind::Parse, "SELECT 2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_observer_truncates_oversized_queries_and_survives_malformed_lengths() {
+        let huge = format!("SELECT '{}'\0", "a".repeat(MAX_LOGGED_QUERY_BYTES + 100));
+        let mut wire = frame(b'Q', huge.as_bytes());
+        wire.extend(frame(b'Q', b"SELECT 'after-huge'\0"));
+        // Malformed frame with length 2 (< 4) followed by another Q frame.
+        wire.extend([b'Q', 0, 0, 0, 2]);
+        wire.extend(frame(b'Q', b"SELECT 'after-malformed'\0"));
+
+        let mut observer = FrameObserver::new();
+        let mut seen = Vec::new();
+        observer.observe(&wire, |kind, sql| seen.push((kind, sql.to_owned())));
+
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].1.len() <= MAX_LOGGED_QUERY_BYTES + 32);
+        assert!(seen[0].1.ends_with("/* truncated */"), "{}", seen[0].1);
+        assert_eq!(
+            seen[1],
+            (
+                crate::runlog::StatementKind::Query,
+                "SELECT 'after-huge'".to_owned()
+            )
+        );
     }
 }

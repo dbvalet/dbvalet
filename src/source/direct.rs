@@ -127,6 +127,7 @@ impl CredentialSource for DirectSource {
 
         Ok(Lease {
             login: UpstreamLogin { user, password },
+            valid_until,
             alias: self.alias.clone(),
             admin: Arc::clone(&self.admin),
             member_of: grant.member_of.clone(),

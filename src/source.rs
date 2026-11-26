@@ -70,6 +70,7 @@ pub trait CredentialSource {
 #[derive(Debug)]
 pub struct Lease {
     login: UpstreamLogin,
+    valid_until: String,
     alias: DatabaseAlias,
     admin: Arc<AdminLogin>,
     member_of: String,
@@ -79,6 +80,17 @@ pub struct Lease {
 impl Lease {
     pub fn login(&self) -> &UpstreamLogin {
         &self.login
+    }
+
+    pub fn valid_until(&self) -> &str {
+        &self.valid_until
+    }
+
+    pub fn run_id(&self) -> &str {
+        self.login
+            .user()
+            .strip_prefix("dbvalet_")
+            .unwrap_or(self.login.user())
     }
 
     /// Ends the login's sessions and drops it.
