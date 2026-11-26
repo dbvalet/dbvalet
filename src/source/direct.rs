@@ -179,7 +179,7 @@ impl CredentialSource for DirectSource {
             ("", format!("ROLE {}", quote_ident(self.admin.user())))
         };
         let clock = LeaseClock::new(started, started_at, max_ttl);
-        let valid_until = timestamp_literal(&client, clock.next_expiry())
+        let valid_until = timestamp_literal(&client, clock.next_expiry(started))
             .await
             .map_err(create_failed)?;
         // Written before the login exists, so a run killed from here on leaves it to the sweep.
@@ -230,13 +230,29 @@ async fn timestamp_literal(
     Ok(quote_literal(row.get(0)))
 }
 
-/// Moves the login's `VALID UNTIL` to `expiry`, over a fresh admin connection.
+/// Outcome of one expiry push against the database.
+pub(super) enum PushOutcome {
+    /// The login's expiry is at least `expiry`, as of `database_now`.
+    Pushed {
+        database_now: SystemTime,
+        expiry: SystemTime,
+    },
+    /// The database's clock has already passed `max_ttl`.
+    ReachedMaxTtl,
+    /// The login no longer exists (for instance, dropped by a sweep after a long outage).
+    AlreadyGone,
+}
+
+/// Moves the login's `VALID UNTIL` to its next expiry, over a fresh admin connection.
+/// Skips `ALTER ROLE` once the expiry has already reached the cap, while still reading the
+/// database's clock so laptop sleep past `max_ttl` is caught promptly.
 pub(super) async fn push_expiry(
     alias: &DatabaseAlias,
     admin: &AdminLogin,
     user: &str,
-    expiry: SystemTime,
-) -> Result<(), SourceError> {
+    clock: &LeaseClock,
+    confirmed_expiry: SystemTime,
+) -> Result<PushOutcome, SourceError> {
     let push_failed = |reason| SourceError::PushExpiry {
         login: user.to_owned(),
         reason,
@@ -246,16 +262,44 @@ pub(super) async fn push_expiry(
             "can't connect as the admin login for `{alias}`: {reason}"
         ))
     })?;
+    let sql_failed = |err: tokio_postgres::Error| push_failed(describe_sql_error(&err));
+    let database_now: SystemTime = client
+        .query_one("SELECT now()", &[])
+        .await
+        .map_err(sql_failed)?
+        .get(0);
+    if clock.remaining(database_now).is_none() {
+        return Ok(PushOutcome::ReachedMaxTtl);
+    }
+    let expiry = clock.next_expiry(database_now);
+    if expiry <= confirmed_expiry {
+        return Ok(PushOutcome::Pushed {
+            database_now,
+            expiry: confirmed_expiry,
+        });
+    }
     let valid_until = timestamp_literal(&client, expiry)
         .await
-        .map_err(|err| push_failed(describe_sql_error(&err)))?;
-    client
+        .map_err(sql_failed)?;
+    if let Err(err) = client
         .batch_execute(&format!(
             "ALTER ROLE {} VALID UNTIL {valid_until}",
             quote_ident(user)
         ))
         .await
-        .map_err(|err| push_failed(describe_sql_error(&err)))
+    {
+        if err
+            .as_db_error()
+            .is_some_and(|db| *db.code() == SqlState::UNDEFINED_OBJECT)
+        {
+            return Ok(PushOutcome::AlreadyGone);
+        }
+        return Err(sql_failed(err));
+    }
+    Ok(PushOutcome::Pushed {
+        database_now,
+        expiry,
+    })
 }
 
 /// Refuses versions and admin settings under which dbvalet can't drop the login it creates.

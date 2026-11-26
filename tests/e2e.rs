@@ -2071,8 +2071,10 @@ fn project_with_reader_and_max_ttl(alias: &str, max_ttl_minutes: u32) -> PathBuf
 /// Starts `dbvalet run` in `dir` with [`SHORT_MINUTE_MS`] lease minutes and the child
 /// `sh -c <script>`. Returns once the child prints READY, with the run, the rest of its stdout
 /// and the login name the child printed as `login=`.
+///
+/// The caller holds [`sweeping_alone`] until the run ends: at max_ttl the login's `VALID UNTIL`
+/// passes before its own teardown drops it, and another test's superuser sweep would see it.
 fn start_short_run(dir: &Path, script: &str) -> (Child, BufReader<ChildStdout>, String) {
-    let _sweeping = sweeping();
     let mut run = Command::new(DBVALET)
         .current_dir(dir)
         .env("XDG_STATE_HOME", dir.join("state"))
@@ -2137,6 +2139,19 @@ fn expiries_until_dropped(login: &str) -> Vec<SystemTime> {
     expiries
 }
 
+/// Waits up to `limit` for a started run to exit, killing it and failing the test after that.
+fn exit_within(mut run: Child, limit: Duration) -> Output {
+    let deadline = Instant::now() + limit;
+    while run.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            run.kill().unwrap();
+            panic!("still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    run.wait_with_output().unwrap()
+}
+
 /// Waits up to 30 s for `path` to be gone.
 fn wait_until_removed(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -2161,7 +2176,7 @@ fn wait_until_database_passes(time: SystemTime) {
 /// Waits up to 30 s for the login's `VALID UNTIL` to move past `previous`.
 fn wait_until_expiry_passes(login: &str, previous: SystemTime) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while valid_until(login).unwrap() <= previous {
+    while valid_until(login).expect("the login was dropped before its expiry moved") <= previous {
         assert!(
             Instant::now() < deadline,
             "{login}'s expiry stayed at {previous:?}"
@@ -2174,6 +2189,7 @@ fn wait_until_expiry_passes(login: &str, previous: SystemTime) {
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn during_a_run_the_logins_expiry_moves_forward_at_each_push_and_never_past_max_ttl() {
     // 30 lease minutes of 400 ms: max_ttl is 12 s, and pushes land 8, 10 and 12 s past the start.
+    let _alone = sweeping_alone();
     let dir = project_with_reader_and_max_ttl("e2e-push-expiry", 30);
     let (mut run, mut stdout, login_name) =
         start_short_run(&dir, "echo \"login=$PGUSER\"; echo READY; read line");
@@ -2181,9 +2197,9 @@ fn during_a_run_the_logins_expiry_moves_forward_at_each_push_and_never_past_max_
 
     let expiries = expiries_until_dropped(&login_name);
     run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let finished = exit_within(run, Duration::from_secs(30));
     let mut rest = String::new();
     stdout.read_to_string(&mut rest).unwrap();
-    let finished = run.wait_with_output().unwrap();
 
     assert!(expiries.len() >= 3, "{expiries:?}");
     assert!(
@@ -2204,8 +2220,9 @@ fn during_a_run_the_logins_expiry_moves_forward_at_each_push_and_never_past_max_
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn a_run_that_reaches_max_ttl_keeps_the_command_running_drops_the_login_and_prints_a_notice() {
-    // 10 lease minutes of 400 ms: max_ttl arrives 4 s after the start.
-    let dir = project_with_reader_and_max_ttl("e2e-max-ttl-reached", 10);
+    // 20 lease minutes of 400 ms: max_ttl arrives 8 s after the start.
+    let _alone = sweeping_alone();
+    let dir = project_with_reader_and_max_ttl("e2e-max-ttl-reached", 20);
     let (mut run, mut stdout, login_name) = start_short_run(
         &dir,
         "echo \"login=$PGUSER\"; \
@@ -2224,9 +2241,9 @@ fn a_run_that_reaches_max_ttl_keeps_the_command_running_drops_the_login_and_prin
         &login_name,
     );
     run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let finished = exit_within(run, Duration::from_secs(30));
     let mut rest = String::new();
     stdout.read_to_string(&mut rest).unwrap();
-    let finished = run.wait_with_output().unwrap();
 
     let stderr = text(&finished.stderr);
     let dbvalet_lines: Vec<&str> = stderr
@@ -2240,7 +2257,7 @@ fn a_run_that_reaches_max_ttl_keeps_the_command_running_drops_the_login_and_prin
     assert_eq!(
         dbvalet_lines,
         [
-            "dbvalet: `e2e-max-ttl-reached` reached its max_ttl of 10 minutes: \
+            "dbvalet: `e2e-max-ttl-reached` reached its max_ttl of 20 minutes: \
              dbvalet ended the command's database access, and the command keeps running"
         ],
         "stderr: {stderr}"
@@ -2252,6 +2269,7 @@ fn a_run_that_reaches_max_ttl_keeps_the_command_running_drops_the_login_and_prin
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn another_machines_run_during_a_long_run_leaves_its_login_alone_until_max_ttl() {
     // 30 lease minutes of 400 ms: the first VALID UNTIL is 6 s ahead, and max_ttl is 12 s.
+    let _alone = sweeping_alone();
     let dir = project_with_reader_and_max_ttl("e2e-long-run-swept", 30);
     let (mut run, mut stdout, login_name) = start_short_run(
         &dir,
@@ -2261,14 +2279,11 @@ fn another_machines_run_during_a_long_run_leaves_its_login_alone_until_max_ttl()
     let first_expiry = valid_until(&login_name).unwrap();
     wait_until_database_passes(first_expiry);
 
-    let second = {
-        let _sweeping = sweeping();
-        run_command(&dir, &["true"])
-            .env("XDG_STATE_HOME", dir.join("other-machine-state"))
-            .env("DBVALET_TEST_MINUTE_MS", SHORT_MINUTE_MS)
-            .output()
-            .unwrap()
-    };
+    let second = run_command(&dir, &["true"])
+        .env("XDG_STATE_HOME", dir.join("other-machine-state"))
+        .env("DBVALET_TEST_MINUTE_MS", SHORT_MINUTE_MS)
+        .output()
+        .unwrap();
     let logins_after_second_run = superuser_count(
         "SELECT count(*) FROM pg_roles WHERE rolname = $1",
         &login_name,
@@ -2284,7 +2299,7 @@ fn another_machines_run_during_a_long_run_leaves_its_login_alone_until_max_ttl()
     );
     stdin.write_all(b"\n").unwrap();
     drop(stdin);
-    let finished = run.wait_with_output().unwrap();
+    let finished = exit_within(run, Duration::from_secs(30));
 
     assert!(second.status.success(), "stderr: {}", text(&second.stderr));
     assert_eq!(logins_after_second_run, 1);
@@ -2300,8 +2315,9 @@ fn another_machines_run_during_a_long_run_leaves_its_login_alone_until_max_ttl()
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn a_failed_push_is_printed_and_the_next_push_moves_the_expiry_forward() {
-    // 30 lease minutes of 400 ms: pushes every 2 s, and max_ttl is 12 s.
-    let dir = project_with_reader_and_max_ttl("e2e-push-fails", 30);
+    // 120 lease minutes of 400 ms: pushes every 2 s, and max_ttl is 48 s, well after the test.
+    let _alone = sweeping_alone();
+    let dir = project_with_reader_and_max_ttl("e2e-push-fails", 120);
     let (mut run, _stdout, login_name) =
         start_short_run(&dir, "echo \"login=$PGUSER\"; echo READY; read line");
     let (lines, received) = std::sync::mpsc::channel();
@@ -2318,7 +2334,7 @@ fn a_failed_push_is_printed_and_the_next_push_moves_the_expiry_forward() {
     superuser_sql("ALTER ROLE e2e_push_fails LOGIN;");
     wait_until_expiry_passes(&login_name, expiry_at_failure);
     run.stdin.take().unwrap().write_all(b"\n").unwrap();
-    let status = run.wait().unwrap();
+    let finished = exit_within(run, Duration::from_secs(30));
     reader.join().unwrap();
 
     assert!(
@@ -2329,5 +2345,5 @@ fn a_failed_push_is_printed_and_the_next_push_moves_the_expiry_forward() {
     );
     assert!(failure.contains("isn't permitted to log in"), "{failure}");
     assert!(!failure.contains("pw-e2e-push-fails-admin"), "{failure}");
-    assert!(status.success());
+    assert!(finished.status.success());
 }
