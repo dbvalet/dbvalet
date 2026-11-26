@@ -9,11 +9,28 @@ pub mod cli;
 pub mod config;
 pub mod endpoint;
 pub mod keychain;
+pub mod ledger;
 pub mod policy;
 pub mod proxy;
 pub mod run;
 pub mod runlog;
 pub mod source;
+
+/// Every temporary login's name starts with this.
+pub(crate) const LOGIN_PREFIX: &str = "dbvalet_";
+/// 80 random bits, written as the 16 base32 characters after [`LOGIN_PREFIX`].
+pub(crate) const RUN_ID_BYTES: usize = 10;
+const RUN_ID_CHARS: usize = RUN_ID_BYTES * 8 / 5;
+
+/// Whether `name` is a temporary login's name: `^dbvalet_[a-z2-7]{16}$`.
+pub(crate) fn is_login_name(name: &str) -> bool {
+    name.strip_prefix(LOGIN_PREFIX).is_some_and(|run_id| {
+        run_id.len() == RUN_ID_CHARS
+            && run_id
+                .bytes()
+                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+    })
+}
 
 /// Lowercase RFC 4648 base32: safe in an unquoted SQL identifier, a URL and an environment value.
 const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";

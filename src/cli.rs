@@ -1,6 +1,7 @@
 //! The command line, mapped onto library calls.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitCode, ExitStatus};
@@ -11,9 +12,11 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 use crate::DatabaseAlias;
 use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
+use crate::ledger;
 use crate::policy::{self, PolicyError};
 use crate::run::{self, RunError, RunOptions};
 use crate::runlog::{self, RunLogError};
+use crate::source::CredentialSource;
 use crate::source::direct::{self, DirectSource};
 
 const INITIAL_STDIN_CAPACITY: usize = 256;
@@ -62,6 +65,14 @@ enum Command {
     Log {
         /// The run ID to print. Omit to list recent runs.
         run_id: Option<String>,
+    },
+    /// Drop the temporary logins that killed runs left behind.
+    ///
+    /// Sweeps every database in this machine's ledger and in dbvalet.toml.
+    Gc {
+        /// Connect without TLS. Allowed only for a database on localhost.
+        #[arg(long)]
+        allow_plaintext: bool,
     },
 }
 
@@ -156,6 +167,37 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             write_stdout(&mut stdout, content.as_bytes())?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Gc { allow_plaintext } => {
+            let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            // Without the ledger no database can be swept safely, so none is tried.
+            let mut aliases = match ledger::aliases() {
+                Ok(aliases) => aliases,
+                Err(err) => {
+                    let _ = writeln!(io::stderr(), "dbvalet: {err}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            match config::find_and_load(&cwd) {
+                Ok(config) => aliases.extend(config.databases.into_keys()),
+                Err(ConfigError::NotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if aliases.is_empty() {
+                print_line(format_args!(
+                    "nothing to clean up: no database in the ledger or in {}",
+                    config::FILE_NAME
+                ));
+            }
+            let mut all_swept = true;
+            for alias in &aliases {
+                all_swept &= gc(alias, allow_plaintext).await;
+            }
+            Ok(if all_swept {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
     }
 }
 
@@ -166,6 +208,46 @@ fn write_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         Err(err) => Err(CliError::WriteStdout(err)),
     }
+}
+
+/// Sweeps one database and prints what it dropped. Returns whether nothing failed.
+async fn gc(alias: &DatabaseAlias, allow_plaintext: bool) -> bool {
+    let admin = match keychain::load(alias, allow_plaintext) {
+        Ok(admin) => admin,
+        Err(err) => {
+            let _ = writeln!(io::stderr(), "dbvalet: `{alias}`: {err}");
+            return false;
+        }
+    };
+    let report = match DirectSource::new(alias.clone(), admin).sweep().await {
+        Ok(report) => report,
+        Err(err) => {
+            let _ = writeln!(io::stderr(), "dbvalet: `{alias}`: {err}");
+            return false;
+        }
+    };
+    for login in &report.dropped {
+        print_line(format_args!(
+            "`{alias}`: dropped the leftover login `{login}`"
+        ));
+    }
+    for login in &report.already_gone {
+        print_line(format_args!(
+            "`{alias}`: removed the ledger entry for `{login}`, whose login was already gone"
+        ));
+    }
+    for err in &report.failures {
+        let _ = writeln!(io::stderr(), "dbvalet: `{alias}`: {err}");
+    }
+    if report.dropped.is_empty() && report.already_gone.is_empty() && report.failures.is_empty() {
+        print_line(format_args!("`{alias}`: nothing to clean up"));
+    }
+    report.failures.is_empty()
+}
+
+/// Prints a line of `gc`'s report. A closed stdout mustn't stop the sweep of the next database.
+fn print_line(line: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout(), "{line}");
 }
 
 /// The child's exit code, or 128 plus the signal that killed it, as a shell reports it.

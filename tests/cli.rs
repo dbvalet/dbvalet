@@ -295,3 +295,22 @@ fn log_with_a_run_id_prints_that_run_log_and_fails_when_missing() {
             .contains("no run log found for `dddddddddddddddd`")
     );
 }
+
+#[test]
+fn gc_with_an_empty_ledger_and_no_dbvalet_toml_has_nothing_to_clean_up() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-gc-empty");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let output = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .arg("gc")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "nothing to clean up: no database in the ledger or in dbvalet.toml\n"
+    );
+}
