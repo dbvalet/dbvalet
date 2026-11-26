@@ -232,7 +232,14 @@ impl RunLog {
         if sql.trim().is_empty() {
             return;
         }
-        let redacted = redact_sql(sql);
+        // Scrub runtime secrets before truncating so a secret straddling the 64 KiB boundary
+        // is removed in full, and discard the extra lookahead before redaction/collapsing can
+        // shrink the prefix and pull a partial secret back under the 64 KiB limit.
+        let mut scrubbed = self.inner.secrets.scrub(sql);
+        if truncated {
+            truncate_utf8(&mut scrubbed, MAX_LOGGED_QUERY_BYTES);
+        }
+        let redacted = redact_sql(&scrubbed);
         let scrubbed = self.inner.secrets.scrub(&redacted);
         let mut single_line = sanitize_single_line(&scrubbed);
         if single_line.trim().is_empty() {
@@ -412,9 +419,7 @@ fn redact_uri_passwords(text: &str) -> String {
         let authority_start = cursor + rel_sep + 3;
         out.push_str(&text[cursor..authority_start]);
         let authority_end = text[authority_start..]
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | ')' | ';' | ',')
-            })
+            .find(|c: char| c.is_whitespace() || c == '/')
             .map_or(text.len(), |offset| authority_start + offset);
         let authority = &text[authority_start..authority_end];
         if let Some(at) = authority.rfind('@')
@@ -675,9 +680,21 @@ fn redact_sql_inner(sql: &str, depth: usize) -> String {
 
         if let Some((prefix_len, is_escape_string)) = quoted_string_prefix(bytes, pos) {
             let redacting = expect_secret_literal || redact_statement_literals;
-            // Scan with backslash escapes when redacting so `standard_conforming_strings = off`
-            // cannot split a password literal at `\'` and leak the tail.
-            let end = scan_quoted_string(bytes, pos + prefix_len, is_escape_string || redacting);
+            let body_start = pos + prefix_len;
+            let end = if is_escape_string {
+                scan_quoted_string(bytes, body_start, true)
+            } else {
+                // Scan under both `standard_conforming_strings = on` and `off`. If they disagree,
+                // a backslash before a quote makes the boundary ambiguous; redact the rest of the
+                // input whenever credentials could follow so neither server setting can leak.
+                let end_std = scan_quoted_string(bytes, body_start, false);
+                let end_esc = scan_quoted_string(bytes, body_start, true);
+                if end_std != end_esc && (redacting || contains_potential_secret_cue(&sql[pos..])) {
+                    out.push_str(REDACTED_LITERAL);
+                    break;
+                }
+                end_std
+            };
             if redacting {
                 out.push_str(REDACTED_LITERAL);
                 pos = if expect_secret_literal {
@@ -713,6 +730,9 @@ fn redact_sql_inner(sql: &str, depth: usize) -> String {
                 let delimiter = &sql[pos..pos + delimiter_len];
                 let body_end = if closed { end - delimiter_len } else { end };
                 let body = &sql[pos + delimiter_len..body_end];
+                if looks_like_password_sql_template(body) {
+                    redact_statement_literals = true;
+                }
                 let body = redact_sql_inner(body, depth + 1);
                 let body = redact_embedded_credentials(&body);
                 out.push_str(delimiter);
@@ -763,6 +783,11 @@ fn redact_sql_inner(sql: &str, depth: usize) -> String {
     }
 
     out
+}
+
+fn contains_potential_secret_cue(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("password") || lower.contains("connection") || text.contains("://")
 }
 
 fn word_is_secret_key(word: &str) -> bool {
@@ -877,7 +902,14 @@ fn redact_conninfo_passwords(text: &str) -> String {
                             pos = scan_quoted_string(bytes, cursor + 1, true);
                         } else {
                             let mut val_end = cursor;
-                            while val_end < len && !bytes[val_end].is_ascii_whitespace() {
+                            while val_end < len {
+                                if bytes[val_end] == b'\\' {
+                                    val_end = (val_end + 2).min(len);
+                                    continue;
+                                }
+                                if bytes[val_end].is_ascii_whitespace() {
+                                    break;
+                                }
                                 val_end += 1;
                             }
                             pos = val_end;
@@ -944,9 +976,19 @@ fn skip_continued_quoted_literals(bytes: &[u8], mut pos: usize) -> usize {
         }
         if saw_newline
             && cursor < len
-            && let Some((prefix_len, _)) = quoted_string_prefix(bytes, cursor)
+            && let Some((prefix_len, is_escape_string)) = quoted_string_prefix(bytes, cursor)
         {
-            pos = scan_quoted_string(bytes, cursor + prefix_len, true);
+            let body_start = cursor + prefix_len;
+            if is_escape_string {
+                pos = scan_quoted_string(bytes, body_start, true);
+            } else {
+                let end_std = scan_quoted_string(bytes, body_start, false);
+                let end_esc = scan_quoted_string(bytes, body_start, true);
+                if end_std != end_esc {
+                    return len;
+                }
+                pos = end_std;
+            }
             continue;
         }
         return pos;
@@ -1242,9 +1284,19 @@ mod tests {
         );
         assert_eq!(
             redact_sql(
+                "CREATE SERVER s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (password 'srv-pw', sslpassword 'srv-ssl-pw')"
+            ),
+            "CREATE SERVER s FOREIGN DATA WRAPPER postgres_fdw OPTIONS (password '[REDACTED]', sslpassword '[REDACTED]')"
+        );
+        assert_eq!(
+            redact_sql(
                 "CREATE SUBSCRIPTION sub CONNECTION 'host=db password=rep-pw' PUBLICATION pub"
             ),
             "CREATE SUBSCRIPTION sub CONNECTION '[REDACTED]' PUBLICATION pub"
+        );
+        assert_eq!(
+            redact_sql("ALTER SUBSCRIPTION sub CONNECTION 'host=db password=rep-pw-2'"),
+            "ALTER SUBSCRIPTION sub CONNECTION '[REDACTED]'"
         );
         assert_eq!(
             redact_sql("DO $$ BEGIN ALTER ROLE alice PASSWORD 'do-block-pw'; END $$;"),
@@ -1463,6 +1515,79 @@ mod tests {
         assert!(!content.contains("toksecret"), "{content}");
         assert!(content.contains(" /* truncated */\n"), "{content}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_token_at_the_observer_cap_does_not_survive_when_newlines_collapse() {
+        let dir = temp_runs_dir("truncate-shrink");
+        let header = sample_header("aaaaaaaaaaaaaaaa", 1_795_688_130, &["psql"], true);
+        let log = open_in(&dir, &header, sample_secrets()).unwrap();
+        let newlines = "\n".repeat(MAX_LOGGED_QUERY_BYTES + 40);
+        // Simulates the observer cutting 20 chars into the 32-char token at 64 KiB + 64.
+        let sql = format!("SELECT 1{newlines}toksecret1234567890a");
+        log.statement(StatementKind::Query, &sql, true);
+
+        let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
+        assert!(!content.contains("toksecret"), "{content}");
+        assert!(content.contains(" /* truncated */\n"), "{content}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backslash_passwords_are_redacted_under_both_standard_and_nonstandard_strings() {
+        let cases = [
+            ("ALTER ROLE a PASSWORD 'ab\\''pw-tail-71'", "pw-tail-71"),
+            (
+                "ALTER ROLE a PASSWORD 'pw-1\\'; ALTER ROLE b PASSWORD 'pw-second-47'",
+                "pw-second-47",
+            ),
+            (
+                "CREATE ROLE a LOGIN PASSWORD 'x\\' VALID UNTIL 'infinity'; ALTER ROLE b PASSWORD 'pw-72'",
+                "pw-72",
+            ),
+            ("SELECT '\\''; ALTER ROLE a PASSWORD 'pw-48'; -- '", "pw-48"),
+        ];
+        for (sql, leaked) in cases {
+            let redacted = redact_sql(sql);
+            assert!(
+                !redacted.contains(leaked),
+                "input: {sql}\nredacted: {redacted}"
+            );
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "input: {sql}\nredacted: {redacted}"
+            );
+        }
+        assert_eq!(redact_sql("SELECT 'C:\\'"), "SELECT 'C:\\'");
+    }
+
+    #[test]
+    fn dollar_quoted_format_uri_delimiters_and_escaped_conninfo_spaces_are_redacted() {
+        let cases = [
+            (
+                "DO $f$ BEGIN EXECUTE format($q$ALTER ROLE a PASSWORD %L$q$, 'pw-41'); END $f$",
+                "pw-41",
+            ),
+            (
+                "SELECT dblink('postgresql://u:pw?q#r''s@h/db', 'SELECT 1')",
+                "pw?q",
+            ),
+            (
+                "SELECT dblink_connect('c', 'host=h password=ab\\ pw-53 dbname=d')",
+                "pw-53",
+            ),
+        ];
+        for (sql, leaked) in cases {
+            let redacted = redact_sql(sql);
+            assert!(
+                !redacted.contains(leaked),
+                "input: {sql}\nredacted: {redacted}"
+            );
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "input: {sql}\nredacted: {redacted}"
+            );
+        }
     }
 
     #[test]
