@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::time::{ClockId, clock_gettime};
 use secrecy::SecretString;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -115,6 +116,7 @@ pub struct SweepReport {
 #[derive(Debug)]
 pub struct Lease {
     login: UpstreamLogin,
+    access_deadline: AccessDeadline,
     /// Taken by whichever ends the lease first, so the teardown runs exactly once.
     live: Arc<Mutex<Option<LiveLease>>>,
     keep_alive: JoinHandle<()>,
@@ -132,11 +134,48 @@ struct LiveLease {
     proxy: Option<Proxy>,
 }
 
+/// A deadline measured by a clock that keeps running while this machine sleeps.
+#[derive(Clone, Copy, Debug)]
+pub struct AccessDeadline(Duration);
+
+pub(super) fn suspend_clock_now() -> Duration {
+    #[cfg(target_os = "linux")]
+    let clock = ClockId::CLOCK_BOOTTIME;
+    #[cfg(not(target_os = "linux"))]
+    let clock = ClockId::CLOCK_MONOTONIC;
+    clock_gettime(clock)
+        .expect("the platform provides its suspend-aware clock")
+        .into()
+}
+
+impl AccessDeadline {
+    pub(crate) fn at(when: Duration) -> Self {
+        Self(when)
+    }
+
+    pub(crate) fn has_passed(self) -> bool {
+        suspend_clock_now() >= self.0
+    }
+
+    async fn wait(self) {
+        loop {
+            let remaining = self.0.saturating_sub(suspend_clock_now());
+            if remaining.is_zero() {
+                return;
+            }
+            // Tokio's timers can pause during suspend. Recheck the suspend-aware clock
+            // even when the proxy is idle and the next expiry push is still minutes away.
+            tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        }
+    }
+}
+
 /// When a lease started, on the database's clock and on this process's, and its timings.
 #[derive(Debug, Clone, Copy)]
 struct LeaseClock {
     started: SystemTime,
     started_at: Instant,
+    access_deadline: AccessDeadline,
     /// As `dbvalet.toml` gives it, for the notice.
     max_ttl: Duration,
     lasts: Duration,
@@ -146,12 +185,19 @@ struct LeaseClock {
 
 impl LeaseClock {
     /// `started` is the database's `now()`, read just after this process's `started_at`.
-    fn new(started: SystemTime, started_at: Instant, max_ttl: Duration) -> Self {
+    fn new(
+        started: SystemTime,
+        started_at: Instant,
+        started_with_suspend: Duration,
+        max_ttl: Duration,
+    ) -> Self {
+        let lasts = lease_time(max_ttl).min(LONGEST_LEASE);
         Self {
             started,
             started_at,
+            access_deadline: AccessDeadline::at(started_with_suspend + lasts),
             max_ttl,
-            lasts: lease_time(max_ttl).min(LONGEST_LEASE),
+            lasts,
             ahead: lease_time(LEASE_AHEAD),
             push_interval: lease_time(EXPIRY_PUSH_INTERVAL),
         }
@@ -206,6 +252,7 @@ impl Lease {
         let keep_alive = tokio::spawn(keep_alive(Arc::clone(&live), pushes));
         Self {
             login,
+            access_deadline: clock.access_deadline,
             live,
             keep_alive,
         }
@@ -213,6 +260,10 @@ impl Lease {
 
     pub fn login(&self) -> &UpstreamLogin {
         &self.login
+    }
+
+    pub(crate) fn access_deadline(&self) -> AccessDeadline {
+        self.access_deadline
     }
 
     /// Hands the lease the proxy in front of its login, so whichever ends the lease stops the
@@ -292,11 +343,13 @@ async fn keep_alive(live: Arc<Mutex<Option<LiveLease>>>, pushes: Pushes) {
     let mut ticks = tokio::time::interval_at(first_push.into(), clock.push_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let max_ttl_reached = tokio::time::sleep_until(clock.ends_at().into());
-    tokio::pin!(max_ttl_reached);
+    let host_deadline_reached = clock.access_deadline.wait();
+    tokio::pin!(max_ttl_reached, host_deadline_reached);
     loop {
         tokio::select! {
             biased;
             () = &mut max_ttl_reached => break,
+            () = &mut host_deadline_reached => break,
             _ = ticks.tick() => {}
         }
         // Bounded, so a database that stops answering mid-push only costs this push.
@@ -313,6 +366,7 @@ async fn keep_alive(live: Arc<Mutex<Option<LiveLease>>>, pushes: Pushes) {
         let pushed = tokio::select! {
             biased;
             () = &mut max_ttl_reached => break,
+            () = &mut host_deadline_reached => break,
             pushed = push => pushed.unwrap_or_else(|_| {
                 Err(SourceError::PushExpiry {
                     login: pushes.user.clone(),
@@ -348,7 +402,10 @@ async fn keep_alive(live: Arc<Mutex<Option<LiveLease>>>, pushes: Pushes) {
                     pushes.user
                 );
                 // No further pushes can revive a dropped login; wait to close the proxy and ledger.
-                max_ttl_reached.await;
+                tokio::select! {
+                    () = &mut max_ttl_reached => {}
+                    () = &mut host_deadline_reached => {}
+                }
                 break;
             }
             Err(err) => {
@@ -397,7 +454,12 @@ mod tests {
     #[test]
     fn max_ttl_remains_until_the_databases_clock_passes_the_start_plus_max_ttl() {
         let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let clock = LeaseClock::new(started, Instant::now(), Duration::from_secs(600));
+        let clock = LeaseClock::new(
+            started,
+            Instant::now(),
+            suspend_clock_now(),
+            Duration::from_secs(600),
+        );
         assert_eq!(
             clock.remaining(started + Duration::from_secs(240)),
             Some(Duration::from_secs(360))
@@ -408,7 +470,12 @@ mod tests {
     #[test]
     fn a_max_ttl_too_long_for_the_clocks_still_gives_an_end() {
         let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let clock = LeaseClock::new(started, Instant::now(), Duration::from_secs(u64::MAX));
+        let clock = LeaseClock::new(
+            started,
+            Instant::now(),
+            suspend_clock_now(),
+            Duration::from_secs(u64::MAX),
+        );
         assert!(clock.ends_at() > Instant::now());
         assert!(clock.remaining(started).is_some());
     }

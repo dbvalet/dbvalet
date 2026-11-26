@@ -131,6 +131,7 @@ impl CredentialSource for DirectSource {
                     reason,
                 })?;
         let started_at = Instant::now();
+        let started_with_suspend = super::suspend_clock_now();
         let server = client
             .query_one(
                 "SELECT current_setting('server_version'),
@@ -178,7 +179,7 @@ impl CredentialSource for DirectSource {
         } else {
             ("", format!("ROLE {}", quote_ident(self.admin.user())))
         };
-        let clock = LeaseClock::new(started, started_at, max_ttl);
+        let clock = LeaseClock::new(started, started_at, started_with_suspend, max_ttl);
         let valid_until = timestamp_literal(&client, clock.next_expiry(started))
             .await
             .map_err(create_failed)?;

@@ -65,7 +65,13 @@ async fn run_child(
     let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
-    let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
+    let proxy = proxy::start(
+        upstream,
+        login.clone(),
+        token.clone(),
+        lease.access_deadline(),
+    )
+    .await?;
     let port = proxy.port();
     lease.attach_proxy(proxy).await;
     let mut child = child_command(command, login.user(), &token, port, &database);
