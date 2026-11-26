@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitStatus;
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -10,7 +11,7 @@ use crate::config::RoleGrant;
 use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
-use crate::source::{CredentialSource, SourceError, UpstreamLogin};
+use crate::source::{CredentialSource, Lease, SourceError};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -34,11 +35,12 @@ pub enum RunError {
 }
 
 /// Sweeps what earlier runs left, runs `command` against a new temporary login through the
-/// proxy, then drops the login.
+/// proxy, then drops the login. At `max_ttl` the lease drops it while `command` keeps running.
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
     grant: &RoleGrant,
+    max_ttl: Duration,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
@@ -46,32 +48,34 @@ pub async fn run<S: CredentialSource>(
     for err in source.sweep().await?.failures {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
-    let lease = source.mint(grant).await?;
-    let finished = run_child(lease.login(), upstream, command).await;
+    let lease = source.mint(grant, max_ttl).await?;
+    let finished = run_child(&lease, upstream, command).await;
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
     finished
 }
 
+/// Leaves the proxy to the lease, whose teardown stops it.
 async fn run_child(
-    login: &UpstreamLogin,
+    lease: &Lease,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
+    let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
     let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
-    let mut child = child_command(command, login.user(), &token, proxy.port(), &database);
-    let finished = match child.spawn() {
+    let port = proxy.port();
+    lease.attach_proxy(proxy).await;
+    let mut child = child_command(command, login.user(), &token, port, &database);
+    match child.spawn() {
         Ok(mut running) => running.wait().await.map_err(RunError::Wait),
         Err(source) => Err(RunError::Spawn {
             program: command[0].to_string_lossy().into_owned(),
             source,
         }),
-    };
-    proxy.stop().await;
-    finished
+    }
 }
 
 /// The child inherits dbvalet's environment minus every `PG*` variable and `DATABASE_URL`,

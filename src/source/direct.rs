@@ -4,14 +4,16 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use secrecy::ExposeSecret;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
-use super::{CredentialSource, Lease, SourceError, SweepReport, UpstreamLogin};
+use super::{
+    CredentialSource, Lease, LeaseClock, LiveLease, SourceError, SweepReport, UpstreamLogin,
+};
 use crate::config::RoleGrant;
 use crate::endpoint::Tls;
 use crate::keychain::{self, AdminLogin};
@@ -26,8 +28,6 @@ const MINIMUM_SERVER_VERSION_NUM: i32 = 150000;
 /// From this version a CREATEROLE admin can inherit the roles it creates.
 const CREATEROLE_SELF_GRANT_VERSION_NUM: i32 = 160000;
 const LOGIN_PASSWORD_BYTES: usize = 20;
-/// How far ahead of the database's clock a new login's `VALID UNTIL` is set.
-const LEASE_AHEAD: &str = "15 minutes";
 /// How long `pg_terminate_backend` waits for each of the login's sessions to end.
 const SESSION_END_TIMEOUT_MS: i64 = 5_000;
 /// A second pass catches a session that was still starting, so not yet listed, during the first.
@@ -119,7 +119,7 @@ impl CredentialSource for DirectSource {
         Ok(report)
     }
 
-    async fn mint(&self, grant: &RoleGrant) -> Result<Lease, SourceError> {
+    async fn mint(&self, grant: &RoleGrant, max_ttl: Duration) -> Result<Lease, SourceError> {
         let create_failed = |err: tokio_postgres::Error| SourceError::CreateLogin {
             reason: describe_sql_error(&err),
         };
@@ -130,26 +130,24 @@ impl CredentialSource for DirectSource {
                     alias: self.alias.clone(),
                     reason,
                 })?;
+        let started_at = Instant::now();
         let server = client
             .query_one(
-                &format!(
-                    "SELECT current_setting('server_version'),
-                            current_setting('server_version_num')::int,
-                            to_char((now() + interval '{LEASE_AHEAD}') AT TIME ZONE 'UTC',
-                                    'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                            rolsuper,
-                            rolinherit
-                     FROM pg_roles
-                     WHERE rolname = current_user"
-                ),
+                "SELECT current_setting('server_version'),
+                        current_setting('server_version_num')::int,
+                        now(),
+                        rolsuper,
+                        rolinherit
+                 FROM pg_roles
+                 WHERE rolname = current_user",
                 &[],
             )
             .await
             .map_err(create_failed)?;
-        let (version, version_num, valid_until, superuser, inherit): (
+        let (version, version_num, started, superuser, inherit): (
             String,
             i32,
-            String,
+            SystemTime,
             bool,
             bool,
         ) = (
@@ -180,6 +178,10 @@ impl CredentialSource for DirectSource {
         } else {
             ("", format!("ROLE {}", quote_ident(self.admin.user())))
         };
+        let clock = LeaseClock::new(started, started_at, max_ttl);
+        let valid_until = timestamp_literal(&client, clock.next_expiry())
+            .await
+            .map_err(create_failed)?;
         // Written before the login exists, so a run killed from here on leaves it to the sweep.
         let ledger_entry = ledger::create(&self.alias, &user, grant.read_only)?;
         let read_only = if grant.read_only {
@@ -195,21 +197,65 @@ impl CredentialSource for DirectSource {
                      IN ROLE {group} {admin_member};
                  {read_only}",
                 verifier = quote_literal(&verifier),
-                valid_until = quote_literal(&valid_until),
                 group = quote_ident(&grant.member_of),
             ))
             .await
             .map_err(create_failed)?;
 
-        Ok(Lease {
-            login: UpstreamLogin { user, password },
+        let live = LiveLease {
             alias: self.alias.clone(),
             admin: Arc::clone(&self.admin),
+            user: user.clone(),
             member_of: grant.member_of.clone(),
             read_only: grant.read_only,
             ledger_entry,
-        })
+            proxy: None,
+        };
+        Ok(Lease::start(UpstreamLogin { user, password }, live, clock))
     }
+}
+
+/// `time` as a quoted literal that `VALID UNTIL` takes, to the microsecond.
+async fn timestamp_literal(
+    client: &Client,
+    time: SystemTime,
+) -> Result<String, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            "SELECT to_char($1::timestamptz AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+            &[&time],
+        )
+        .await?;
+    Ok(quote_literal(row.get(0)))
+}
+
+/// Moves the login's `VALID UNTIL` to `expiry`, over a fresh admin connection.
+pub(super) async fn push_expiry(
+    alias: &DatabaseAlias,
+    admin: &AdminLogin,
+    user: &str,
+    expiry: SystemTime,
+) -> Result<(), SourceError> {
+    let push_failed = |reason| SourceError::PushExpiry {
+        login: user.to_owned(),
+        reason,
+    };
+    let client = connect(alias, admin).await.map_err(|reason| {
+        push_failed(format!(
+            "can't connect as the admin login for `{alias}`: {reason}"
+        ))
+    })?;
+    let valid_until = timestamp_literal(&client, expiry)
+        .await
+        .map_err(|err| push_failed(describe_sql_error(&err)))?;
+    client
+        .batch_execute(&format!(
+            "ALTER ROLE {} VALID UNTIL {valid_until}",
+            quote_ident(user)
+        ))
+        .await
+        .map_err(|err| push_failed(describe_sql_error(&err)))
 }
 
 /// Refuses versions and admin settings under which dbvalet can't drop the login it creates.
