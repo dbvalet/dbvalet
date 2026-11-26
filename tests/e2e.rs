@@ -1014,3 +1014,384 @@ fn a_read_only_run_leaves_no_large_objects_after_teardown() {
         0
     );
 }
+
+fn isolated_state_home(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("state-{name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn dbvalet_log(state_home: &Path, args: &[&str]) -> Output {
+    Command::new(DBVALET)
+        .env("XDG_STATE_HOME", state_home)
+        .arg("log")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn after_a_run_dbvalet_log_shows_the_header_and_simple_query_text() {
+    let dir = project_with_reader("e2e-log-simple");
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-log-simple]\n\
+         max_ttl_minutes = 480\n\
+         \n\
+         [databases.e2e-log-simple.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n",
+    )
+    .unwrap();
+    let state = isolated_state_home("e2e-log-simple");
+
+    let run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args(["run", "--allow-plaintext", "--", "psql", "-c", "select 1"])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "stderr: {}", text(&run.stderr));
+
+    let listing = dbvalet_log(&state, &[]);
+    assert!(
+        listing.status.success(),
+        "stderr: {}",
+        text(&listing.stderr)
+    );
+    let listed = text(&listing.stdout);
+    let first_line = listed.lines().next().unwrap();
+    let run_id = first_line.split_whitespace().nth(1).unwrap();
+
+    let shown = dbvalet_log(&state, &[run_id]);
+    assert!(shown.status.success(), "stderr: {}", text(&shown.stderr));
+    let log = text(&shown.stdout);
+    assert!(log.contains(&format!("run_id: {run_id}\n")), "{log}");
+    assert!(log.contains("started_at: "), "{log}");
+    assert!(log.contains("database: e2e-log-simple\n"), "{log}");
+    assert!(log.contains("role: reader\n"), "{log}");
+    assert!(log.contains("valid_until: "), "{log}");
+    assert!(log.contains("max_ttl: 480m\n"), "{log}");
+    assert!(log.contains("sql_log: enabled\n"), "{log}");
+    assert!(log.contains("command: psql -c 'select 1'\n"), "{log}");
+    assert!(log.contains(" [Q] select 1\n"), "{log}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_prepared_statement_sent_over_the_extended_protocol_appears_in_the_run_log() {
+    let dir = project_with_reader("e2e-log-extended");
+    let state = isolated_state_home("e2e-log-extended");
+
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo \"login=$PGUSER\"; echo \"url=$DATABASE_URL\"; echo READY; read line",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut seen = String::new();
+    while !seen.ends_with("READY\n") {
+        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
+    }
+    let login_name = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("login="))
+        .unwrap()
+        .to_owned();
+    let run_id = login_name.strip_prefix("dbvalet_").unwrap().to_owned();
+    let proxy_url = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("url="))
+        .unwrap()
+        .to_owned();
+
+    runtime().block_on(async {
+        let (client, connection) = tokio_postgres::connect(&proxy_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let add_stmt = client.prepare("SELECT $1::int + 1 AS total").await.unwrap();
+        let total: i32 = client.query_one(&add_stmt, &[&41i32]).await.unwrap().get(0);
+        assert_eq!(total, 42);
+
+        let echo_stmt = client.prepare("SELECT $1::text AS echo").await.unwrap();
+        let echoed: String = client
+            .query_one(&echo_stmt, &[&"bound-param-secret-7c3e"])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(echoed, "bound-param-secret-7c3e");
+    });
+
+    run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+
+    let shown = dbvalet_log(&state, &[&run_id]);
+    assert!(shown.status.success(), "stderr: {}", text(&shown.stderr));
+    let log = text(&shown.stdout);
+    assert!(log.contains(" [P] SELECT $1::int + 1 AS total\n"), "{log}");
+    assert!(log.contains(" [P] SELECT $1::text AS echo\n"), "{log}");
+    assert!(!log.contains("bound-param-secret-7c3e"), "{log}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_run_with_no_sql_log_records_the_header_and_no_statements() {
+    let dir = project_with_reader("e2e-log-no-sql");
+    let state = isolated_state_home("e2e-log-no-sql");
+
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--no-sql-log",
+            "--",
+            "psql",
+            "-At",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    run.stdin
+        .take()
+        .unwrap()
+        .write_all(b"SELECT 'no-sql-log-marker-4a1f';\n")
+        .unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "no-sql-log-marker-4a1f\n");
+
+    let listing = dbvalet_log(&state, &[]);
+    assert!(
+        listing.status.success(),
+        "stderr: {}",
+        text(&listing.stderr)
+    );
+    let listed = text(&listing.stdout);
+    let run_id = listed
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+
+    let shown = dbvalet_log(&state, &[run_id]);
+    assert!(shown.status.success(), "stderr: {}", text(&shown.stderr));
+    let log = text(&shown.stdout);
+    assert!(log.contains(&format!("run_id: {run_id}\n")), "{log}");
+    assert!(log.contains("database: e2e-log-no-sql\n"), "{log}");
+    assert!(log.contains("role: reader\n"), "{log}");
+    assert!(log.contains("sql_log: disabled (--no-sql-log)\n"), "{log}");
+    assert!(log.contains("command: psql -At\n"), "{log}");
+    assert!(!log.contains("no-sql-log-marker-4a1f"), "{log}");
+    assert!(!log.contains(" [Q] "), "{log}");
+    assert!(!log.contains(" [P] "), "{log}");
+    let (_, after_header) = log.split_once("\n\n").unwrap();
+    assert!(after_header.is_empty(), "body: {after_header:?}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn the_run_log_hides_the_token_login_password_and_sql_passwords() {
+    let dir = project_with_reader("e2e-log-secrets");
+    let state = isolated_state_home("e2e-log-secrets");
+    let witness = "e2e_log_secrets_witness";
+
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c"])
+        .arg(
+            "echo \"login=$PGUSER\"; \
+             echo \"token=$PGPASSWORD\"; \
+             psql -c \"ALTER ROLE e2e_log_target PASSWORD 'pw-alter-role-8f3c'\" || true; \
+             psql -c 'CREATE ROLE e2e_log_created LOGIN PASSWORD $$pw-create-role-4d9a$$' || true; \
+             echo \"echoed=$(psql -Atc \"SELECT '$PGPASSWORD'\")\"; \
+             echo READY; read line",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut seen = String::new();
+    while !seen.ends_with("READY\n") {
+        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
+    }
+    let login_name = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("login="))
+        .unwrap()
+        .to_owned();
+    let run_id = login_name.strip_prefix("dbvalet_").unwrap().to_owned();
+    let token = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("token="))
+        .unwrap()
+        .to_owned();
+    let echoed = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("echoed="))
+        .unwrap()
+        .to_owned();
+    // Proxy must not rewrite or block SQL on the wire (ADR-0002).
+    assert_eq!(echoed, token);
+
+    let verifier: String = runtime().block_on(async {
+        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client
+            .query_one(
+                "SELECT rolpassword FROM pg_authid WHERE rolname = $1",
+                &[&login_name],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    });
+    superuser_sql(&format!(
+        "DROP ROLE IF EXISTS {witness}; CREATE ROLE {witness} LOGIN PASSWORD '{verifier}';"
+    ));
+
+    run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let output = run.wait_with_output().unwrap();
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    // PostgreSQL itself refused ALTER ROLE in a read-only transaction, proving the proxy relayed it.
+    assert!(
+        stderr.contains("cannot execute ALTER ROLE in a read-only transaction"),
+        "stderr: {stderr}"
+    );
+
+    let shown = dbvalet_log(&state, &[&run_id]);
+    assert!(shown.status.success(), "stderr: {}", text(&shown.stderr));
+    let log = text(&shown.stdout);
+    assert!(
+        log.contains(" [Q] ALTER ROLE e2e_log_target PASSWORD '[REDACTED]'\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains(" [Q] CREATE ROLE e2e_log_created LOGIN PASSWORD '[REDACTED]'\n"),
+        "{log}"
+    );
+    assert!(log.contains(" [Q] SELECT '[REDACTED]'\n"), "{log}");
+    assert!(!log.contains("pw-alter-role-8f3c"), "{log}");
+    assert!(!log.contains("pw-create-role-4d9a"), "{log}");
+    assert!(!log.contains(&token), "{log}");
+    assert!(!log.contains("pw-e2e-log-secrets-admin"), "{log}");
+    assert_eq!(passwords_of(witness, &log), Vec::<String>::new());
+
+    // Also verify a direct `psql -c "ALTER ROLE ... PASSWORD"` command redacts the header too.
+    let direct_state = isolated_state_home("e2e-log-secrets-direct");
+    let direct_run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &direct_state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "psql",
+            "-c",
+            "ALTER ROLE e2e_log_target PASSWORD 'pw-cli-arg-2b7e'",
+        ])
+        .output()
+        .unwrap();
+    assert!(!direct_run.status.success());
+    let direct_list = dbvalet_log(&direct_state, &[]);
+    let direct_id = text(&direct_list.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned();
+    let direct_log = text(&dbvalet_log(&direct_state, &[&direct_id]).stdout);
+    assert!(
+        direct_log.contains(" [Q] ALTER ROLE e2e_log_target PASSWORD '[REDACTED]'\n"),
+        "{direct_log}"
+    );
+    assert!(!direct_log.contains("pw-cli-arg-2b7e"), "{direct_log}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn dbvalet_log_lists_runs_newest_first() {
+    let dir = project_with_reader("e2e-log-order");
+    let state = isolated_state_home("e2e-log-order");
+
+    let first = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo \"$PGUSER\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "stderr: {}", text(&first.stderr));
+    let first_id = text(&first.stdout)
+        .trim()
+        .strip_prefix("dbvalet_")
+        .unwrap()
+        .to_owned();
+
+    let second = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo \"$PGUSER\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(second.status.success(), "stderr: {}", text(&second.stderr));
+    let second_id = text(&second.stdout)
+        .trim()
+        .strip_prefix("dbvalet_")
+        .unwrap()
+        .to_owned();
+
+    let listing = dbvalet_log(&state, &[]);
+    assert!(
+        listing.status.success(),
+        "stderr: {}",
+        text(&listing.stderr)
+    );
+    let listed = text(&listing.stdout);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 2, "{listed}");
+    assert!(lines[0].contains(&second_id), "{listed}");
+    assert!(lines[1].contains(&first_id), "{listed}");
+}
