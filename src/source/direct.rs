@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
@@ -9,14 +10,222 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
-use crate::DatabaseAlias;
+use super::{CredentialSource, Lease, SourceError, UpstreamLogin};
+use crate::config::RoleGrant;
 use crate::endpoint::Tls;
 use crate::keychain::{self, AdminLogin};
+use crate::{DatabaseAlias, random_base32};
 
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_SERVER_VERSION_NUM: i32 = 140000;
 /// From this version a CREATEROLE admin can inherit the roles it creates.
 const CREATEROLE_SELF_GRANT_VERSION_NUM: i32 = 160000;
+/// 80 random bits, written as the 16 base32 characters after `dbvalet_`.
+const RUN_ID_BYTES: usize = 10;
+const LOGIN_PASSWORD_BYTES: usize = 20;
+/// How far ahead of the database's clock a new login's `VALID UNTIL` is set.
+const LEASE_AHEAD: &str = "15 minutes";
+/// How long `pg_terminate_backend` waits for each of the login's sessions to end.
+const SESSION_END_TIMEOUT_MS: i64 = 5_000;
+
+/// Temporary logins created over admin SQL, with a fresh admin connection per operation.
+#[derive(Debug)]
+pub struct DirectSource {
+    alias: DatabaseAlias,
+    admin: Arc<AdminLogin>,
+}
+
+impl DirectSource {
+    pub fn new(alias: DatabaseAlias, admin: AdminLogin) -> Self {
+        Self {
+            alias,
+            admin: Arc::new(admin),
+        }
+    }
+}
+
+impl CredentialSource for DirectSource {
+    async fn mint(&self, grant: &RoleGrant) -> Result<Lease, SourceError> {
+        let create_failed = |err: tokio_postgres::Error| SourceError::CreateLogin {
+            reason: describe_sql_error(&err),
+        };
+        let client =
+            connect(&self.alias, &self.admin)
+                .await
+                .map_err(|reason| SourceError::Connect {
+                    alias: self.alias.clone(),
+                    reason,
+                })?;
+        let server = client
+            .query_one(
+                &format!(
+                    "SELECT current_setting('server_version'),
+                            current_setting('server_version_num')::int,
+                            to_char((now() + interval '{LEASE_AHEAD}') AT TIME ZONE 'UTC',
+                                    'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                            rolsuper,
+                            rolinherit
+                     FROM pg_roles
+                     WHERE rolname = current_user"
+                ),
+                &[],
+            )
+            .await
+            .map_err(create_failed)?;
+        let (version, version_num, valid_until, superuser, inherit): (
+            String,
+            i32,
+            String,
+            bool,
+            bool,
+        ) = (
+            server.get(0),
+            server.get(1),
+            server.get(2),
+            server.get(3),
+            server.get(4),
+        );
+        check_mint_prerequisites(
+            &self.alias,
+            self.admin.user(),
+            &version,
+            version_num,
+            superuser,
+            inherit,
+        )?;
+
+        let user = new_login_name().map_err(SourceError::Random)?;
+        let password = random_base32(LOGIN_PASSWORD_BYTES).map_err(SourceError::Random)?;
+        // Only the SCRAM verifier reaches the server, so its logs never hold the password.
+        let verifier =
+            postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
+        // The admin needs the login's privileges to end its sessions and drop what it owns:
+        // PostgreSQL 16 and later give them through createrole_self_grant, older ones through ROLE.
+        let (self_grant, admin_member) = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+            ("SET createrole_self_grant = 'inherit';", String::new())
+        } else {
+            ("", format!("ROLE {}", quote_ident(self.admin.user())))
+        };
+        let read_only = if grant.read_only {
+            format!("ALTER ROLE {user} SET default_transaction_read_only = on;")
+        } else {
+            String::new()
+        };
+        // One simple query runs as one transaction, so a read login never exists without read_only.
+        client
+            .batch_execute(&format!(
+                "{self_grant}
+                 CREATE ROLE {user} LOGIN PASSWORD {verifier} VALID UNTIL {valid_until}
+                     IN ROLE {group} {admin_member};
+                 {read_only}",
+                verifier = quote_literal(&verifier),
+                valid_until = quote_literal(&valid_until),
+                group = quote_ident(&grant.member_of),
+            ))
+            .await
+            .map_err(create_failed)?;
+
+        Ok(Lease {
+            login: UpstreamLogin { user, password },
+            alias: self.alias.clone(),
+            admin: Arc::clone(&self.admin),
+            member_of: grant.member_of.clone(),
+            read_only: grant.read_only,
+        })
+    }
+}
+
+/// Refuses versions and admin settings under which dbvalet can't drop the login it creates.
+fn check_mint_prerequisites(
+    alias: &DatabaseAlias,
+    user: &str,
+    version: &str,
+    version_num: i32,
+    superuser: bool,
+    inherit: bool,
+) -> Result<(), SourceError> {
+    if version_num < MINIMUM_SERVER_VERSION_NUM {
+        return Err(SourceError::TooOld {
+            version: version.to_owned(),
+        });
+    }
+    if !superuser && version_num < CREATEROLE_SELF_GRANT_VERSION_NUM && !inherit {
+        return Err(SourceError::AdminNoInherit {
+            alias: alias.clone(),
+            user: user.to_owned(),
+            quoted: quote_ident(user),
+            version: version.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// `dbvalet_` and 16 lowercase base32 characters, safe unquoted in SQL.
+fn new_login_name() -> Result<String, getrandom::Error> {
+    Ok(format!(
+        "dbvalet_{}",
+        random_base32(RUN_ID_BYTES)?.expose_secret()
+    ))
+}
+
+/// Ends the login's sessions, clears or reassigns what it owns, and drops it.
+pub(super) async fn drop_login(
+    alias: &DatabaseAlias,
+    admin: &AdminLogin,
+    user: &str,
+    member_of: &str,
+    read_only: bool,
+) -> Result<(), SourceError> {
+    let drop_failed = |reason| SourceError::DropLogin {
+        login: user.to_owned(),
+        reason,
+    };
+    let client = connect(alias, admin).await.map_err(drop_failed)?;
+    client
+        .query(
+            "SELECT pg_terminate_backend(pid, $2) FROM pg_stat_activity WHERE usename = $1",
+            &[&user, &SESSION_END_TIMEOUT_MS],
+        )
+        .await
+        .map_err(|err| drop_failed(describe_sql_error(&err)))?;
+    // pg_terminate_backend returns false rather than failing, so count what is left.
+    let remaining: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+            &[&user],
+        )
+        .await
+        .map_err(|err| drop_failed(describe_sql_error(&err)))?
+        .get(0);
+    if remaining > 0 {
+        return Err(drop_failed(format!(
+            "{remaining} of its sessions didn't end within {SESSION_END_TIMEOUT_MS} ms"
+        )));
+    }
+    client
+        .batch_execute(&drop_login_sql(user, member_of, read_only))
+        .await
+        .map_err(|err| drop_failed(describe_sql_error(&err)))
+}
+
+fn drop_login_sql(user: &str, member_of: &str, read_only: bool) -> String {
+    let login = quote_ident(user);
+    if read_only {
+        // Read-only runs never transfer objects to the group role, so anything created
+        // despite read-only defaults (such as large objects before PostgreSQL 16) is dropped.
+        format!(
+            "DROP OWNED BY {login};
+             DROP ROLE {login};"
+        )
+    } else {
+        let group = quote_ident(member_of);
+        format!(
+            "REASSIGN OWNED BY {login} TO {group};
+             DROP OWNED BY {login};
+             DROP ROLE {login};"
+        )
+    }
+}
 
 /// One line of `dbvalet doctor`'s report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +408,18 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+fn quote_literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// The server's message and SQLSTATE: admin SQL errors never quote the statement text.
+fn describe_sql_error(err: &tokio_postgres::Error) -> String {
+    match err.as_db_error() {
+        Some(db) => format!("{} (SQLSTATE {})", db.message(), db.code().code()),
+        None => "the connection to PostgreSQL ended before it answered".to_owned(),
+    }
+}
+
 async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, String> {
     let endpoint = admin.endpoint();
     if endpoint.tls() == Tls::VerifyFull {
@@ -324,6 +545,19 @@ mod tests {
 
     fn alias() -> DatabaseAlias {
         "app".parse().unwrap()
+    }
+
+    #[test]
+    fn a_new_login_name_is_dbvalet_and_16_lowercase_base32_characters() {
+        let name = new_login_name().unwrap();
+        let run_id = name.strip_prefix("dbvalet_").unwrap();
+        assert_eq!(run_id.len(), 16, "{name}");
+        assert!(
+            run_id
+                .bytes()
+                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7')),
+            "{name}"
+        );
     }
 
     #[test]
@@ -553,5 +787,56 @@ mod tests {
         assert!(missing_db.contains("dbvalet login app"));
         assert!(missing_db.contains("defaults to the user name"));
         assert!(!missing_db.contains("leaked-raw"));
+    }
+
+    #[test]
+    fn mint_refuses_a_noinherit_non_superuser_before_postgresql_16() {
+        let err = check_mint_prerequisites(&alias(), "app-admin", "15.8", 150008, false, false)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, SourceError::AdminNoInherit { .. }));
+        assert!(
+            message.contains("ALTER ROLE \"app-admin\" INHERIT"),
+            "{message}"
+        );
+        assert!(message.contains("dbvalet doctor app"), "{message}");
+    }
+
+    #[test]
+    fn mint_allows_a_noinherit_admin_when_superuser_or_on_postgresql_16_or_later() {
+        assert!(check_mint_prerequisites(&alias(), "super", "14.12", 140012, true, false).is_ok());
+        assert!(check_mint_prerequisites(&alias(), "admin", "14.12", 140012, false, true).is_ok());
+        assert!(check_mint_prerequisites(&alias(), "admin", "16.0", 160000, false, false).is_ok());
+    }
+
+    #[test]
+    fn dropping_a_read_only_login_skips_reassign_owned() {
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_reader", true);
+        assert!(!sql.contains("REASSIGN OWNED"), "{sql}");
+        assert!(
+            sql.contains("DROP OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP ROLE \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_writable_login_reassigns_owned_objects_to_its_group() {
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_writer", false);
+        assert!(
+            sql.contains("REASSIGN OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\" TO \"dbvalet_writer\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("DROP ROLE \"dbvalet_aaaaaaaaaaaaaaaa\";"),
+            "{sql}"
+        );
     }
 }

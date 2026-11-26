@@ -101,3 +101,71 @@ fn login_refuses_unencoded_at_in_password_without_printing_it() {
     assert!(!stdout.contains("cret-PART-9a1"), "stdout: {stdout}");
     assert!(!stderr.contains("cret-PART-9a1"), "stderr: {stderr}");
 }
+
+fn project(name: &str, config: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("dbvalet.toml"), config).unwrap();
+    dir
+}
+
+#[test]
+fn run_with_an_unlisted_role_is_refused_before_reading_the_keychain_and_lists_the_allowed_roles() {
+    let dir = project(
+        "cli-test-unlisted-role",
+        "[databases.cli-test-unstored.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n",
+    );
+
+    let output = Command::new(DBVALET)
+        .current_dir(&dir)
+        .args([
+            "run",
+            "--role",
+            "writer",
+            "--",
+            "sh",
+            "-c",
+            "echo child-ran",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr.contains(
+            "the role `writer` isn't allowed for `cli-test-unstored`: dbvalet.toml allows reader"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn run_with_two_databases_and_no_db_flag_is_refused_and_lists_the_aliases() {
+    let dir = project(
+        "cli-test-two-databases",
+        "[databases.cli-test-app.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n\
+         [databases.cli-test-analytics.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n",
+    );
+
+    let output = Command::new(DBVALET)
+        .current_dir(dir.join("nested"))
+        .args(["run", "--", "sh", "-c", "echo child-ran"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr.contains(
+            "dbvalet.toml lists more than one database: \
+             pass --db with one of cli-test-analytics, cli-test-app"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
