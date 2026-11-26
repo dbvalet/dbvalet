@@ -19,7 +19,7 @@ use crate::ledger;
 use crate::{DatabaseAlias, random_base32};
 
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MINIMUM_SERVER_VERSION_NUM: i32 = 140000;
+const MINIMUM_SERVER_VERSION_NUM: i32 = 150000;
 /// From this version a CREATEROLE admin can inherit the roles it creates.
 const CREATEROLE_SELF_GRANT_VERSION_NUM: i32 = 160000;
 const LOGIN_PREFIX: &str = "dbvalet_";
@@ -502,10 +502,10 @@ async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
 fn version_check(rights: &Rights) -> Check {
     let version = &rights.server_version;
     if rights.server_version_num >= MINIMUM_SERVER_VERSION_NUM {
-        Check::passed(format!("PostgreSQL {version} is 14 or later"))
+        Check::passed(format!("PostgreSQL {version} is 15 or later"))
     } else {
         Check::failed(format!(
-            "PostgreSQL {version} is too old: dbvalet needs 14 or later"
+            "PostgreSQL {version} is end-of-life: dbvalet needs 15 or later"
         ))
     }
 }
@@ -535,13 +535,25 @@ fn end_sessions_check(user: &str, rights: &Rights) -> Check {
             "`{user}` can end other roles' sessions, through pg_signal_backend"
         ));
     }
-    if rights.create_role && rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-        return Check::passed(format!(
-            "`{user}` can end the sessions of logins it creates, \
-             because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
+    let quoted = quote_ident(user);
+    if rights.create_role {
+        if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+            return Check::passed(format!(
+                "`{user}` can end the sessions of logins it creates, \
+                 because dbvalet sets createrole_self_grant on PostgreSQL 16 and later"
+            ));
+        }
+        if rights.inherit {
+            return Check::passed(format!(
+                "`{user}` can end the sessions of logins it creates, \
+                 because dbvalet adds it as a member of each login"
+            ));
+        }
+        return Check::failed(format!(
+            "`{user}` can't end the sessions of logins it creates because it has NOINHERIT: \
+             run ALTER ROLE {quoted} INHERIT"
         ));
     }
-    let quoted = quote_ident(user);
     if rights.server_version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
         let grant_fix = if rights.signal_backend_member || !rights.inherit {
             format!("GRANT pg_signal_backend TO {quoted} WITH INHERIT TRUE")
@@ -553,20 +565,18 @@ fn end_sessions_check(user: &str, rights: &Rights) -> Check {
              as a superuser, run ALTER ROLE {quoted} CREATEROLE, or {grant_fix}"
         ));
     }
-    let prefix = if rights.create_role {
-        ""
-    } else {
-        "as a superuser, "
-    };
     let fix = if !rights.inherit && rights.signal_backend_member {
         format!("ALTER ROLE {quoted} INHERIT")
     } else if !rights.inherit {
-        format!("GRANT pg_signal_backend TO {quoted} and ALTER ROLE {quoted} INHERIT")
+        format!(
+            "ALTER ROLE {quoted} CREATEROLE INHERIT, \
+             or GRANT pg_signal_backend TO {quoted} and ALTER ROLE {quoted} INHERIT"
+        )
     } else {
-        format!("GRANT pg_signal_backend TO {quoted}")
+        format!("ALTER ROLE {quoted} CREATEROLE, or GRANT pg_signal_backend TO {quoted}")
     };
     Check::failed(format!(
-        "`{user}` can't end other roles' sessions: {prefix}run {fix}"
+        "`{user}` can't end other roles' sessions: as a superuser, run {fix}"
     ))
 }
 
@@ -745,26 +755,26 @@ mod tests {
     }
 
     #[test]
-    fn postgresql_13_fails_the_version_check_and_names_14() {
+    fn postgresql_14_fails_the_version_check_naming_15_and_end_of_life() {
         let check = version_check(&Rights {
             superuser: true,
-            ..pg("13.18", 130018)
+            ..pg("14.25", 140025)
         });
         assert!(!check.passed);
         assert_eq!(
             check.message,
-            "PostgreSQL 13.18 is too old: dbvalet needs 14 or later"
+            "PostgreSQL 14.25 is end-of-life: dbvalet needs 15 or later"
         );
     }
 
     #[test]
-    fn postgresql_14_passes_the_version_check() {
+    fn postgresql_15_passes_the_version_check() {
         let check = version_check(&Rights {
             superuser: true,
-            ..pg("14.0", 140000)
+            ..pg("15.0", 150000)
         });
         assert!(check.passed);
-        assert_eq!(check.message, "PostgreSQL 14.0 is 14 or later");
+        assert_eq!(check.message, "PostgreSQL 15.0 is 15 or later");
     }
 
     #[test]
@@ -810,7 +820,7 @@ mod tests {
             "admin",
             &Rights {
                 superuser: true,
-                ..pg("14.12", 140012)
+                ..pg("15.20", 150020)
             },
         );
         assert!(check.passed);
@@ -821,14 +831,13 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_with_pg_signal_backend_can_end_sessions_before_postgresql_16() {
+    fn an_admin_with_pg_signal_backend_can_end_sessions_on_postgresql_15() {
         let check = end_sessions_check(
             "admin",
             &Rights {
-                create_role: true,
                 signal_backend: true,
                 signal_backend_member: true,
-                ..pg("14.12", 140012)
+                ..pg("15.20", 150020)
             },
         );
         assert!(check.passed);
@@ -856,57 +865,87 @@ mod tests {
     }
 
     #[test]
-    fn a_createrole_admin_before_postgresql_16_without_pg_signal_backend_is_told_to_grant_it() {
+    fn a_createrole_inherit_admin_on_postgresql_15_can_end_sessions() {
         let check = end_sessions_check(
             "app-admin",
             &Rights {
                 create_role: true,
-                ..pg("14.12", 140012)
+                ..pg("15.20", 150020)
             },
         );
-        assert!(!check.passed);
+        assert!(check.passed);
         assert_eq!(
             check.message,
-            "`app-admin` can't end other roles' sessions: \
-             run GRANT pg_signal_backend TO \"app-admin\""
+            "`app-admin` can end the sessions of logins it creates, \
+             because dbvalet adds it as a member of each login"
         );
     }
 
     #[test]
-    fn a_noinherit_createrole_admin_holding_pg_signal_backend_before_16_is_told_to_enable_inherit()
-    {
+    fn a_noinherit_createrole_admin_on_postgresql_15_is_told_to_enable_inherit() {
         let check = end_sessions_check(
             "app-admin",
             &Rights {
                 create_role: true,
                 inherit: false,
-                signal_backend_member: true,
-                ..pg("14.12", 140012)
+                ..pg("15.20", 150020)
             },
         );
         assert!(!check.passed);
         assert_eq!(
             check.message,
-            "`app-admin` can't end other roles' sessions: \
+            "`app-admin` can't end the sessions of logins it creates because it has NOINHERIT: \
              run ALTER ROLE \"app-admin\" INHERIT"
         );
     }
 
     #[test]
-    fn a_noinherit_plain_admin_before_16_is_told_as_superuser_to_grant_and_enable_inherit() {
+    fn a_plain_admin_on_postgresql_15_is_told_to_add_createrole_or_grant_pg_signal_backend() {
+        let check = end_sessions_check("plain", &pg("15.20", 150020));
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`plain` can't end other roles' sessions: \
+             as a superuser, run ALTER ROLE \"plain\" CREATEROLE, \
+             or GRANT pg_signal_backend TO \"plain\""
+        );
+    }
+
+    #[test]
+    fn a_noinherit_plain_admin_holding_pg_signal_backend_on_postgresql_15_is_told_to_enable_inherit()
+     {
         let check = end_sessions_check(
             "plain",
             &Rights {
                 inherit: false,
-                ..pg("14.12", 140012)
+                signal_backend_member: true,
+                ..pg("15.20", 150020)
             },
         );
         assert!(!check.passed);
         assert_eq!(
             check.message,
             "`plain` can't end other roles' sessions: \
-             as a superuser, run GRANT pg_signal_backend TO \"plain\" \
-             and ALTER ROLE \"plain\" INHERIT"
+             as a superuser, run ALTER ROLE \"plain\" INHERIT"
+        );
+    }
+
+    #[test]
+    fn a_noinherit_plain_admin_on_postgresql_15_is_told_as_superuser_to_add_createrole_and_inherit()
+    {
+        let check = end_sessions_check(
+            "plain",
+            &Rights {
+                inherit: false,
+                ..pg("15.20", 150020)
+            },
+        );
+        assert!(!check.passed);
+        assert_eq!(
+            check.message,
+            "`plain` can't end other roles' sessions: \
+             as a superuser, run ALTER ROLE \"plain\" CREATEROLE INHERIT, \
+             or GRANT pg_signal_backend TO \"plain\" and ALTER ROLE \"plain\" INHERIT"
         );
     }
 
@@ -974,6 +1013,17 @@ mod tests {
     }
 
     #[test]
+    fn mint_refuses_postgresql_14_as_end_of_life() {
+        let err =
+            check_mint_prerequisites(&alias(), "super", "14.25", 140025, true, true).unwrap_err();
+        assert!(matches!(err, SourceError::TooOld { .. }));
+        assert_eq!(
+            err.to_string(),
+            "PostgreSQL 14.25 is end-of-life: dbvalet needs 15 or later"
+        );
+    }
+
+    #[test]
     fn mint_refuses_a_noinherit_non_superuser_before_postgresql_16() {
         let err = check_mint_prerequisites(&alias(), "app-admin", "15.8", 150008, false, false)
             .unwrap_err();
@@ -987,9 +1037,9 @@ mod tests {
     }
 
     #[test]
-    fn mint_allows_a_noinherit_admin_when_superuser_or_on_postgresql_16_or_later() {
-        assert!(check_mint_prerequisites(&alias(), "super", "14.12", 140012, true, false).is_ok());
-        assert!(check_mint_prerequisites(&alias(), "admin", "14.12", 140012, false, true).is_ok());
+    fn mint_allows_supported_admins_on_postgresql_15_and_16() {
+        assert!(check_mint_prerequisites(&alias(), "super", "15.20", 150020, true, false).is_ok());
+        assert!(check_mint_prerequisites(&alias(), "admin", "15.20", 150020, false, true).is_ok());
         assert!(check_mint_prerequisites(&alias(), "admin", "16.0", 160000, false, false).is_ok());
     }
 

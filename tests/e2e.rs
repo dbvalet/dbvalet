@@ -87,7 +87,7 @@ fn a_superuser_admin_stored_from_stdin_passes_every_doctor_check() {
     assert!(checked.status.success(), "doctor: {stdout}");
     assert!(stdout.contains("ok   the keychain holds an admin login for `e2e-superuser`\n"));
     assert!(stdout.contains("ok   `e2e_superuser_admin` connects to localhost:5432/postgres\n"));
-    assert!(stdout.contains(" is 14 or later\n"));
+    assert!(stdout.contains(" is 15 or later\n"));
     assert!(stdout.contains("ok   `e2e_superuser_admin` is a superuser\n"));
     assert!(
         stdout
@@ -118,7 +118,7 @@ fn a_createrole_admin_on_postgresql_16_or_later_passes_every_doctor_check() {
     assert!(checked.status.success(), "doctor: {stdout}");
     assert!(stdout.contains("ok   the keychain holds an admin login for `e2e-createrole`\n"));
     assert!(stdout.contains("ok   `e2e_createrole_admin` connects to localhost:5432/postgres\n"));
-    assert!(stdout.contains(" is 14 or later\n"));
+    assert!(stdout.contains(" is 15 or later\n"));
     assert!(stdout.contains("ok   `e2e_createrole_admin` has CREATEROLE\n"));
     assert!(stdout.contains(
         "ok   `e2e_createrole_admin` can end the sessions of logins it creates, \
@@ -129,33 +129,35 @@ fn a_createrole_admin_on_postgresql_16_or_later_passes_every_doctor_check() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn a_createrole_admin_before_postgresql_16_is_told_to_grant_pg_signal_backend() {
+fn a_createrole_admin_on_postgresql_15_passes_every_doctor_check() {
     if server_version_num() >= 160000 {
         return;
     }
     superuser_sql(
-        "DROP ROLE IF EXISTS e2e_createrole_old_admin;
-         CREATE ROLE e2e_createrole_old_admin LOGIN CREATEROLE PASSWORD 'pw-e2e-old-55a7';",
+        "DROP ROLE IF EXISTS e2e_createrole_15_admin;
+         CREATE ROLE e2e_createrole_15_admin LOGIN CREATEROLE PASSWORD 'pw-e2e-pg15-55a7';",
     );
     let stored = login(
-        "e2e-createrole-old",
-        "postgresql://e2e_createrole_old_admin:pw-e2e-old-55a7@localhost:5432/postgres",
+        "e2e-createrole-15",
+        "postgresql://e2e_createrole_15_admin:pw-e2e-pg15-55a7@localhost:5432/postgres",
     );
     assert!(stored.status.success(), "login: {}", text(&stored.stderr));
 
-    let checked = doctor("e2e-createrole-old");
+    let checked = doctor("e2e-createrole-15");
 
     let stdout = text(&checked.stdout);
-    assert!(!checked.status.success());
-    assert!(stdout.contains("ok   `e2e_createrole_old_admin` has CREATEROLE\n"));
+    assert!(checked.status.success(), "doctor: {stdout}");
+    assert!(stdout.contains("ok   the keychain holds an admin login for `e2e-createrole-15`\n"));
     assert!(
-        stdout.contains(
-            "FAIL `e2e_createrole_old_admin` can't end other roles' sessions: \
-             run GRANT pg_signal_backend TO \"e2e_createrole_old_admin\"\n"
-        ),
-        "doctor: {stdout}"
+        stdout.contains("ok   `e2e_createrole_15_admin` connects to localhost:5432/postgres\n")
     );
-    assert!(!stdout.contains("as a superuser"), "doctor: {stdout}");
+    assert!(stdout.contains(" is 15 or later\n"));
+    assert!(stdout.contains("ok   `e2e_createrole_15_admin` has CREATEROLE\n"));
+    assert!(stdout.contains(
+        "ok   `e2e_createrole_15_admin` can end the sessions of logins it creates, \
+         because dbvalet adds it as a member of each login\n"
+    ));
+    assert!(!stdout.contains("FAIL"));
 }
 
 #[test]
@@ -248,30 +250,32 @@ fn doctor_with_a_wrong_stored_password_fails_without_printing_it() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn a_noinherit_createrole_admin_holding_pg_signal_backend_before_postgresql_16_is_told_to_enable_inherit()
- {
+fn a_noinherit_createrole_admin_on_postgresql_15_is_told_to_enable_inherit() {
     if server_version_num() >= 160000 {
         return;
     }
     superuser_sql(
-        "DROP ROLE IF EXISTS e2e_noinh_14_admin;
-         CREATE ROLE e2e_noinh_14_admin LOGIN CREATEROLE NOINHERIT PASSWORD 'pw-e2e-noinh14-2a9b';
-         GRANT pg_signal_backend TO e2e_noinh_14_admin;",
+        "DROP ROLE IF EXISTS e2e_noinh_15_admin;
+         CREATE ROLE e2e_noinh_15_admin LOGIN CREATEROLE NOINHERIT PASSWORD 'pw-e2e-noinh15-2a9b';",
     );
     let stored = login(
-        "e2e-noinh-14",
-        "postgresql://e2e_noinh_14_admin:pw-e2e-noinh14-2a9b@localhost:5432/postgres",
+        "e2e-noinh-15",
+        "postgresql://e2e_noinh_15_admin:pw-e2e-noinh15-2a9b@localhost:5432/postgres",
     );
     assert!(stored.status.success(), "login: {}", text(&stored.stderr));
 
-    let checked = doctor("e2e-noinh-14");
+    let checked = doctor("e2e-noinh-15");
 
     let stdout = text(&checked.stdout);
     assert!(!checked.status.success(), "doctor: {stdout}");
     assert!(
-        stdout.contains("ALTER ROLE \"e2e_noinh_14_admin\" INHERIT"),
+        stdout.contains(
+            "FAIL `e2e_noinh_15_admin` can't end the sessions of logins it creates \
+             because it has NOINHERIT: run ALTER ROLE \"e2e_noinh_15_admin\" INHERIT\n"
+        ),
         "doctor: {stdout}"
     );
+    assert!(!stdout.contains("pg_signal_backend"), "doctor: {stdout}");
     assert!(!stdout.contains("as a superuser"), "doctor: {stdout}");
 }
 
@@ -759,12 +763,11 @@ fn a_run_with_a_createrole_admin_reads_and_leaves_no_login_or_session() {
     );
 
     let stdout = text(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
-    assert!(
-        text(&output.stderr).is_empty(),
-        "stderr: {}",
-        text(&output.stderr)
-    );
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    // PostgreSQL 19 warns on stderr about the temporary login's short VALID UNTIL expiry;
+    // a teardown failure from dbvalet itself is prefixed with `dbvalet:`.
+    assert!(!stderr.contains("dbvalet:"), "stderr: {stderr}");
     let login_name = stdout.lines().next().unwrap().to_owned();
     assert_eq!(stdout, format!("{login_name}\n1\n"));
     assert_eq!(
@@ -891,7 +894,9 @@ fn a_noinherit_createrole_admin_on_postgresql_16_or_later_runs_and_drops_its_log
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
     assert!(output.status.success(), "stderr: {stderr}");
-    assert!(stderr.is_empty(), "stderr: {stderr}");
+    // PostgreSQL 19 warns on stderr about the temporary login's short VALID UNTIL expiry;
+    // a teardown failure from dbvalet itself is prefixed with `dbvalet:`.
+    assert!(!stderr.contains("dbvalet:"), "stderr: {stderr}");
     let login_name = stdout.lines().next().unwrap().to_owned();
     assert_eq!(stdout, format!("{login_name}\n1\n"));
     assert_eq!(

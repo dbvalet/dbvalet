@@ -36,7 +36,7 @@ pub enum SourceError {
         alias: DatabaseAlias,
         reason: String,
     },
-    #[error("PostgreSQL {version} is too old: dbvalet needs 14 or later")]
+    #[error("PostgreSQL {version} is end-of-life: dbvalet needs 15 or later")]
     TooOld { version: String },
     #[error(
         "the admin login `{user}` has NOINHERIT on PostgreSQL {version}, so it can't drop \
