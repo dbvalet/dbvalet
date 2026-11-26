@@ -1030,7 +1030,11 @@ fn a_read_only_run_leaves_no_large_objects_after_teardown() {
                     .unwrap();
             tokio::spawn(connection);
             client
-                .query_one("SELECT count(*) FROM pg_largeobject_metadata", &[])
+                .query_one(
+                    "SELECT count(*) FROM pg_largeobject_metadata
+                     WHERE lomowner = 'dbvalet_reader'::regrole",
+                    &[],
+                )
                 .await
                 .unwrap()
                 .get(0)
@@ -1428,7 +1432,11 @@ fn a_run_whose_login_a_sweep_already_dropped_ends_without_an_error() {
     superuser_sql(&format!(
         "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
     ));
-    let swept = gc_command(&dir).output().unwrap();
+    // Another machine's sweep: it has no ledger entry for the login, so it drops it.
+    let swept = gc_command(&dir)
+        .env("XDG_STATE_HOME", dir.join("other-machine-state"))
+        .output()
+        .unwrap();
     drop(alone);
 
     run.stdin.take().unwrap().write_all(b"\n").unwrap();
@@ -1436,6 +1444,11 @@ fn a_run_whose_login_a_sweep_already_dropped_ends_without_an_error() {
 
     let stderr = text(&output.stderr);
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert!(
+        text(&swept.stdout).contains(&format!("dropped the leftover login `{login_name}`")),
+        "stdout: {}",
+        text(&swept.stdout)
+    );
     assert!(output.status.success(), "stderr: {stderr}");
     assert!(stderr.is_empty(), "stderr: {stderr}");
     assert!(!ledger_entry(&dir, "e2e-run-swept-early", &login_name).exists());
@@ -1499,9 +1512,12 @@ fn gc_with_a_closed_stdout_still_sweeps_every_database() {
 fn an_unreadable_ledger_entry_is_reported_and_the_run_still_runs() {
     use std::os::unix::fs::PermissionsExt;
     let dir = project_with_reader("e2e-run-unreadable-entry");
+    superuser_sql("DROP ROLE IF EXISTS dbvalet_unreadablebeside;");
     let entry = ledger_entry(&dir, "e2e-run-unreadable-entry", "dbvalet_unreadableentryz");
+    let beside = ledger_entry(&dir, "e2e-run-unreadable-entry", "dbvalet_unreadablebeside");
     std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
     std::fs::write(&entry, "read-only\n").unwrap();
+    std::fs::write(&beside, "read-only\n").unwrap();
     std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let output = run_in(&dir, &["sh", "-c", "echo ran"]);
@@ -1516,6 +1532,7 @@ fn an_unreadable_ledger_entry_is_reported_and_the_run_still_runs() {
             && stderr.contains("dbvalet_unreadableentryz"),
         "stderr: {stderr}"
     );
+    assert!(!beside.exists());
 }
 
 #[test]
@@ -1660,6 +1677,9 @@ fn a_lock_on_a_table_the_crashed_login_owns_fails_that_drop_without_stopping_gc_
     let login_name = printed(&seen, "login").to_owned();
     run.kill().unwrap();
     run.wait().unwrap();
+    superuser_sql("DROP ROLE IF EXISTS dbvalet_lockedtablenext2;");
+    let beside = ledger_entry(&dir, "e2e-gc-locked-table", "dbvalet_lockedtablenext2");
+    std::fs::write(&beside, "read-only\n").unwrap();
     let lock_holder = runtime();
     let holding = lock_holder.block_on(async {
         let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
@@ -1685,6 +1705,7 @@ fn a_lock_on_a_table_the_crashed_login_owns_fails_that_drop_without_stopping_gc_
         "SELECT count(*) FROM pg_roles WHERE rolname = $1",
         &login_name,
     );
+    let beside_after_first_gc = beside.exists();
     drop(holding);
     drop(lock_holder);
     let swept_after = output_within(gc_command(&dir), Duration::from_secs(60));
@@ -1706,6 +1727,7 @@ fn a_lock_on_a_table_the_crashed_login_owns_fails_that_drop_without_stopping_gc_
     assert!(next.status.success(), "stderr: {}", text(&next.stderr));
     assert_eq!(text(&next.stdout), "ran\n");
     assert_eq!(logins_while_locked, 1);
+    assert!(!beside_after_first_gc);
     assert!(
         swept_after.status.success(),
         "stderr: {}",
@@ -1790,4 +1812,238 @@ fn a_writable_login_that_set_itself_read_only_keeps_its_table_after_a_crash() {
         ),
         0
     );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn an_expired_login_owning_a_table_in_another_database_is_left_to_that_databases_sweep() {
+    let other_db_url = "postgresql://postgres:e2e-throwaway@localhost:5432/e2e_gc_other_db";
+    if superuser_count(
+        "SELECT count(*) FROM pg_database WHERE datname = $1",
+        "e2e_gc_other_db",
+    ) == 0
+    {
+        superuser_sql("CREATE DATABASE e2e_gc_other_db;");
+    }
+    create_writer_group("e2e_gc_other_writer");
+    runtime().block_on(async {
+        let (client, connection) = tokio_postgres::connect(other_db_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS e2e_gc_other_writer AUTHORIZATION e2e_gc_other_writer;
+                 DROP TABLE IF EXISTS e2e_gc_other_writer.e2e_gc_other_table;",
+            )
+            .await
+            .unwrap();
+    });
+    let dir = project_with_reader("e2e-gc-other-db-a");
+    superuser_sql(
+        "DROP ROLE IF EXISTS e2e_gc_other_db_z;
+         CREATE ROLE e2e_gc_other_db_z LOGIN SUPERUSER PASSWORD 'pw-e2e-gc-other-db-z';",
+    );
+    let stored = login(
+        "e2e-gc-other-db-z",
+        "postgresql://e2e_gc_other_db_z:pw-e2e-gc-other-db-z@localhost:5432/e2e_gc_other_db",
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-gc-other-db-a.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n\
+         [databases.e2e-gc-other-db-z.roles]\n\
+         writer = { member_of = \"e2e_gc_other_writer\", read_only = false }\n",
+    )
+    .unwrap();
+    let (mut run, seen) = start_run_until_ready(
+        &dir,
+        &["--db", "e2e-gc-other-db-z", "--role", "writer"],
+        "echo \"login=$PGUSER\"; psql -v ON_ERROR_STOP=1 -qAtXc \
+         'CREATE TABLE e2e_gc_other_writer.e2e_gc_other_table ()'",
+    );
+    let login_name = printed(&seen, "login").to_owned();
+    run.kill().unwrap();
+    run.wait().unwrap();
+
+    let alone = sweeping_alone();
+    superuser_sql(&format!(
+        "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
+    ));
+    let swept = gc_command(&dir).output().unwrap();
+    drop(alone);
+    drop(run.stdin.take());
+    let owned_by_group: i64 = runtime().block_on(async {
+        let (client, connection) = tokio_postgres::connect(other_db_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_tables
+                 WHERE tablename = 'e2e_gc_other_table' AND tableowner = 'e2e_gc_other_writer'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+    });
+
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert_eq!(text(&swept.stderr), "");
+    assert!(
+        text(&swept.stdout).contains(&format!(
+            "`e2e-gc-other-db-z`: dropped the leftover login `{login_name}`"
+        )),
+        "stdout: {}",
+        text(&swept.stdout)
+    );
+    assert_eq!(owned_by_group, 1);
+}
+
+/// A server on 127.0.0.1 that lets every client log in, then never answers a query.
+fn silent_after_login_server() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut startup = vec![0; u32::from_be_bytes(length) as usize - 4];
+            stream.read_exact(&mut startup).unwrap();
+            // AuthenticationOk, then ReadyForQuery with an idle transaction status.
+            stream
+                .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                .unwrap();
+            held.push(stream);
+        }
+    });
+    port
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn an_admin_endpoint_that_logs_in_and_then_never_answers_is_reported_and_gc_moves_on() {
+    let port = silent_after_login_server();
+    let stored = login(
+        "e2e-gc-silent-after-login-a",
+        &format!("postgresql://e2e_silent:pw-e2e-silent@127.0.0.1:{port}/postgres"),
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    let dir = project_with_reader("e2e-gc-silent-after-login-b");
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-gc-silent-after-login-a.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n\
+         [databases.e2e-gc-silent-after-login-b.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n",
+    )
+    .unwrap();
+    superuser_sql("DROP ROLE IF EXISTS dbvalet_silentafterlogin;");
+    let entry = ledger_entry(
+        &dir,
+        "e2e-gc-silent-after-login-b",
+        "dbvalet_silentafterlogin",
+    );
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(&entry, "read-only\n").unwrap();
+
+    let _sweeping = sweeping();
+    let swept = output_within(gc_command(&dir), Duration::from_secs(60));
+
+    let stderr = text(&swept.stderr);
+    assert_eq!(swept.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("`e2e-gc-silent-after-login-a`"),
+        "stderr: {stderr}"
+    );
+    assert!(!entry.exists());
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_of_another_database_never_holds_this_databases_ledger_entries() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let (accepted, connected) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in silent.incoming() {
+            held.push(stream);
+            let _ = accepted.send(());
+        }
+    });
+    let stored = login(
+        "e2e-gc-hold-x",
+        &format!("postgresql://e2e_hold:pw-e2e-hold@127.0.0.1:{port}/postgres"),
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    let dir = project_with_reader("e2e-gc-hold-z");
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-gc-hold-x.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n\
+         [databases.e2e-gc-hold-z.roles]\n\
+         reader = { member_of = \"dbvalet_reader\", read_only = true }\n",
+    )
+    .unwrap();
+    let (mut crashed, seen) =
+        start_run_until_ready(&dir, &["--db", "e2e-gc-hold-z"], "echo \"login=$PGUSER\"");
+    let login_name = printed(&seen, "login").to_owned();
+    crashed.kill().unwrap();
+    crashed.wait().unwrap();
+
+    let _sweeping = sweeping();
+    // A run on the other database, stuck connecting while its sweep has begun.
+    let mut stuck = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args([
+            "run",
+            "--db",
+            "e2e-gc-hold-x",
+            "--allow-plaintext",
+            "--",
+            "true",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    connected.recv_timeout(Duration::from_secs(10)).unwrap();
+    let next = output_within(
+        {
+            let mut next = Command::new(DBVALET);
+            next.current_dir(&dir)
+                .env("XDG_STATE_HOME", dir.join("state"))
+                .args([
+                    "run",
+                    "--db",
+                    "e2e-gc-hold-z",
+                    "--allow-plaintext",
+                    "--",
+                    "true",
+                ]);
+            next
+        },
+        Duration::from_secs(60),
+    );
+    let stuck_while_next_ran = stuck.try_wait().unwrap().is_none();
+    let logins_after_next = superuser_count(
+        "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+        &login_name,
+    );
+    stuck.kill().unwrap();
+    stuck.wait().unwrap();
+    drop(crashed.stdin.take());
+
+    assert!(next.status.success(), "stderr: {}", text(&next.stderr));
+    assert!(
+        stuck_while_next_ran,
+        "the stuck run ended before the next run did"
+    );
+    assert_eq!(logins_after_next, 0);
 }
