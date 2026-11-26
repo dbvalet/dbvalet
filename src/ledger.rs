@@ -105,14 +105,14 @@ pub fn orphans(alias: &DatabaseAlias) -> Result<Vec<Entry>, LedgerError> {
                 return Err(io_error("lock the ledger entry", &path, reason));
             }
         }
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
             .map_err(|reason| io_error("read the ledger entry", &path, reason))?;
         orphans.push(Entry {
             path,
             login,
             // Anything unreadable counts as writable, so a sweep reassigns objects, never drops them.
-            read_only: contents == READ_ONLY,
+            read_only: contents == READ_ONLY.as_bytes(),
             _lock: file,
         });
     }
@@ -136,6 +136,13 @@ fn entries(dir: &Path) -> Result<Vec<(DatabaseAlias, String, PathBuf)>, LedgerEr
     let mut entries = Vec::new();
     for file in listing {
         let file = file.map_err(|reason| io_error("read the ledger", dir, reason))?;
+        if !file
+            .file_type()
+            .map_err(|reason| io_error("read the ledger", dir, reason))?
+            .is_file()
+        {
+            continue;
+        }
         let name = file.file_name();
         // No alias contains `.` or starts with one, so staging files fail to parse here.
         let Some((alias, login)) = name.to_str().and_then(|name| name.split_once('.')) else {

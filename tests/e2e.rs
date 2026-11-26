@@ -1203,7 +1203,13 @@ fn a_ledger_entry_whose_login_was_never_created_is_removed_by_gc() {
     std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
     std::fs::write(&entry, "read-only\n").unwrap();
 
-    let swept = gc_in(&dir);
+    // From outside any project, so gc finds the alias through the ledger alone.
+    let swept = Command::new(DBVALET)
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args(["gc", "--allow-plaintext"])
+        .output()
+        .unwrap();
 
     let stdout = text(&swept.stdout);
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
@@ -1310,4 +1316,41 @@ fn a_createrole_admin_drops_the_login_while_its_query_is_still_running() {
         ),
         0
     );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_run_whose_login_a_sweep_already_dropped_ends_without_an_error() {
+    let dir = project_with_reader("e2e-run-swept-early");
+    let (mut run, login_name) = start_run_with_busy_session(&dir);
+    superuser_sql(&format!(
+        "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
+    ));
+    let swept = gc_in(&dir);
+
+    run.stdin.take().unwrap().write_all(b"\n").unwrap();
+    let output = run.wait_with_output().unwrap();
+
+    let stderr = text(&output.stderr);
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert!(!ledger_entry(&dir, "e2e-run-swept-early", &login_name).exists());
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_corrupt_ledger_entry_or_a_stray_directory_does_not_stop_gc() {
+    let dir = project_with_reader("e2e-gc-corrupt-ledger");
+    superuser_sql("DROP ROLE IF EXISTS dbvalet_corruptledgerent;");
+    let corrupt = ledger_entry(&dir, "e2e-gc-corrupt-ledger", "dbvalet_corruptledgerent");
+    let stray = ledger_entry(&dir, "e2e-gc-corrupt-ledger", "stray");
+    std::fs::create_dir_all(&stray).unwrap();
+    std::fs::write(&corrupt, b"\xff\xfe").unwrap();
+
+    let swept = gc_in(&dir);
+
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert!(!corrupt.exists());
+    assert!(stray.is_dir());
 }

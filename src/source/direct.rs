@@ -1,5 +1,6 @@
 //! Temporary logins created with the admin login, over admin SQL.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -70,12 +71,15 @@ impl CredentialSource for DirectSource {
                     reason,
                 })?;
         let mut report = SweepReport::default();
+        // Retried without its ledger entry, a read-only login could be taken for a writable one.
+        let mut tried = BTreeSet::new();
         for entry in orphans {
             // Only names dbvalet makes: anything else in the ledger is left alone.
             if !is_login_name(entry.login()) {
                 continue;
             }
             let login = entry.login().to_owned();
+            tried.insert(login.clone());
             match drop_leftover_login(&client, &login, entry.read_only()).await {
                 Ok(existed) => match entry.remove() {
                     Ok(()) if existed => report.dropped.push(login),
@@ -99,7 +103,7 @@ impl CredentialSource for DirectSource {
         };
         for row in expired {
             let login: String = row.get(0);
-            if !is_login_name(&login) {
+            if !is_login_name(&login) || tried.contains(&login) {
                 continue;
             }
             match drop_leftover_login(&client, &login, false).await {
@@ -264,10 +268,10 @@ pub(super) async fn drop_login(
     let client = connect(alias, admin).await.map_err(drop_failed)?;
     end_sessions(&client, user).await.map_err(drop_failed)?;
     let reassign_to = (!read_only).then_some(member_of);
-    client
-        .batch_execute(&drop_login_sql(user, reassign_to))
+    execute_drop(&client, user, reassign_to)
         .await
-        .map_err(|err| drop_failed(describe_sql_error(&err)))
+        .map(|_| ())
+        .map_err(drop_failed)
 }
 
 /// Drops a login an ended run left behind, reading from the database what its lease knew.
@@ -298,6 +302,9 @@ async fn drop_leftover_login(
     let reassign_to = match (read_only, groups.as_slice()) {
         (true, _) => None,
         (false, [group]) => Some(group.as_str()),
+        (false, []) => {
+            return Err("it belongs to no group role that could take over what it created".into());
+        }
         (false, _) => {
             return Err(format!(
                 "it belongs to {} group roles, so dbvalet can't tell which one should own \
@@ -307,13 +314,22 @@ async fn drop_leftover_login(
         }
     };
     end_sessions(client, user).await?;
+    execute_drop(client, user, reassign_to).await
+}
+
+/// Runs [`drop_login_sql`]. Returns false when the login was already gone, as when a sweep
+/// elsewhere dropped it first.
+async fn execute_drop(
+    client: &Client,
+    user: &str,
+    reassign_to: Option<&str>,
+) -> Result<bool, String> {
     let Err(err) = client
         .batch_execute(&drop_login_sql(user, reassign_to))
         .await
     else {
         return Ok(true);
     };
-    // Another sweep dropping the same login at the same moment is as good as this one.
     let still_exists: bool = client
         .query_one(
             "SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)",
