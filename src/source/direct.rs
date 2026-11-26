@@ -3,13 +3,15 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use secrecy::ExposeSecret;
+use tokio::sync::watch;
 use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{CancelToken, Client, NoTls};
 
 use super::{
     CredentialSource, Lease, LeaseClock, LiveLease, SourceError, SweepReport, UpstreamLogin,
@@ -202,15 +204,24 @@ impl CredentialSource for DirectSource {
             ))
             .await
             .map_err(create_failed)?;
+        // Kept so end_sessions can still match backends by usesysid if another actor drops the role.
+        let role_oid: Option<u32> = client
+            .query_opt("SELECT oid FROM pg_roles WHERE rolname = $1", &[&user])
+            .await
+            .map_err(create_failed)?
+            .map(|row| row.get(0));
 
+        let active_push = Arc::new(ActivePush::default());
         let live = LiveLease {
             alias: self.alias.clone(),
             admin: Arc::clone(&self.admin),
             user: user.clone(),
+            role_oid,
             member_of: grant.member_of.clone(),
             read_only: grant.read_only,
             ledger_entry,
             proxy: None,
+            active_push,
         };
         Ok(Lease::start(UpstreamLogin { user, password }, live, clock))
     }
@@ -231,6 +242,126 @@ async fn timestamp_literal(
     Ok(quote_literal(row.get(0)))
 }
 
+/// Tracks an in-flight `ALTER ROLE ... VALID UNTIL` so teardown cancels it on PostgreSQL
+/// and waits for it to settle before running `DROP ROLE`.
+#[derive(Debug, Default)]
+pub(super) struct ActivePush {
+    next_id: AtomicU64,
+    state: Mutex<ActivePushState>,
+}
+
+#[derive(Debug, Default)]
+struct ActivePushState {
+    closed: bool,
+    in_flight: Option<InFlightPush>,
+}
+
+struct InFlightPush {
+    id: u64,
+    cancel_token: CancelToken,
+    done: watch::Receiver<bool>,
+}
+
+impl fmt::Debug for InFlightPush {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InFlightPush")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+struct PushGuard {
+    active_push: Arc<ActivePush>,
+    id: u64,
+    done: watch::Sender<bool>,
+}
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .active_push
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.in_flight.as_ref().is_some_and(|p| p.id == self.id) {
+            state.in_flight = None;
+        }
+        drop(state);
+        let _ = self.done.send(true);
+    }
+}
+
+impl ActivePush {
+    fn begin(self: &Arc<Self>, cancel_token: CancelToken) -> Option<PushGuard> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return None;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (done_tx, done_rx) = watch::channel(false);
+        state.in_flight = Some(InFlightPush {
+            id,
+            cancel_token,
+            done: done_rx,
+        });
+        Some(PushGuard {
+            active_push: Arc::clone(self),
+            id,
+            done: done_tx,
+        })
+    }
+
+    /// Prevents any new `ALTER ROLE` push from starting and cancels an in-flight one.
+    pub(super) async fn close_and_cancel(&self) {
+        let in_flight = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.closed = true;
+            state.in_flight.take()
+        };
+        if let Some(in_flight) = in_flight {
+            cancel_and_wait(in_flight).await;
+        }
+    }
+
+    /// Cancels the currently running `ALTER ROLE` (for example after a push timeout) while
+    /// allowing later pushes to run.
+    pub(super) async fn cancel_in_flight(&self) {
+        let in_flight = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.in_flight.take()
+        };
+        if let Some(in_flight) = in_flight {
+            cancel_and_wait(in_flight).await;
+        }
+    }
+}
+
+async fn cancel_and_wait(mut in_flight: InFlightPush) {
+    let deadline = tokio::time::Instant::now() + ADMIN_CONNECT_TIMEOUT;
+    loop {
+        if *in_flight.done.borrow() {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let _ = tokio::time::timeout(
+            remaining.min(Duration::from_secs(2)),
+            in_flight.cancel_token.cancel_query(NoTls),
+        )
+        .await;
+        let wait = remaining.min(Duration::from_millis(200));
+        if tokio::time::timeout(wait, in_flight.done.changed())
+            .await
+            .is_ok()
+            && *in_flight.done.borrow()
+        {
+            return;
+        }
+    }
+}
+
 /// Outcome of one expiry push against the database.
 pub(super) enum PushOutcome {
     /// The login's expiry is at least `expiry`, as of `database_now`.
@@ -245,14 +376,15 @@ pub(super) enum PushOutcome {
 }
 
 /// Moves the login's `VALID UNTIL` to its next expiry, over a fresh admin connection.
-/// Skips `ALTER ROLE` once the expiry has already reached the cap, while still reading the
-/// database's clock so laptop sleep past `max_ttl` is caught promptly.
+/// Always checks that the login still exists and reads the database's clock, skipping
+/// `ALTER ROLE` once the expiry has already reached the cap.
 pub(super) async fn push_expiry(
     alias: &DatabaseAlias,
     admin: &AdminLogin,
     user: &str,
     clock: &LeaseClock,
     confirmed_expiry: SystemTime,
+    active_push: &Arc<ActivePush>,
 ) -> Result<PushOutcome, SourceError> {
     let push_failed = |reason| SourceError::PushExpiry {
         login: user.to_owned(),
@@ -264,11 +396,18 @@ pub(super) async fn push_expiry(
         ))
     })?;
     let sql_failed = |err: tokio_postgres::Error| push_failed(describe_sql_error(&err));
-    let database_now: SystemTime = client
-        .query_one("SELECT now()", &[])
+    let row = client
+        .query_one(
+            "SELECT now(), EXISTS (SELECT FROM pg_roles WHERE rolname = $1)",
+            &[&user],
+        )
         .await
-        .map_err(sql_failed)?
-        .get(0);
+        .map_err(sql_failed)?;
+    let database_now: SystemTime = row.get(0);
+    let exists: bool = row.get(1);
+    if !exists {
+        return Ok(PushOutcome::AlreadyGone);
+    }
     if clock.remaining(database_now).is_none() {
         return Ok(PushOutcome::ReachedMaxTtl);
     }
@@ -282,25 +421,36 @@ pub(super) async fn push_expiry(
     let valid_until = timestamp_literal(&client, expiry)
         .await
         .map_err(sql_failed)?;
-    if let Err(err) = client
-        .batch_execute(&format!(
-            "ALTER ROLE {} VALID UNTIL {valid_until}",
-            quote_ident(user)
-        ))
-        .await
-    {
-        if err
-            .as_db_error()
-            .is_some_and(|db| *db.code() == SqlState::UNDEFINED_OBJECT)
-        {
-            return Ok(PushOutcome::AlreadyGone);
-        }
-        return Err(sql_failed(err));
-    }
-    Ok(PushOutcome::Pushed {
-        database_now,
-        expiry,
+    let Some(guard) = active_push.begin(client.cancel_token()) else {
+        // Teardown already closed pushes; leave the rest to teardown.
+        return Ok(PushOutcome::ReachedMaxTtl);
+    };
+    let sql = format!("ALTER ROLE {} VALID UNTIL {valid_until}", quote_ident(user));
+    // Run in its own task so dropping push_expiry (on abort/timeout) doesn't drop the client
+    // before ActivePush::close_and_cancel cancels the server-side statement and observes completion.
+    let result = tokio::spawn(async move {
+        let _guard = guard;
+        client.batch_execute(&sql).await
     })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(PushOutcome::Pushed {
+            database_now,
+            expiry,
+        }),
+        Ok(Err(err)) => {
+            if err
+                .as_db_error()
+                .is_some_and(|db| *db.code() == SqlState::UNDEFINED_OBJECT)
+            {
+                return Ok(PushOutcome::AlreadyGone);
+            }
+            Err(sql_failed(err))
+        }
+        Err(_) => Err(push_failed(
+            "the expiry push task stopped unexpectedly".to_owned(),
+        )),
+    }
 }
 
 /// Refuses versions and admin settings under which dbvalet can't drop the login it creates.
@@ -341,6 +491,7 @@ pub(super) async fn drop_login(
     alias: &DatabaseAlias,
     admin: &AdminLogin,
     user: &str,
+    role_oid: Option<u32>,
     member_of: &str,
     read_only: bool,
 ) -> Result<(), SourceError> {
@@ -349,7 +500,9 @@ pub(super) async fn drop_login(
         reason,
     };
     let client = connect(alias, admin).await.map_err(drop_failed)?;
-    end_sessions(&client, user).await.map_err(drop_failed)?;
+    end_sessions(&client, user, role_oid)
+        .await
+        .map_err(drop_failed)?;
     let reassign_to = (!read_only).then_some(member_of);
     execute_drop(&client, user, reassign_to)
         .await
@@ -382,7 +535,8 @@ async fn drop_leftover_login(
 ) -> Result<bool, String> {
     let Some(role) = client
         .query_opt(
-            "SELECT COALESCE('default_transaction_read_only=on' = ANY (r.rolconfig), false),
+            "SELECT r.oid,
+                    COALESCE('default_transaction_read_only=on' = ANY (r.rolconfig), false),
                     ARRAY(SELECT DISTINCT g.rolname::text
                           FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                           WHERE m.member = r.oid)
@@ -395,9 +549,10 @@ async fn drop_leftover_login(
     else {
         return Ok(false);
     };
+    let role_oid: u32 = role.get(0);
     // The login can change its own settings in either direction, but not the ledger.
-    let read_only = ledger_read_only.unwrap_or_else(|| role.get(0));
-    let groups: Vec<String> = role.get(1);
+    let read_only = ledger_read_only.unwrap_or_else(|| role.get(1));
+    let groups: Vec<String> = role.get(2);
     let reassign_to = match (read_only, groups.as_slice()) {
         (true, _) => None,
         (false, [group]) => Some(group.as_str()),
@@ -412,7 +567,7 @@ async fn drop_leftover_login(
             ));
         }
     };
-    end_sessions(client, user).await?;
+    end_sessions(client, user, Some(role_oid)).await?;
     execute_drop(client, user, reassign_to).await
 }
 
@@ -444,21 +599,25 @@ async fn execute_drop(
     }
 }
 
-async fn end_sessions(client: &Client, user: &str) -> Result<(), String> {
+async fn end_sessions(client: &Client, user: &str, role_oid: Option<u32>) -> Result<(), String> {
     let mut remaining: i64 = 0;
     for _ in 0..SESSION_END_PASSES {
         client
             .query(
-                "SELECT pg_terminate_backend(pid, $2) FROM pg_stat_activity WHERE usename = $1",
-                &[&user, &SESSION_END_TIMEOUT_MS],
+                "SELECT pg_terminate_backend(pid, $3)
+                 FROM pg_stat_activity
+                 WHERE usename = $1 OR ($2::oid IS NOT NULL AND usesysid = $2)",
+                &[&user, &role_oid, &SESSION_END_TIMEOUT_MS],
             )
             .await
             .map_err(|err| describe_sql_error(&err))?;
         // pg_terminate_backend returns false rather than failing, so count what is left.
         remaining = client
             .query_one(
-                "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
-                &[&user],
+                "SELECT count(*)
+                 FROM pg_stat_activity
+                 WHERE usename = $1 OR ($2::oid IS NOT NULL AND usesysid = $2)",
+                &[&user, &role_oid],
             )
             .await
             .map_err(|err| describe_sql_error(&err))?

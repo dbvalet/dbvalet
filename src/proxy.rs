@@ -2,11 +2,14 @@
 //! token; it then gets its own upstream connection as the temporary login, and the proxy
 //! copies bytes both ways without reading them.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
@@ -37,6 +40,11 @@ const AUTHENTICATION_OK: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
 const AUTHENTICATION_CLEARTEXT_PASSWORD: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 const PASSWORD_MESSAGE_TAG: u8 = b'p';
 const ERROR_RESPONSE_TAG: u8 = b'E';
+const BACKEND_KEY_DATA_TAG: u8 = b'K';
+const BACKEND_KEY_DATA_LEN: usize = 13;
+const READY_FOR_QUERY_TAG: u8 = b'Z';
+/// Upper bound on sending PostgreSQL CancelRequests when stopping the proxy.
+const BACKEND_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 const INVALID_PASSWORD_SQLSTATE: &str = "28P01";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
@@ -59,12 +67,37 @@ pub enum ProxyError {
     Listen(#[source] io::Error),
 }
 
+/// A PostgreSQL backend's process id and cancel key, read from its `BackendKeyData` message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackendKey {
+    process_id: i32,
+    secret_key: i32,
+}
+
 /// What every client connection is checked against and relayed as.
 struct Access {
     token: SecretString,
     endpoint: Endpoint,
     login: UpstreamLogin,
     deadline: AccessDeadline,
+    next_connection_id: AtomicU64,
+    active_backends: Mutex<BTreeMap<u64, BackendKey>>,
+}
+
+/// Removes a connection's backend key when its relay task ends cleanly before proxy shutdown.
+struct RegisteredBackend<'a> {
+    access: &'a Access,
+    id: u64,
+}
+
+impl Drop for RegisteredBackend<'_> {
+    fn drop(&mut self) {
+        self.access
+            .active_backends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 /// Listens on a random port of 127.0.0.1 until [`Proxy::stop`].
@@ -86,6 +119,8 @@ pub async fn start(
         endpoint,
         login,
         deadline,
+        next_connection_id: AtomicU64::new(1),
+        active_backends: Mutex::new(BTreeMap::new()),
     });
     let (stop, stopped) = oneshot::channel();
     let accept_loop = tokio::spawn(accept(listener, access, stopped));
@@ -101,7 +136,8 @@ impl Proxy {
         self.port
     }
 
-    /// Closes the listener and every client and upstream connection before it returns.
+    /// Closes the listener and every client and upstream connection before it returns,
+    /// then sends PostgreSQL cancel requests for any backends that were still open.
     pub async fn stop(self) {
         // The loop ends on either a message or a dropped sender, so a failed send is fine.
         let _ = self.stop.send(());
@@ -125,7 +161,42 @@ async fn accept(listener: TcpListener, access: Arc<Access>, mut stopped: oneshot
             Some(_) = connections.join_next() => {}
         }
     }
+    // Snapshot open backends before aborting relay tasks, whose Drop guards clear the map.
+    let active: Vec<BackendKey> = access
+        .active_backends
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .copied()
+        .collect();
     connections.shutdown().await;
+    cancel_backends(&access.endpoint, &active).await;
+}
+
+/// Sends PostgreSQL cancel requests so active backends exit once their upstream socket closes,
+/// even when the temporary login has already been dropped and `pg_stat_activity.usename` is NULL.
+async fn cancel_backends(endpoint: &Endpoint, keys: &[BackendKey]) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut cancels = JoinSet::new();
+    for &key in keys {
+        let host = endpoint.host().to_owned();
+        let port = endpoint.port();
+        cancels.spawn(async move {
+            let Ok(mut stream) = TcpStream::connect((host.as_str(), port)).await else {
+                return;
+            };
+            let mut packet = BytesMut::with_capacity(16);
+            frontend::cancel_request(key.process_id, key.secret_key, &mut packet);
+            let _ = stream.write_all(&packet).await;
+        });
+    }
+    let _ = tokio::time::timeout(BACKEND_CANCEL_TIMEOUT, async {
+        while cancels.join_next().await.is_some() {}
+    })
+    .await;
+    cancels.shutdown().await;
 }
 
 async fn serve(mut client: TcpStream, access: Arc<Access>) {
@@ -148,24 +219,38 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
         .await;
     }
     if access.deadline.has_passed() {
-        return Ok(());
+        return refuse(
+            client,
+            CONNECTION_FAILURE_SQLSTATE,
+            "this run reached its max_ttl",
+        )
+        .await;
     }
-    let (mut server, unread) = match connect_upstream(access, &parameters).await {
+    let (mut server, unread, backend_key) = match connect_upstream(access, &parameters).await {
         Ok(connected) => connected,
         Err(UpstreamRefusal::ErrorResponse(error)) => return client.write_all(&error).await,
         Err(UpstreamRefusal::Failed(reason)) => {
             return refuse(client, CONNECTION_FAILURE_SQLSTATE, &reason).await;
         }
     };
+    let _registered = backend_key.map(|key| {
+        let id = access.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        access
+            .active_backends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, key);
+        RegisteredBackend { access, id }
+    });
     client.write_all(&AUTHENTICATION_OK).await?;
     client.write_all(&unread).await?;
     let mut client = LeaseStream {
         socket: client,
-        deadline: access.deadline,
+        deadline: access.deadline.clone(),
     };
     let mut server = LeaseStream {
         socket: &mut server,
-        deadline: access.deadline,
+        deadline: access.deadline.clone(),
     };
     tokio::io::copy_bidirectional(&mut client, &mut server).await?;
     Ok(())
@@ -310,11 +395,12 @@ enum UpstreamRefusal {
 }
 
 /// Starts an upstream session as the temporary login with the client's parameters, except
-/// `user` and `database`. Returns it after `AuthenticationOk`, with the bytes read past it.
+/// `user` and `database`. Returns it after `ReadyForQuery` (or post-auth `ErrorResponse`),
+/// with the exact startup bytes to forward and the backend's `BackendKeyData` when sent.
 async fn connect_upstream(
     access: &Access,
     client_parameters: &[(String, String)],
-) -> Result<(TcpStream, BytesMut), UpstreamRefusal> {
+) -> Result<(TcpStream, BytesMut, Option<BackendKey>), UpstreamRefusal> {
     let endpoint = &access.endpoint;
     let login = &access.login;
     let mut server = TcpStream::connect((endpoint.host(), endpoint.port()))
@@ -359,7 +445,8 @@ async fn connect_upstream(
                 server_verified = true;
             }
             backend::Message::AuthenticationOk if scram.is_none() || server_verified => {
-                return Ok((server, unread));
+                let (forwarded, backend_key) = read_startup_tail(&mut server, &mut unread).await?;
+                return Ok((server, forwarded, backend_key));
             }
             backend::Message::AuthenticationSasl(_) | backend::Message::AuthenticationOk => {
                 return Err(out_of_order());
@@ -371,6 +458,53 @@ async fn connect_upstream(
             }
         }
         server.write_all(&out).await.map_err(failed)?;
+    }
+}
+
+/// Reads backend startup messages from `AuthenticationOk` through `ReadyForQuery` (or
+/// `ErrorResponse`), keeping the raw bytes intact while extracting `BackendKeyData`.
+async fn read_startup_tail(
+    server: &mut TcpStream,
+    unread: &mut BytesMut,
+) -> Result<(BytesMut, Option<BackendKey>), UpstreamRefusal> {
+    let mut forwarded = BytesMut::new();
+    let mut backend_key = None;
+    loop {
+        while let Some(header) = backend::Header::parse(unread).map_err(failed)? {
+            if header.len() < 4 {
+                return Err(UpstreamRefusal::Failed(
+                    "the database sent a malformed message during login".to_owned(),
+                ));
+            }
+            let frame_len = 1 + header.len() as usize;
+            if frame_len > MAX_UPSTREAM_LOGIN_MESSAGE_LEN {
+                return Err(UpstreamRefusal::Failed(
+                    "the database sent an oversized message during login".to_owned(),
+                ));
+            }
+            if unread.len() < frame_len {
+                break;
+            }
+            let frame = unread.split_to(frame_len);
+            if header.tag() == BACKEND_KEY_DATA_TAG && frame.len() == BACKEND_KEY_DATA_LEN {
+                backend_key = Some(BackendKey {
+                    process_id: i32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]),
+                    secret_key: i32::from_be_bytes([frame[9], frame[10], frame[11], frame[12]]),
+                });
+            }
+            let done = header.tag() == READY_FOR_QUERY_TAG || header.tag() == ERROR_RESPONSE_TAG;
+            forwarded.extend_from_slice(&frame);
+            if done {
+                forwarded.extend_from_slice(unread);
+                unread.clear();
+                return Ok((forwarded, backend_key));
+            }
+        }
+        if server.read_buf(unread).await.map_err(failed)? == 0 {
+            return Err(UpstreamRefusal::Failed(
+                "the database closed the connection during login".to_owned(),
+            ));
+        }
     }
 }
 
@@ -435,6 +569,48 @@ mod tests {
         assert_eq!(
             peer.try_read(&mut [0; 4]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_tail_extracts_backend_key_data_and_preserves_every_byte() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut expected = Vec::new();
+        // ParameterStatus: "server_version\017\0" (len = 4 + 18 = 22)
+        expected.push(b'S');
+        expected.extend_from_slice(&22i32.to_be_bytes());
+        expected.extend_from_slice(b"server_version\x0017\0");
+        // BackendKeyData: pid = 4242, secret = 0x11223344
+        expected.push(b'K');
+        expected.extend_from_slice(&12i32.to_be_bytes());
+        expected.extend_from_slice(&4242i32.to_be_bytes());
+        expected.extend_from_slice(&0x1122_3344i32.to_be_bytes());
+        // ReadyForQuery: 'I'
+        expected.push(b'Z');
+        expected.extend_from_slice(&5i32.to_be_bytes());
+        expected.push(b'I');
+
+        let server_bytes = expected.clone();
+        let peer_task = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_all(&server_bytes).await.unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut unread = BytesMut::new();
+        let (forwarded, key) = read_startup_tail(&mut client, &mut unread)
+            .await
+            .ok()
+            .unwrap();
+        peer_task.await.unwrap();
+
+        assert_eq!(forwarded.as_ref(), expected.as_slice());
+        assert_eq!(
+            key,
+            Some(BackendKey {
+                process_id: 4242,
+                secret_key: 0x1122_3344,
+            })
         );
     }
 
