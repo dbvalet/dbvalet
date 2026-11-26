@@ -33,7 +33,8 @@ pub enum RunError {
     Random(#[source] getrandom::Error),
 }
 
-/// Runs `command` against a new temporary login through the proxy, then drops the login.
+/// Sweeps what earlier runs left, runs `command` against a new temporary login through the
+/// proxy, then drops the login.
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
@@ -42,6 +43,9 @@ pub async fn run<S: CredentialSource>(
     command: &[OsString],
 ) -> Result<ExitStatus, RunError> {
     assert!(!command.is_empty(), "run needs a command");
+    for err in source.sweep().await?.failures {
+        let _ = writeln!(io::stderr(), "dbvalet: {err}");
+    }
     let lease = source.mint(grant).await?;
     let finished = run_child(lease.login(), upstream, command).await;
     if let Err(err) = lease.release().await {

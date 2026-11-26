@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod endpoint;
 pub mod keychain;
+pub mod ledger;
 pub mod policy;
 pub mod proxy;
 pub mod run;

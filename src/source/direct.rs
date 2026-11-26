@@ -10,23 +10,38 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, NoTls};
 
-use super::{CredentialSource, Lease, SourceError, UpstreamLogin};
+use super::{CredentialSource, Lease, SourceError, SweepReport, UpstreamLogin};
 use crate::config::RoleGrant;
 use crate::endpoint::Tls;
 use crate::keychain::{self, AdminLogin};
+use crate::ledger;
 use crate::{DatabaseAlias, random_base32};
 
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MINIMUM_SERVER_VERSION_NUM: i32 = 140000;
 /// From this version a CREATEROLE admin can inherit the roles it creates.
 const CREATEROLE_SELF_GRANT_VERSION_NUM: i32 = 160000;
-/// 80 random bits, written as the 16 base32 characters after `dbvalet_`.
+const LOGIN_PREFIX: &str = "dbvalet_";
+/// 80 random bits, written as the 16 base32 characters after [`LOGIN_PREFIX`].
 const RUN_ID_BYTES: usize = 10;
+const RUN_ID_CHARS: usize = RUN_ID_BYTES * 8 / 5;
 const LOGIN_PASSWORD_BYTES: usize = 20;
 /// How far ahead of the database's clock a new login's `VALID UNTIL` is set.
 const LEASE_AHEAD: &str = "15 minutes";
 /// How long `pg_terminate_backend` waits for each of the login's sessions to end.
 const SESSION_END_TIMEOUT_MS: i64 = 5_000;
+/// A second pass catches a session that was still starting, so not yet listed, during the first.
+const SESSION_END_PASSES: usize = 2;
+/// Leftover logins a sweep may drop without a ledger entry. Group roles fail `rolcanlogin`,
+/// and live runs anywhere keep their `VALID UNTIL` in the future.
+const EXPIRED_LOGINS: &str = "
+    SELECT rolname::text
+    FROM pg_roles
+    WHERE rolcanlogin
+      AND rolname ~ '^dbvalet_[a-z2-7]{16}$'
+      AND rolvaliduntil < now()
+      -- Another admin's logins are left to that admin's own sweep.
+      AND pg_has_role(current_user, oid, 'USAGE')";
 
 /// Temporary logins created over admin SQL, with a fresh admin connection per operation.
 #[derive(Debug)]
@@ -45,6 +60,59 @@ impl DirectSource {
 }
 
 impl CredentialSource for DirectSource {
+    async fn sweep(&self) -> Result<SweepReport, SourceError> {
+        let orphans = ledger::orphans(&self.alias)?;
+        let client =
+            connect(&self.alias, &self.admin)
+                .await
+                .map_err(|reason| SourceError::Connect {
+                    alias: self.alias.clone(),
+                    reason,
+                })?;
+        let mut report = SweepReport::default();
+        for entry in orphans {
+            // Only names dbvalet makes: anything else in the ledger is left alone.
+            if !is_login_name(entry.login()) {
+                continue;
+            }
+            let login = entry.login().to_owned();
+            match drop_leftover_login(&client, &login, entry.read_only()).await {
+                Ok(existed) => match entry.remove() {
+                    Ok(()) if existed => report.dropped.push(login),
+                    Ok(()) => report.already_gone.push(login),
+                    Err(err) => report.failures.push(err.into()),
+                },
+                Err(reason) => report
+                    .failures
+                    .push(SourceError::DropLeftoverLogin { login, reason }),
+            }
+        }
+
+        let expired = match client.query(EXPIRED_LOGINS, &[]).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                report.failures.push(SourceError::ListExpiredLogins {
+                    reason: describe_sql_error(&err),
+                });
+                return Ok(report);
+            }
+        };
+        for row in expired {
+            let login: String = row.get(0);
+            if !is_login_name(&login) {
+                continue;
+            }
+            match drop_leftover_login(&client, &login, false).await {
+                Ok(true) => report.dropped.push(login),
+                Ok(false) => {}
+                Err(reason) => report
+                    .failures
+                    .push(SourceError::DropLeftoverLogin { login, reason }),
+            }
+        }
+        Ok(report)
+    }
+
     async fn mint(&self, grant: &RoleGrant) -> Result<Lease, SourceError> {
         let create_failed = |err: tokio_postgres::Error| SourceError::CreateLogin {
             reason: describe_sql_error(&err),
@@ -106,6 +174,8 @@ impl CredentialSource for DirectSource {
         } else {
             ("", format!("ROLE {}", quote_ident(self.admin.user())))
         };
+        // Written before the login exists, so a run killed from here on leaves it to the sweep.
+        let ledger_entry = ledger::create(&self.alias, &user, grant.read_only)?;
         let read_only = if grant.read_only {
             format!("ALTER ROLE {user} SET default_transaction_read_only = on;")
         } else {
@@ -131,6 +201,7 @@ impl CredentialSource for DirectSource {
             admin: Arc::clone(&self.admin),
             member_of: grant.member_of.clone(),
             read_only: grant.read_only,
+            ledger_entry,
         })
     }
 }
@@ -160,12 +231,22 @@ fn check_mint_prerequisites(
     Ok(())
 }
 
-/// `dbvalet_` and 16 lowercase base32 characters, safe unquoted in SQL.
+/// [`LOGIN_PREFIX`] and 16 lowercase base32 characters, safe unquoted in SQL.
 fn new_login_name() -> Result<String, getrandom::Error> {
     Ok(format!(
-        "dbvalet_{}",
+        "{LOGIN_PREFIX}{}",
         random_base32(RUN_ID_BYTES)?.expose_secret()
     ))
+}
+
+/// Whether [`new_login_name`] could have made `name`: `^dbvalet_[a-z2-7]{16}$`.
+fn is_login_name(name: &str) -> bool {
+    name.strip_prefix(LOGIN_PREFIX).is_some_and(|run_id| {
+        run_id.len() == RUN_ID_CHARS
+            && run_id
+                .bytes()
+                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+    })
 }
 
 /// Ends the login's sessions, clears or reassigns what it owns, and drops it.
@@ -181,49 +262,118 @@ pub(super) async fn drop_login(
         reason,
     };
     let client = connect(alias, admin).await.map_err(drop_failed)?;
+    end_sessions(&client, user).await.map_err(drop_failed)?;
+    let reassign_to = (!read_only).then_some(member_of);
     client
-        .query(
-            "SELECT pg_terminate_backend(pid, $2) FROM pg_stat_activity WHERE usename = $1",
-            &[&user, &SESSION_END_TIMEOUT_MS],
-        )
-        .await
-        .map_err(|err| drop_failed(describe_sql_error(&err)))?;
-    // pg_terminate_backend returns false rather than failing, so count what is left.
-    let remaining: i64 = client
-        .query_one(
-            "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
-            &[&user],
-        )
-        .await
-        .map_err(|err| drop_failed(describe_sql_error(&err)))?
-        .get(0);
-    if remaining > 0 {
-        return Err(drop_failed(format!(
-            "{remaining} of its sessions didn't end within {SESSION_END_TIMEOUT_MS} ms"
-        )));
-    }
-    client
-        .batch_execute(&drop_login_sql(user, member_of, read_only))
+        .batch_execute(&drop_login_sql(user, reassign_to))
         .await
         .map_err(|err| drop_failed(describe_sql_error(&err)))
 }
 
-fn drop_login_sql(user: &str, member_of: &str, read_only: bool) -> String {
+/// Drops a login an ended run left behind, reading from the database what its lease knew.
+/// Returns whether the login still existed.
+async fn drop_leftover_login(
+    client: &Client,
+    user: &str,
+    ledger_read_only: bool,
+) -> Result<bool, String> {
+    let Some(role) = client
+        .query_opt(
+            "SELECT COALESCE('default_transaction_read_only=on' = ANY (r.rolconfig), false),
+                    ARRAY(SELECT DISTINCT g.rolname::text
+                          FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
+                          WHERE m.member = r.oid)
+             FROM pg_roles r
+             WHERE r.rolname = $1 AND r.rolcanlogin",
+            &[&user],
+        )
+        .await
+        .map_err(|err| describe_sql_error(&err))?
+    else {
+        return Ok(false);
+    };
+    // The login can reset its own settings but not the ledger, so either one marking it counts.
+    let read_only = ledger_read_only || role.get::<_, bool>(0);
+    let groups: Vec<String> = role.get(1);
+    let reassign_to = match (read_only, groups.as_slice()) {
+        (true, _) => None,
+        (false, [group]) => Some(group.as_str()),
+        (false, _) => {
+            return Err(format!(
+                "it belongs to {} group roles, so dbvalet can't tell which one should own \
+                 what it created",
+                groups.len()
+            ));
+        }
+    };
+    end_sessions(client, user).await?;
+    let Err(err) = client
+        .batch_execute(&drop_login_sql(user, reassign_to))
+        .await
+    else {
+        return Ok(true);
+    };
+    // Another sweep dropping the same login at the same moment is as good as this one.
+    let still_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT FROM pg_roles WHERE rolname = $1)",
+            &[&user],
+        )
+        .await
+        .map_err(|err| describe_sql_error(&err))?
+        .get(0);
+    if still_exists {
+        Err(describe_sql_error(&err))
+    } else {
+        Ok(false)
+    }
+}
+
+async fn end_sessions(client: &Client, user: &str) -> Result<(), String> {
+    let mut remaining: i64 = 0;
+    for _ in 0..SESSION_END_PASSES {
+        client
+            .query(
+                "SELECT pg_terminate_backend(pid, $2) FROM pg_stat_activity WHERE usename = $1",
+                &[&user, &SESSION_END_TIMEOUT_MS],
+            )
+            .await
+            .map_err(|err| describe_sql_error(&err))?;
+        // pg_terminate_backend returns false rather than failing, so count what is left.
+        remaining = client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE usename = $1",
+                &[&user],
+            )
+            .await
+            .map_err(|err| describe_sql_error(&err))?
+            .get(0);
+        if remaining == 0 {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "{remaining} of its sessions were still open after {SESSION_END_PASSES} rounds of \
+         pg_terminate_backend"
+    ))
+}
+
+/// Without a group to reassign to, as for a read-only login, everything the login owns is
+/// dropped, including anything created despite read-only defaults (such as large objects
+/// before PostgreSQL 16).
+fn drop_login_sql(user: &str, reassign_to: Option<&str>) -> String {
     let login = quote_ident(user);
-    if read_only {
-        // Read-only runs never transfer objects to the group role, so anything created
-        // despite read-only defaults (such as large objects before PostgreSQL 16) is dropped.
-        format!(
+    match reassign_to {
+        None => format!(
             "DROP OWNED BY {login};
              DROP ROLE {login};"
-        )
-    } else {
-        let group = quote_ident(member_of);
-        format!(
+        ),
+        Some(group) => format!(
             "REASSIGN OWNED BY {login} TO {group};
              DROP OWNED BY {login};
-             DROP ROLE {login};"
-        )
+             DROP ROLE {login};",
+            group = quote_ident(group)
+        ),
     }
 }
 
@@ -561,6 +711,24 @@ mod tests {
     }
 
     #[test]
+    fn the_login_name_pattern_accepts_a_new_login_name() {
+        assert!(is_login_name(&new_login_name().unwrap()));
+        assert!(is_login_name("dbvalet_abcdefghijklmnop"));
+        assert!(is_login_name("dbvalet_234567234567zzzz"));
+    }
+
+    #[test]
+    fn the_login_name_pattern_rejects_dbvalet_reader_and_near_misses() {
+        assert!(!is_login_name("dbvalet_reader"));
+        assert!(!is_login_name("dbvalet_abcdefghijklmno"));
+        assert!(!is_login_name("dbvalet_abcdefghijklmnopq"));
+        assert!(!is_login_name("dbvalet_ABCDEFGHIJKLMNOP"));
+        assert!(!is_login_name("dbvalet_abcdefghijklmno1"));
+        assert!(!is_login_name("dbvalet_abcdefghijklmno\u{e9}"));
+        assert!(!is_login_name("xdbvalet_abcdefghijklmnop"));
+    }
+
+    #[test]
     fn postgresql_13_fails_the_version_check_and_names_14() {
         let check = version_check(&Rights {
             superuser: true,
@@ -811,7 +979,7 @@ mod tests {
 
     #[test]
     fn dropping_a_read_only_login_skips_reassign_owned() {
-        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_reader", true);
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", None);
         assert!(!sql.contains("REASSIGN OWNED"), "{sql}");
         assert!(
             sql.contains("DROP OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\";"),
@@ -825,7 +993,7 @@ mod tests {
 
     #[test]
     fn dropping_a_writable_login_reassigns_owned_objects_to_its_group() {
-        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", "dbvalet_writer", false);
+        let sql = drop_login_sql("dbvalet_aaaaaaaaaaaaaaaa", Some("dbvalet_writer"));
         assert!(
             sql.contains("REASSIGN OWNED BY \"dbvalet_aaaaaaaaaaaaaaaa\" TO \"dbvalet_writer\";"),
             "{sql}"
