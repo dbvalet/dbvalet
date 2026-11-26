@@ -1,15 +1,17 @@
 //! Signal handling and parent-death wiring for a run's child process.
 //!
 //! dbvalet and its child share the terminal's process group:
-//! - On the first `SIGINT`, dbvalet prints a short hint on stderr and keeps waiting for
-//!   the child (which received `SIGINT` too). A second `SIGINT` (from the process group
-//!   or sent to dbvalet's PID alone) forwards `SIGTERM` to the child and starts the same
-//!   [`SIGNAL_WAIT_TIMEOUT`] deadline as `SIGTERM` (exiting with the child's code, or
-//!   `130` on timeout).
-//! - On `SIGTERM` or `SIGHUP`, dbvalet forwards the signal to the child, waits up to
-//!   [`SIGNAL_WAIT_TIMEOUT`], and lets teardown proceed whether or not the child exited
-//!   (exiting with the child's code, or `143` / `129` on timeout). Earlier deadlines are
-//!   never extended by subsequent signals.
+//! - Two Ctrl-C presses (`SIGINT`) end the run: the first prints a short hint on stderr
+//!   and waits for the child (which in a terminal process group received `SIGINT` too), and
+//!   the second forwards `SIGTERM` to the child and starts the [`SIGNAL_WAIT_TIMEOUT`]
+//!   deadline, tearing down when the child exits or after 5 seconds if it hasn't (returning
+//!   the child's code, or `130` on timeout). `SIGINT`s sent in quick succession may be
+//!   coalesced by tokio and count as one; supervisors and scripts should send `SIGTERM`,
+//!   which ends the run within [`SIGNAL_WAIT_TIMEOUT`].
+//! - On `SIGTERM` or `SIGHUP`, dbvalet forwards the signal to the child and tears down
+//!   when it exits, or after [`SIGNAL_WAIT_TIMEOUT`] if it hasn't (returning the child's
+//!   code, or `143` / `129` on timeout). Earlier deadlines are never extended by
+//!   subsequent signals.
 //! - On Linux, the child receives `PR_SET_PDEATHSIG(SIGTERM)` via an internal self-exec
 //!   shim so it exits if dbvalet is killed with `SIGKILL`. macOS has no equivalent kernel
 //!   mechanism; an orphaned child there keeps running without database access once the
@@ -33,8 +35,8 @@ use tokio::process::Child;
 use tokio::signal::unix::{self, SignalKind};
 use tokio::time::Sleep;
 
-/// How long dbvalet waits for the child to exit after forwarding `SIGTERM` or `SIGHUP`
-/// before tearing down the proxy and dropping the temporary login anyway.
+/// How long dbvalet waits for the child to exit after a second `SIGINT`, `SIGTERM` or
+/// `SIGHUP` before tearing down the proxy and dropping the temporary login anyway.
 pub const SIGNAL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(any(target_os = "linux", test))]
@@ -81,7 +83,8 @@ pub enum WaitOutcome {
     Exited(ExitStatus),
     /// A signal arrived before the child was spawned.
     SignalledBeforeSpawn(i32),
-    /// dbvalet forwarded the signal and the child didn't exit within the grace period.
+    /// dbvalet forwarded a stop signal (`SIGTERM` or `SIGHUP`) and the child didn't exit
+    /// within the grace period.
     TimedOut(TerminationSignal),
 }
 

@@ -2720,10 +2720,14 @@ fn two_ctrl_cs_while_psql_runs_a_long_query_end_the_run_and_drop_the_login() {
     let elapsed = after_second.elapsed();
     let stderr_text = stderr_handle.join().unwrap();
 
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "elapsed={elapsed:?} stderr: {stderr_text}"
+    );
     assert!(
-        matches!(status.code(), Some(143 | 130)),
-        "exit={:?} elapsed={elapsed:?} stderr: {stderr_text}",
-        status.code()
+        elapsed < Duration::from_secs(3),
+        "expected forwarded SIGTERM to end psql before the 5 s timeout, took {elapsed:?}"
     );
     assert!(
         !stderr_text.contains("couldn't drop"),
@@ -2775,14 +2779,20 @@ fn two_sigints_to_dbvalet_pid_alone_end_the_run_and_drop_the_login() {
         Duration::from_secs(5),
     );
 
+    let after_second = Instant::now();
     signal::kill(pid_of(&run), Signal::SIGINT).unwrap();
     let status = wait_for_exit(&mut run, Duration::from_secs(8));
+    let elapsed = after_second.elapsed();
     let stderr_text = stderr_handle.join().unwrap();
 
+    assert_eq!(
+        status.code(),
+        Some(143),
+        "elapsed={elapsed:?} stderr: {stderr_text}"
+    );
     assert!(
-        matches!(status.code(), Some(143 | 130)),
-        "exit={:?} stderr: {stderr_text}",
-        status.code()
+        elapsed < Duration::from_secs(3),
+        "expected forwarded SIGTERM to end the child before the 5 s timeout, took {elapsed:?}"
     );
     assert!(
         !stderr_text.contains("couldn't drop"),
@@ -2807,7 +2817,7 @@ fn two_sigints_to_dbvalet_pid_alone_end_the_run_and_drop_the_login() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn sigterm_interrupts_login_setup_before_role_creation() {
+fn sigterm_during_login_setup_exits_143_without_starting_the_child_or_writing_a_ledger_entry() {
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
