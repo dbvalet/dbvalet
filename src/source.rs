@@ -109,7 +109,7 @@ impl Lease {
     pub fn run_id(&self) -> &str {
         self.login
             .user()
-            .strip_prefix("dbvalet_")
+            .strip_prefix(crate::LOGIN_PREFIX)
             .unwrap_or(self.login.user())
     }
 

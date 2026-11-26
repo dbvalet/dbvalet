@@ -61,7 +61,9 @@ enum Command {
     },
     /// List recent runs (newest first), or print one run's log.
     ///
-    /// Passwords in SQL statements (such as `ALTER ROLE ... PASSWORD`) are shown as `'[REDACTED]'`.
+    /// The run token and temporary login password are always scrubbed. SQL password redaction
+    /// (such as `ALTER ROLE ... PASSWORD '[REDACTED]'`) is lexical and best-effort; use
+    /// `dbvalet run --no-sql-log` when query text must stay off disk.
     Log {
         /// The run ID to print. Omit to list recent runs.
         run_id: Option<String>,
@@ -162,10 +164,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Log {
             run_id: Some(run_id),
         } => {
-            let content = runlog::read(&run_id)?;
             let mut stdout = io::stdout().lock();
-            write_stdout(&mut stdout, content.as_bytes())?;
-            Ok(ExitCode::SUCCESS)
+            match runlog::copy_to(&run_id, &mut stdout) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(RunLogError::WriteOutput(err)) if err.kind() == io::ErrorKind::BrokenPipe => {
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(err) => Err(err.into()),
+            }
         }
         Command::Gc { allow_plaintext } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;

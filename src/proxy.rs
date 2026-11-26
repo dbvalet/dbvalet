@@ -18,7 +18,7 @@ use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::{Endpoint, Tls};
-use crate::runlog::{RunLog, StatementKind};
+use crate::runlog::{MAX_OBSERVED_QUERY_BYTES, RunLog, StatementKind};
 use crate::source::UpstreamLogin;
 
 /// PostgreSQL refuses longer startup packets too.
@@ -27,14 +27,10 @@ const MAX_PASSWORD_MESSAGE_LEN: usize = 1_000;
 /// Far above any authentication message, so a non-PostgreSQL peer can't make dbvalet
 /// reserve gigabytes.
 const MAX_UPSTREAM_LOGIN_MESSAGE_LEN: usize = 64 * 1024;
-/// Upper bound on bytes buffered per logged statement; larger queries are still relayed
-/// in full, with only the logged text truncated.
-const MAX_LOGGED_QUERY_BYTES: usize = 64 * 1024;
 const RELAY_BUFFER_BYTES: usize = 8 * 1024;
 const FRONTEND_HEADER_LEN: usize = 5;
 const SIMPLE_QUERY_TAG: u8 = b'Q';
 const PARSE_TAG: u8 = b'P';
-const TRUNCATED_MARKER: &str = " /* truncated */";
 /// SSL and GSS encryption requests are a length and a code, nothing more.
 const ENCRYPTION_REQUEST_LEN: usize = 8;
 const PROTOCOL_VERSION_3_0: u32 = 3 << 16;
@@ -190,9 +186,11 @@ async fn relay_with_log(
                 let _ = server_write.shutdown().await;
                 return Ok::<(), io::Error>(());
             }
-            // Write to the run log before forwarding so every statement is on disk
-            // before PostgreSQL can reply and let the child exit.
-            observer.observe(&buf[..n], |kind, sql| sql_log.statement(kind, sql));
+            // Synchronous local file write before forwarding is intentional: it guarantees
+            // every statement is on disk before PostgreSQL can reply and let the child exit.
+            observer.observe(&buf[..n], |kind, sql, truncated| {
+                sql_log.statement(kind, sql, truncated);
+            });
             server_write.write_all(&buf[..n]).await?;
         }
     };
@@ -247,7 +245,11 @@ impl FrameObserver {
         }
     }
 
-    fn observe(&mut self, mut input: &[u8], mut on_statement: impl FnMut(StatementKind, &str)) {
+    fn observe(
+        &mut self,
+        mut input: &[u8],
+        mut on_statement: impl FnMut(StatementKind, &str, bool),
+    ) {
         while !input.is_empty() {
             match &mut self.state {
                 FrameState::Header { buf, filled } => {
@@ -306,8 +308,8 @@ impl FrameObserver {
                     input = &input[take..];
                     *remaining -= take;
                     if *remaining == 0 {
-                        let sql = format_observed_query(buf, *truncated);
-                        on_statement(StatementKind::Query, &sql);
+                        let sql = String::from_utf8_lossy(buf);
+                        on_statement(StatementKind::Query, &sql, *truncated);
                         self.state = FrameState::Header {
                             buf: [0; FRONTEND_HEADER_LEN],
                             filled: 0,
@@ -353,8 +355,8 @@ impl FrameObserver {
                     let chunk = &input[..take];
                     if let Some(nul) = chunk.iter().position(|&b| b == 0) {
                         push_query_bytes(buf, truncated, &chunk[..nul]);
-                        let sql = format_observed_query(buf, *truncated);
-                        on_statement(StatementKind::Parse, &sql);
+                        let sql = String::from_utf8_lossy(buf);
+                        on_statement(StatementKind::Parse, &sql, *truncated);
                         let consumed = nul + 1;
                         input = &input[consumed..];
                         let left = *remaining - consumed;
@@ -371,8 +373,8 @@ impl FrameObserver {
                         input = &input[take..];
                         *remaining -= take;
                         if *remaining == 0 {
-                            let sql = format_observed_query(buf, *truncated);
-                            on_statement(StatementKind::Parse, &sql);
+                            let sql = String::from_utf8_lossy(buf);
+                            on_statement(StatementKind::Parse, &sql, *truncated);
                             self.state = FrameState::Header {
                                 buf: [0; FRONTEND_HEADER_LEN],
                                 filled: 0,
@@ -398,21 +400,13 @@ impl FrameObserver {
 }
 
 fn push_query_bytes(buf: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
-    let available = MAX_LOGGED_QUERY_BYTES.saturating_sub(buf.len());
+    let available = MAX_OBSERVED_QUERY_BYTES.saturating_sub(buf.len());
     if chunk.len() <= available {
         buf.extend_from_slice(chunk);
     } else {
         buf.extend_from_slice(&chunk[..available]);
         *truncated = true;
     }
-}
-
-fn format_observed_query(buf: &[u8], truncated: bool) -> String {
-    let mut text = String::from_utf8_lossy(buf).into_owned();
-    if truncated {
-        text.push_str(TRUNCATED_MARKER);
-    }
-    text
 }
 
 /// Answers each SSL or GSS encryption request with `N` until the startup message comes,
@@ -695,44 +689,78 @@ mod tests {
         let mut observer = FrameObserver::new();
         let mut seen = Vec::new();
         for chunk in wire.chunks(1) {
-            observer.observe(chunk, |kind, sql| seen.push((kind, sql.to_owned())));
+            observer.observe(chunk, |kind, sql, truncated| {
+                seen.push((kind, sql.to_owned(), truncated));
+            });
         }
 
         assert_eq!(
             seen,
             vec![
-                (crate::runlog::StatementKind::Query, "select 1".to_owned()),
+                (
+                    crate::runlog::StatementKind::Query,
+                    "select 1".to_owned(),
+                    false
+                ),
                 (
                     crate::runlog::StatementKind::Parse,
-                    "SELECT $1::int + 1".to_owned()
+                    "SELECT $1::int + 1".to_owned(),
+                    false
                 ),
-                (crate::runlog::StatementKind::Parse, "SELECT 2".to_owned()),
+                (
+                    crate::runlog::StatementKind::Parse,
+                    "SELECT 2".to_owned(),
+                    false
+                ),
             ]
         );
     }
 
     #[test]
-    fn frame_observer_truncates_oversized_queries_and_survives_malformed_lengths() {
-        let huge = format!("SELECT '{}'\0", "a".repeat(MAX_LOGGED_QUERY_BYTES + 100));
+    fn an_oversized_query_is_marked_truncated_and_later_queries_still_log() {
+        let huge = format!("SELECT '{}'\0", "a".repeat(MAX_OBSERVED_QUERY_BYTES + 100));
         let mut wire = frame(b'Q', huge.as_bytes());
         wire.extend(frame(b'Q', b"SELECT 'after-huge'\0"));
-        // Malformed frame with length 2 (< 4) followed by another Q frame.
-        wire.extend([b'Q', 0, 0, 0, 2]);
-        wire.extend(frame(b'Q', b"SELECT 'after-malformed'\0"));
 
         let mut observer = FrameObserver::new();
         let mut seen = Vec::new();
-        observer.observe(&wire, |kind, sql| seen.push((kind, sql.to_owned())));
+        observer.observe(&wire, |kind, sql, truncated| {
+            seen.push((kind, sql.to_owned(), truncated));
+        });
 
         assert_eq!(seen.len(), 2);
-        assert!(seen[0].1.len() <= MAX_LOGGED_QUERY_BYTES + 32);
-        assert!(seen[0].1.ends_with("/* truncated */"), "{}", seen[0].1);
+        assert_eq!(seen[0].1.len(), MAX_OBSERVED_QUERY_BYTES);
+        assert!(seen[0].2);
         assert_eq!(
             seen[1],
             (
                 crate::runlog::StatementKind::Query,
-                "SELECT 'after-huge'".to_owned()
+                "SELECT 'after-huge'".to_owned(),
+                false
             )
+        );
+    }
+
+    #[test]
+    fn a_frame_with_a_bad_length_stops_logging_for_that_connection() {
+        let mut wire = frame(b'Q', b"SELECT 'before-bad'\0");
+        // Malformed frame with length 2 (< 4) followed by another Q frame.
+        wire.extend([b'Q', 0, 0, 0, 2]);
+        wire.extend(frame(b'Q', b"SELECT 'after-bad'\0"));
+
+        let mut observer = FrameObserver::new();
+        let mut seen = Vec::new();
+        observer.observe(&wire, |kind, sql, truncated| {
+            seen.push((kind, sql.to_owned(), truncated));
+        });
+
+        assert_eq!(
+            seen,
+            vec![(
+                crate::runlog::StatementKind::Query,
+                "SELECT 'before-bad'".to_owned(),
+                false
+            )]
         );
     }
 }

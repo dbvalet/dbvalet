@@ -2341,38 +2341,117 @@ fn the_run_log_hides_the_token_login_password_and_sql_passwords() {
     assert!(!log.contains(&token), "{log}");
     assert!(!log.contains("pw-e2e-log-secrets-admin"), "{log}");
     assert_eq!(passwords_of(witness, &log), Vec::<String>::new());
+}
 
-    // Also verify a direct `psql -c "ALTER ROLE ... PASSWORD"` command redacts the header too.
-    let direct_state = isolated_state_home("e2e-log-secrets-direct");
-    let direct_run = Command::new(DBVALET)
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn the_run_log_header_redacts_sql_passwords_even_with_long_flags() {
+    let dir = project_with_reader("e2e-log-header-pw");
+    let state = isolated_state_home("e2e-log-header-pw");
+
+    let _sweeping = sweeping();
+    let run = Command::new(DBVALET)
         .current_dir(&dir)
-        .env("XDG_STATE_HOME", &direct_state)
+        .env("XDG_STATE_HOME", &state)
         .args([
             "run",
             "--allow-plaintext",
             "--",
             "psql",
-            "-c",
-            "ALTER ROLE e2e_log_target PASSWORD 'pw-cli-arg-2b7e'",
+            "--command=ALTER ROLE e2e_log_target PASSWORD 'pw-cli-arg-2b7e'",
         ])
         .output()
         .unwrap();
-    assert!(!direct_run.status.success());
-    let direct_list = dbvalet_log(&direct_state, &[]);
-    let direct_id = text(&direct_list.stdout)
+    drop(_sweeping);
+    assert!(!run.status.success());
+
+    let listed = text(&dbvalet_log(&state, &[]).stdout);
+    let run_id = listed
         .lines()
         .next()
         .unwrap()
         .split_whitespace()
         .nth(1)
-        .unwrap()
-        .to_owned();
-    let direct_log = text(&dbvalet_log(&direct_state, &[&direct_id]).stdout);
+        .unwrap();
+    let log = text(&dbvalet_log(&state, &[run_id]).stdout);
     assert!(
-        direct_log.contains(" [Q] ALTER ROLE e2e_log_target PASSWORD '[REDACTED]'\n"),
-        "{direct_log}"
+        log.contains(" [Q] ALTER ROLE e2e_log_target PASSWORD '[REDACTED]'\n"),
+        "{log}"
     );
-    assert!(!direct_log.contains("pw-cli-arg-2b7e"), "{direct_log}");
+    assert!(!log.contains("pw-cli-arg-2b7e"), "{log}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_failed_run_log_open_still_drops_the_temporary_login() {
+    superuser_sql(
+        "DROP ROLE IF EXISTS e2e_log_open_fail_group;
+         CREATE ROLE e2e_log_open_fail_group NOLOGIN;
+         DROP ROLE IF EXISTS e2e_log_open_fail_admin;
+         CREATE ROLE e2e_log_open_fail_admin LOGIN SUPERUSER PASSWORD 'pw-e2e-log-open-fail';",
+    );
+    let stored = login(
+        "e2e-log-open-fail",
+        "postgresql://e2e_log_open_fail_admin:pw-e2e-log-open-fail@localhost:5432/postgres",
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-log-open-fail");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-log-open-fail.roles]\n\
+         reader = { member_of = \"e2e_log_open_fail_group\", read_only = true }\n",
+    )
+    .unwrap();
+    // Leave dbvalet/ledger writable so mint() creates the login, then block dbvalet/runs
+    // with a regular file so opening the run log fails after mint().
+    let state = isolated_state_home("e2e-log-open-fail");
+    let app_state = state.join("dbvalet");
+    std::fs::create_dir_all(&app_state).unwrap();
+    std::fs::write(app_state.join("runs"), b"not a directory").unwrap();
+
+    let _sweeping = sweeping();
+    let output = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "sh",
+            "-c",
+            "echo child-ran",
+        ])
+        .output()
+        .unwrap();
+    drop(_sweeping);
+
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "stdout: {}", text(&output.stdout));
+    assert!(
+        output.stdout.is_empty(),
+        "child should not run, stdout: {}",
+        text(&output.stdout)
+    );
+    assert!(
+        stderr.contains("couldn't create the run log directory"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*)
+             FROM pg_roles r
+             JOIN pg_auth_members m ON m.member = r.oid
+             JOIN pg_roles g ON g.oid = m.roleid
+             WHERE g.rolname = $1 AND r.rolcanlogin AND r.rolname LIKE 'dbvalet\\_%' ESCAPE '\\'",
+            "e2e_log_open_fail_group"
+        ),
+        0
+    );
+    let ledger_entries: Vec<_> = std::fs::read_dir(app_state.join("ledger"))
+        .unwrap()
+        .collect();
+    assert!(ledger_entries.is_empty(), "ledger: {ledger_entries:?}");
 }
 
 #[test]

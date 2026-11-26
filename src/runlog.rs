@@ -1,23 +1,35 @@
 //! Local per-run plain-text log files under `$XDG_STATE_HOME/dbvalet/runs/` (or
 //! `~/.local/state/dbvalet/runs/`).
 //!
-//! ## How password-bearing SQL statements are shown
+//! ## How passwords and secrets are shown
 //!
-//! Before a statement (from a simple-query `Q` frame or an extended-protocol `P` parse frame)
-//! or a header `command` line is written to disk:
-//! - Any SQL string literal following `PASSWORD` (for example in `ALTER ROLE ... PASSWORD '...'`,
-//!   `CREATE ROLE ... WITH ENCRYPTED PASSWORD $$...$$`, `ALTER USER ... PASSWORD E'...'`,
-//!   or `CREATE USER MAPPING ... OPTIONS (password '...')`) is replaced with `'[REDACTED]'`.
-//!   Non-literal forms such as `ALTER ROLE ... PASSWORD NULL` and column references such as
-//!   `SELECT password FROM users` are left intact.
-//! - Any SQL string literal following `CONNECTION` (such as `CREATE SUBSCRIPTION ... CONNECTION '...'`)
-//!   is replaced with `'[REDACTED]'`.
-//! - Dollar-quoted SQL blocks (such as `DO $$ ... $$`) are redacted recursively so embedded
-//!   `ALTER ROLE ... PASSWORD` statements are also redacted.
-//! - Every occurrence of the run token or the temporary login's password is replaced with
-//!   `[REDACTED]`, even outside a `PASSWORD` clause.
+//! - **Runtime secrets (guaranteed):** Every occurrence of the per-run token and the temporary
+//!   login's password is scrubbed verbatim and replaced with `[REDACTED]` before truncation and
+//!   before writing to disk, in both the `command:` header and every statement line. Extended
+//!   protocol `B` (Bind) frames are never logged.
+//! - **SQL password redaction (lexical, best-effort):**
+//!   - Any SQL string literal following a keyword ending in `password` (`PASSWORD`, `sslpassword`,
+//!     etc.) or `CONNECTION` — including single-quoted, `E'...'`, `U&'...'`, `N'...'`, dollar-quoted
+//!     (`$$...$$`, `$tag$...$tag$`), backslash-escaped (`standard_conforming_strings = off`),
+//!     newline-continued, and unterminated literals — is replaced with `'[REDACTED]'`.
+//!     Non-literal forms (`ALTER ROLE ... PASSWORD NULL`) and column references
+//!     (`SELECT password FROM users`) are preserved.
+//!   - Dollar-quoted bodies (such as `DO $$ ... $$`) and embedded single-quoted SQL statements
+//!     (such as `EXECUTE 'ALTER ROLE ... PASSWORD ''...'''`) are redacted recursively. When a
+//!     string literal contains an `ALTER`/`CREATE` `PASSWORD` template (for example
+//!     `format('ALTER ROLE a PASSWORD %L', '...')` or `'ALTER ROLE a PASSWORD ' || quote_literal(...)`),
+//!     remaining string literals in that statement are replaced with `'[REDACTED]'`.
+//!   - Inside string literals, URI userinfo secrets (`scheme://user:SECRET@`) and libpq conninfo
+//!     `password=` / `*password=` values (such as in `dblink`) are replaced with `[REDACTED]`.
+//!   - Because SQL redaction is lexical, it cannot catch passwords constructed dynamically at
+//!     runtime (such as `chr()`, `decode()`, or PL/pgSQL variables). Use `--no-sql-log` whenever
+//!     query text must never be written to disk.
+//! - **`command:` header redaction:** CLI arguments are never parsed as SQL (so `--long-flag` or
+//!   `/*` globs cannot hide credentials). URI userinfo secrets are redacted, and on the first
+//!   case-insensitive `password` or `connection` in an argument, everything after it (or the
+//!   following argument when it ends with that keyword) is replaced with `[REDACTED]`.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -29,9 +41,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::DatabaseAlias;
+use crate::{DatabaseAlias, is_run_id, state_dir};
 
-const STATE_APP_DIR: &str = "dbvalet";
 const RUNS_SUBDIR: &str = "runs";
 const LOG_EXTENSION: &str = ".log";
 const DIR_MODE_OWNER_ONLY: u32 = 0o700;
@@ -44,6 +55,13 @@ const SECONDS_PER_HOUR: u64 = 3_600;
 const SECONDS_PER_MINUTE: u64 = 60;
 const REDACTED_LITERAL: &str = "'[REDACTED]'";
 const REDACTED_SECRET: &str = "[REDACTED]";
+const TRUNCATED_MARKER: &str = " /* truncated */";
+
+/// Maximum byte length of a single logged statement line before the truncation marker.
+pub(crate) const MAX_LOGGED_QUERY_BYTES: usize = 64 * 1024;
+/// Extra lookahead past [`MAX_LOGGED_QUERY_BYTES`] so a 32-byte run token or temporary login
+/// password straddling the truncation boundary is still scrubbed in full before truncating.
+pub(crate) const MAX_OBSERVED_QUERY_BYTES: usize = MAX_LOGGED_QUERY_BYTES + 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementKind {
@@ -60,7 +78,7 @@ impl StatementKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunHeader {
     pub run_id: String,
     pub started_at: SystemTime,
@@ -70,6 +88,21 @@ pub struct RunHeader {
     pub max_ttl: Option<Duration>,
     pub command: Vec<OsString>,
     pub sql_log: bool,
+}
+
+impl fmt::Debug for RunHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunHeader")
+            .field("run_id", &self.run_id)
+            .field("started_at", &self.started_at)
+            .field("database", &self.database)
+            .field("role", &self.role)
+            .field("valid_until", &self.valid_until)
+            .field("max_ttl", &self.max_ttl)
+            .field("command", &REDACTED_SECRET)
+            .field("sql_log", &self.sql_log)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +154,7 @@ impl fmt::Display for RunSummary {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunLogError {
-    #[error("can't find the state directory: neither XDG_STATE_HOME nor HOME is set")]
+    #[error("can't find the state directory: set HOME or XDG_STATE_HOME")]
     NoStateDir,
     #[error("couldn't create the run log directory {}", path.display())]
     CreateDir {
@@ -153,6 +186,8 @@ pub enum RunLogError {
         #[source]
         source: io::Error,
     },
+    #[error("couldn't write the run log output")]
+    WriteOutput(#[source] io::Error),
     #[error("no run log found for `{run_id}`")]
     NotFound { run_id: String },
 }
@@ -184,23 +219,28 @@ pub fn list() -> Result<Vec<RunSummary>, RunLogError> {
     list_in(&dir)
 }
 
-pub fn read(run_id: &str) -> Result<String, RunLogError> {
+/// Streams the run log for `run_id` into `writer`.
+pub fn copy_to(run_id: &str, writer: &mut impl Write) -> Result<(), RunLogError> {
     let dir = default_runs_dir()?;
-    read_in(&dir, run_id)
+    copy_to_in(&dir, run_id, writer)
 }
 
 impl RunLog {
     /// Redacts passwords and runtime secrets from `sql`, normalizes it onto one line,
-    /// and writes it to the run log file.
-    pub fn statement(&self, kind: StatementKind, sql: &str) {
+    /// truncates if needed, and writes it to the run log file.
+    pub fn statement(&self, kind: StatementKind, sql: &str, truncated: bool) {
         if sql.trim().is_empty() {
             return;
         }
         let redacted = redact_sql(sql);
         let scrubbed = self.inner.secrets.scrub(&redacted);
-        let single_line = sanitize_single_line(&scrubbed);
+        let mut single_line = sanitize_single_line(&scrubbed);
         if single_line.trim().is_empty() {
             return;
+        }
+        if truncated || single_line.len() > MAX_LOGGED_QUERY_BYTES {
+            truncate_utf8(&mut single_line, MAX_LOGGED_QUERY_BYTES);
+            single_line.push_str(TRUNCATED_MARKER);
         }
         let line = format!(
             "{} [{}] {single_line}\n",
@@ -227,27 +267,21 @@ impl RunLog {
     }
 }
 
-fn default_runs_dir() -> Result<PathBuf, RunLogError> {
-    let xdg = std::env::var_os("XDG_STATE_HOME");
-    let home = std::env::var_os("HOME");
-    resolve_runs_dir(xdg.as_deref(), home.as_deref())
+fn truncate_utf8(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
 }
 
-fn resolve_runs_dir(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, RunLogError> {
-    if let Some(xdg) = xdg.filter(|value| !value.is_empty()) {
-        let path = Path::new(xdg);
-        if path.is_absolute() {
-            return Ok(path.join(STATE_APP_DIR).join(RUNS_SUBDIR));
-        }
-    }
-    let home = home
-        .filter(|value| !value.is_empty())
-        .ok_or(RunLogError::NoStateDir)?;
-    Ok(Path::new(home)
-        .join(".local")
-        .join("state")
-        .join(STATE_APP_DIR)
-        .join(RUNS_SUBDIR))
+fn default_runs_dir() -> Result<PathBuf, RunLogError> {
+    state_dir()
+        .map(|dir| dir.join(RUNS_SUBDIR))
+        .ok_or(RunLogError::NoStateDir)
 }
 
 fn open_in(dir: &Path, header: &RunHeader, secrets: RunSecrets) -> Result<RunLog, RunLogError> {
@@ -326,18 +360,76 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Formats CLI arguments for the `command:` header without parsing shell text as SQL.
 fn format_command(command: &[OsString], secrets: &RunSecrets) -> String {
-    command
-        .iter()
-        .map(|arg| {
-            let lossy = arg.to_string_lossy();
-            let redacted = redact_sql_inner(&lossy, 0, true);
-            let scrubbed = secrets.scrub(&redacted);
-            let single_line = sanitize_single_line(&scrubbed);
-            quote_command_arg(&single_line)
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = Vec::with_capacity(command.len());
+    let mut redact_next = false;
+    for arg in command {
+        if redact_next {
+            out.push(REDACTED_SECRET.to_owned());
+            redact_next = false;
+            continue;
+        }
+        let lossy = arg.to_string_lossy();
+        let uri_redacted = redact_uri_passwords(&lossy);
+        let (redacted, needs_next) = redact_after_secret_keyword(&uri_redacted);
+        redact_next = needs_next;
+        let scrubbed = secrets.scrub(&redacted);
+        let single_line = sanitize_single_line(&scrubbed);
+        out.push(quote_command_arg(&single_line));
+    }
+    out.join(" ")
+}
+
+/// Keeps text through the first case-insensitive `password` or `connection` in `arg` and
+/// replaces the remainder with `[REDACTED]`. Returns whether the keyword stood at the end
+/// of `arg` (such as `--password`), meaning the next argv element should also be redacted.
+fn redact_after_secret_keyword(arg: &str) -> (String, bool) {
+    let lower = arg.to_ascii_lowercase();
+    let earliest = ["password", "connection"]
+        .into_iter()
+        .filter_map(|kw| lower.find(kw).map(|pos| (pos, kw.len())))
+        .min_by_key(|&(pos, _)| pos);
+    let Some((pos, kw_len)) = earliest else {
+        return (arg.to_owned(), false);
+    };
+    let after = pos + kw_len;
+    let rest = &arg[after..];
+    if rest.is_empty() {
+        return (arg.to_owned(), true);
+    }
+    if rest.starts_with('=') || rest.starts_with(':') {
+        return (format!("{}{}", &arg[..after + 1], REDACTED_SECRET), false);
+    }
+    (format!("{} {}", &arg[..after], REDACTED_SECRET), false)
+}
+
+/// Replaces `scheme://user:SECRET@` userinfo passwords with `scheme://user:[REDACTED]@`.
+fn redact_uri_passwords(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(rel_sep) = text[cursor..].find("://") {
+        let authority_start = cursor + rel_sep + 3;
+        out.push_str(&text[cursor..authority_start]);
+        let authority_end = text[authority_start..]
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | ')' | ';' | ',')
+            })
+            .map_or(text.len(), |offset| authority_start + offset);
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@')
+            && let Some(colon) = authority[..at].find(':')
+        {
+            out.push_str(&authority[..colon + 1]);
+            out.push_str(REDACTED_SECRET);
+            out.push_str(&authority[at..]);
+        } else {
+            out.push_str(authority);
+        }
+        cursor = authority_end;
+    }
+    out.push_str(&text[cursor..]);
+    out
 }
 
 fn quote_command_arg(arg: &str) -> String {
@@ -345,7 +437,11 @@ fn quote_command_arg(arg: &str) -> String {
         return "''".to_owned();
     }
     let needs_quoting = arg.bytes().any(|b| {
-        !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b'+'))
+        !(b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b'+' | b'@' | b'[' | b']'
+            ))
     });
     if !needs_quoting {
         return arg.to_owned();
@@ -375,11 +471,15 @@ fn list_in(dir: &Path) -> Result<Vec<RunSummary>, RunLogError> {
     Ok(summaries)
 }
 
-fn read_in(dir: &Path, requested_run_id: &str) -> Result<String, RunLogError> {
+fn copy_to_in(
+    dir: &Path,
+    requested_run_id: &str,
+    writer: &mut impl Write,
+) -> Result<(), RunLogError> {
     let normalized = requested_run_id
-        .strip_prefix("dbvalet_")
+        .strip_prefix(crate::LOGIN_PREFIX)
         .unwrap_or(requested_run_id);
-    if !is_valid_run_id(normalized) {
+    if !is_run_id(normalized) {
         return Err(RunLogError::NotFound {
             run_id: requested_run_id.to_owned(),
         });
@@ -390,7 +490,23 @@ fn read_in(dir: &Path, requested_run_id: &str) -> Result<String, RunLogError> {
             run_id: requested_run_id.to_owned(),
         });
     };
-    fs::read_to_string(&path).map_err(|source| RunLogError::ReadFile { path, source })
+    let mut file = File::open(&path).map_err(|source| RunLogError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        let n = io::Read::read(&mut file, &mut buf).map_err(|source| RunLogError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        if n == 0 {
+            return Ok(());
+        }
+        writer
+            .write_all(&buf[..n])
+            .map_err(RunLogError::WriteOutput)?;
+    }
 }
 
 /// Returns `(file_name, run_id, full_path)` for every valid run log file in `dir`,
@@ -427,7 +543,7 @@ fn sorted_run_files(dir: &Path) -> Result<Vec<(String, String, PathBuf)>, RunLog
 fn parse_run_id_from_file_name(file_name: &str) -> Option<&str> {
     let stem = file_name.strip_suffix(LOG_EXTENSION)?;
     let (prefix, run_id) = stem.rsplit_once('-')?;
-    if !is_valid_timestamp_prefix(prefix) || !is_valid_run_id(run_id) {
+    if !is_valid_timestamp_prefix(prefix) || !is_run_id(run_id) {
         return None;
     }
     Some(run_id)
@@ -439,13 +555,6 @@ fn is_valid_timestamp_prefix(prefix: &str) -> bool {
         && prefix
             .bytes()
             .all(|b| b.is_ascii_digit() || matches!(b, b'T' | b'.' | b'Z'))
-}
-
-fn is_valid_run_id(run_id: &str) -> bool {
-    !run_id.is_empty()
-        && run_id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b))
 }
 
 fn read_summary(path: &Path, fallback_run_id: &str) -> io::Result<RunSummary> {
@@ -525,175 +634,17 @@ fn sanitize_single_line(text: &str) -> String {
     out
 }
 
-/// Redacts password and connection-string literals from PostgreSQL SQL text.
-pub fn redact_sql(sql: &str) -> String {
-    redact_sql_inner(sql, 0, false)
+/// Best-effort lexical redaction of password and connection-string literals in PostgreSQL SQL.
+fn redact_sql(sql: &str) -> String {
+    redact_sql_inner(sql, 0)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum TokenKind {
-    Trivia { has_newline: bool },
-    Word,
-    QuotedIdent,
-    StringLiteral,
-    DollarString { delimiter_len: usize, closed: bool },
-    Other,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Token {
-    kind: TokenKind,
-    start: usize,
-    end: usize,
-}
-
-fn redact_sql_inner(sql: &str, depth: usize, redact_double_quoted: bool) -> String {
-    let tokens = tokenize_sql(sql);
-    let mut out = String::with_capacity(sql.len());
-    let mut expect_secret_literal = false;
-    let mut index = 0;
-
-    while index < tokens.len() {
-        let token = tokens[index];
-        let slice = &sql[token.start..token.end];
-
-        match token.kind {
-            TokenKind::Trivia { .. } => {
-                out.push_str(slice);
-                index += 1;
-            }
-            TokenKind::StringLiteral if expect_secret_literal => {
-                out.push_str(REDACTED_LITERAL);
-                expect_secret_literal = false;
-                index += 1;
-                // PostgreSQL concatenates adjacent quoted string literals separated by
-                // whitespace/comments containing a newline; redact the whole continuation.
-                index = skip_continued_string_literals(&tokens, index);
-            }
-            TokenKind::DollarString { .. } if expect_secret_literal => {
-                out.push_str(REDACTED_LITERAL);
-                expect_secret_literal = false;
-                index += 1;
-            }
-            TokenKind::Word => {
-                out.push_str(slice);
-                expect_secret_literal = slice.eq_ignore_ascii_case("PASSWORD")
-                    || slice.eq_ignore_ascii_case("CONNECTION");
-                index += 1;
-            }
-            TokenKind::QuotedIdent => {
-                if redact_double_quoted && depth < MAX_REDACT_DEPTH && slice.len() >= 2 {
-                    let inner = &slice[1..slice.len() - 1];
-                    out.push('"');
-                    out.push_str(&redact_sql_inner(inner, depth + 1, false));
-                    if slice.ends_with('"') {
-                        out.push('"');
-                    }
-                } else {
-                    out.push_str(slice);
-                }
-                expect_secret_literal = unquoted_ident_is_password(slice);
-                index += 1;
-            }
-            TokenKind::DollarString {
-                delimiter_len,
-                closed,
-            } => {
-                expect_secret_literal = false;
-                if depth < MAX_REDACT_DEPTH && slice.len() >= delimiter_len {
-                    let delimiter = &slice[..delimiter_len];
-                    let body_end = if closed {
-                        slice.len() - delimiter_len
-                    } else {
-                        slice.len()
-                    };
-                    let body = &slice[delimiter_len..body_end];
-                    out.push_str(delimiter);
-                    out.push_str(&redact_sql_inner(body, depth + 1, false));
-                    if closed {
-                        out.push_str(delimiter);
-                    }
-                } else {
-                    out.push_str(slice);
-                }
-                index += 1;
-            }
-            TokenKind::StringLiteral => {
-                expect_secret_literal = false;
-                if depth < MAX_REDACT_DEPTH {
-                    out.push_str(&redact_nested_single_quoted(
-                        slice,
-                        depth + 1,
-                        redact_double_quoted,
-                    ));
-                } else {
-                    out.push_str(slice);
-                }
-                index += 1;
-            }
-            TokenKind::Other => {
-                expect_secret_literal = false;
-                out.push_str(slice);
-                index += 1;
-            }
-        }
-    }
-
-    out
-}
-
-fn skip_continued_string_literals(tokens: &[Token], mut index: usize) -> usize {
-    loop {
-        let mut lookahead = index;
-        let mut saw_newline = false;
-        while let Some(token) = tokens.get(lookahead) {
-            match token.kind {
-                TokenKind::Trivia { has_newline } => {
-                    saw_newline |= has_newline;
-                    lookahead += 1;
-                }
-                TokenKind::StringLiteral if saw_newline => {
-                    index = lookahead + 1;
-                    break;
-                }
-                _ => return index,
-            }
-        }
-        if lookahead >= tokens.len() {
-            return index;
-        }
-    }
-}
-
-fn unquoted_ident_is_password(quoted: &str) -> bool {
-    let Some(inner) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
-        return false;
-    };
-    inner.replace("\"\"", "\"").eq_ignore_ascii_case("password")
-}
-
-/// Redacts password clauses embedded inside a single-quoted string literal, such as
-/// `EXECUTE 'ALTER ROLE a PASSWORD ''secret'''` or a shell argument `'psql -c ...'`.
-fn redact_nested_single_quoted(slice: &str, depth: usize, redact_double_quoted: bool) -> String {
-    let Some(inner) = slice.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
-        return slice.to_owned();
-    };
-    let lower = inner.to_ascii_lowercase();
-    if !lower.contains("password") && !lower.contains("connection") {
-        return slice.to_owned();
-    }
-    let unescaped = inner.replace("''", "'");
-    let redacted = redact_sql_inner(&unescaped, depth, redact_double_quoted);
-    if redacted == unescaped {
-        return slice.to_owned();
-    }
-    format!("'{}'", redacted.replace('\'', "''"))
-}
-
-fn tokenize_sql(sql: &str) -> Vec<Token> {
+fn redact_sql_inner(sql: &str, depth: usize) -> String {
     let bytes = sql.as_bytes();
     let len = bytes.len();
-    let mut tokens = Vec::new();
+    let mut out = String::with_capacity(len);
+    let mut expect_secret_literal = false;
+    let mut redact_statement_literals = false;
     let mut pos = 0;
 
     while pos < len {
@@ -701,153 +652,87 @@ fn tokenize_sql(sql: &str) -> Vec<Token> {
 
         if byte.is_ascii_whitespace() {
             let start = pos;
-            let mut has_newline = false;
             while pos < len && bytes[pos].is_ascii_whitespace() {
-                if matches!(bytes[pos], b'\n' | b'\r') {
-                    has_newline = true;
-                }
                 pos += 1;
             }
-            tokens.push(Token {
-                kind: TokenKind::Trivia { has_newline },
-                start,
-                end: pos,
-            });
+            out.push_str(&sql[start..pos]);
             continue;
         }
 
         if byte == b'-' && bytes.get(pos + 1) == Some(&b'-') {
             let start = pos;
-            pos += 2;
-            let mut has_newline = false;
-            while pos < len {
-                if bytes[pos] == b'\n' {
-                    has_newline = true;
-                    pos += 1;
-                    break;
-                }
-                pos += 1;
-            }
-            tokens.push(Token {
-                kind: TokenKind::Trivia { has_newline },
-                start,
-                end: pos,
-            });
+            pos = scan_line_comment(bytes, pos);
+            out.push_str(&sql[start..pos]);
             continue;
         }
 
         if byte == b'/' && bytes.get(pos + 1) == Some(&b'*') {
             let start = pos;
-            pos += 2;
-            let mut depth = 1usize;
-            let mut has_newline = false;
-            while pos < len && depth > 0 {
-                if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
-                    depth += 1;
-                    pos += 2;
-                } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
-                    depth -= 1;
-                    pos += 2;
+            pos = scan_block_comment(bytes, pos);
+            out.push_str(&sql[start..pos]);
+            continue;
+        }
+
+        if let Some((prefix_len, is_escape_string)) = quoted_string_prefix(bytes, pos) {
+            let redacting = expect_secret_literal || redact_statement_literals;
+            // Scan with backslash escapes when redacting so `standard_conforming_strings = off`
+            // cannot split a password literal at `\'` and leak the tail.
+            let end = scan_quoted_string(bytes, pos + prefix_len, is_escape_string || redacting);
+            if redacting {
+                out.push_str(REDACTED_LITERAL);
+                pos = if expect_secret_literal {
+                    skip_continued_quoted_literals(bytes, end)
                 } else {
-                    if matches!(bytes[pos], b'\n' | b'\r') {
-                        has_newline = true;
+                    end
+                };
+                expect_secret_literal = false;
+            } else {
+                let slice = &sql[pos..end];
+                if depth < MAX_REDACT_DEPTH {
+                    let (redacted, is_template) = redact_single_quoted_content(slice, depth + 1);
+                    out.push_str(&redacted);
+                    if is_template {
+                        redact_statement_literals = true;
                     }
-                    pos += 1;
+                } else {
+                    out.push_str(slice);
                 }
+                pos = end;
             }
-            tokens.push(Token {
-                kind: TokenKind::Trivia { has_newline },
-                start,
-                end: pos,
-            });
-            continue;
-        }
-
-        if byte == b'\'' {
-            let start = pos;
-            pos = scan_quoted_string(bytes, pos + 1, false);
-            tokens.push(Token {
-                kind: TokenKind::StringLiteral,
-                start,
-                end: pos,
-            });
-            continue;
-        }
-
-        if matches!(byte, b'E' | b'e' | b'N' | b'n') && bytes.get(pos + 1) == Some(&b'\'') {
-            let start = pos;
-            let backslash_escapes = matches!(byte, b'E' | b'e');
-            pos = scan_quoted_string(bytes, pos + 2, backslash_escapes);
-            tokens.push(Token {
-                kind: TokenKind::StringLiteral,
-                start,
-                end: pos,
-            });
-            continue;
-        }
-
-        if matches!(byte, b'U' | b'u')
-            && bytes.get(pos + 1) == Some(&b'&')
-            && bytes.get(pos + 2) == Some(&b'\'')
-        {
-            let start = pos;
-            pos = scan_quoted_string(bytes, pos + 3, false);
-            tokens.push(Token {
-                kind: TokenKind::StringLiteral,
-                start,
-                end: pos,
-            });
             continue;
         }
 
         if byte == b'$'
             && let Some(delimiter_len) = dollar_quote_delimiter_len(bytes, pos)
         {
-            let start = pos;
-            let delimiter = &bytes[pos..pos + delimiter_len];
-            pos += delimiter_len;
-            let mut closed = false;
-            while pos + delimiter_len <= len {
-                if &bytes[pos..pos + delimiter_len] == delimiter {
-                    pos += delimiter_len;
-                    closed = true;
-                    break;
+            let (end, closed) = scan_dollar_string(bytes, pos, delimiter_len);
+            if expect_secret_literal || redact_statement_literals {
+                out.push_str(REDACTED_LITERAL);
+                expect_secret_literal = false;
+            } else if depth < MAX_REDACT_DEPTH {
+                let delimiter = &sql[pos..pos + delimiter_len];
+                let body_end = if closed { end - delimiter_len } else { end };
+                let body = &sql[pos + delimiter_len..body_end];
+                let body = redact_sql_inner(body, depth + 1);
+                let body = redact_embedded_credentials(&body);
+                out.push_str(delimiter);
+                out.push_str(&body);
+                if closed {
+                    out.push_str(delimiter);
                 }
-                pos += 1;
+            } else {
+                out.push_str(&sql[pos..end]);
             }
-            if !closed {
-                pos = len;
-            }
-            tokens.push(Token {
-                kind: TokenKind::DollarString {
-                    delimiter_len,
-                    closed,
-                },
-                start,
-                end: pos,
-            });
+            pos = end;
             continue;
         }
 
         if byte == b'"' {
             let start = pos;
-            pos += 1;
-            while pos < len {
-                if bytes[pos] == b'"' {
-                    pos += 1;
-                    if bytes.get(pos) == Some(&b'"') {
-                        pos += 1;
-                        continue;
-                    }
-                    break;
-                }
-                pos += 1;
-            }
-            tokens.push(Token {
-                kind: TokenKind::QuotedIdent,
-                start,
-                end: pos,
-            });
+            pos = scan_double_quoted_ident(bytes, pos);
+            let slice = &sql[start..pos];
+            out.push_str(slice);
+            expect_secret_literal = unquoted_ident_is_secret_key(slice);
             continue;
         }
 
@@ -857,25 +742,275 @@ fn tokenize_sql(sql: &str) -> Vec<Token> {
             while pos < len && is_ident_continue(bytes[pos]) {
                 pos += 1;
             }
-            tokens.push(Token {
-                kind: TokenKind::Word,
-                start,
-                end: pos,
-            });
+            let word = &sql[start..pos];
+            out.push_str(word);
+            expect_secret_literal = word_is_secret_key(word);
             continue;
         }
 
-        let start = pos;
+        if byte == b';' {
+            expect_secret_literal = false;
+            redact_statement_literals = false;
+            out.push(';');
+            pos += 1;
+            continue;
+        }
+
+        expect_secret_literal = false;
         let ch_len = sql[pos..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&sql[pos..pos + ch_len]);
         pos += ch_len;
-        tokens.push(Token {
-            kind: TokenKind::Other,
-            start,
-            end: pos,
-        });
     }
 
-    tokens
+    out
+}
+
+fn word_is_secret_key(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    lower.ends_with("password") || lower == "connection"
+}
+
+fn unquoted_ident_is_secret_key(quoted: &str) -> bool {
+    let Some(inner) = quoted.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return false;
+    };
+    word_is_secret_key(&inner.replace("\"\"", "\""))
+}
+
+/// Redacts embedded credentials (conninfo `password=...`, URI userinfo, or nested SQL
+/// `PASSWORD` clauses) inside a single-quoted string literal, and reports whether the literal
+/// looks like a dynamic `ALTER`/`CREATE` `PASSWORD` template (such as `format('... %L', ...)`).
+fn redact_single_quoted_content(slice: &str, depth: usize) -> (String, bool) {
+    let Some(inner) = slice.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
+        let embedded = redact_embedded_credentials(slice);
+        return (embedded, false);
+    };
+    let lower = inner.to_ascii_lowercase();
+    let has_keyword = lower.contains("password") || lower.contains("connection");
+    let has_uri = inner.contains("://");
+    if !has_keyword && !has_uri {
+        return (slice.to_owned(), false);
+    }
+    let unescaped = inner.replace("''", "'");
+    let is_template = looks_like_password_sql_template(&unescaped);
+    let mut redacted = if has_keyword {
+        redact_sql_inner(&unescaped, depth)
+    } else {
+        unescaped.clone()
+    };
+    redacted = redact_embedded_credentials(&redacted);
+    if redacted == unescaped {
+        return (slice.to_owned(), is_template);
+    }
+    (format!("'{}'", redacted.replace('\'', "''")), is_template)
+}
+
+fn looks_like_password_sql_template(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("password")
+        && (contains_ascii_word(&lower, "alter") || contains_ascii_word(&lower, "create"))
+        && (contains_ascii_word(&lower, "role")
+            || contains_ascii_word(&lower, "user")
+            || contains_ascii_word(&lower, "group"))
+}
+
+fn contains_ascii_word(haystack: &str, word: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(word) {
+        let pos = start + offset;
+        let end = pos + word.len();
+        let before_ok = pos == 0 || !is_ident_continue(bytes[pos - 1]);
+        let after_ok = end == bytes.len() || !is_ident_continue(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// Redacts URI userinfo passwords and libpq conninfo `password=` / `*password=` values.
+fn redact_embedded_credentials(text: &str) -> String {
+    let with_uris = if text.contains("://") {
+        redact_uri_passwords(text)
+    } else {
+        text.to_owned()
+    };
+    if with_uris.to_ascii_lowercase().contains("password") {
+        redact_conninfo_passwords(&with_uris)
+    } else {
+        with_uris
+    }
+}
+
+/// Replaces `password=<val>` and `*password=<val>` (bare or single-quoted) in libpq conninfo
+/// strings such as those passed to `dblink` or `dblink_connect`.
+fn redact_conninfo_passwords(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut pos = 0;
+
+    while pos < len {
+        if is_ident_start(bytes[pos]) {
+            let start = pos;
+            pos += 1;
+            while pos < len && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
+                pos += 1;
+            }
+            let word = &text[start..pos];
+            out.push_str(word);
+            if word.to_ascii_lowercase().ends_with("password") {
+                let mut cursor = pos;
+                while cursor < len && matches!(bytes[cursor], b' ' | b'\t') {
+                    cursor += 1;
+                }
+                if cursor < len && bytes[cursor] == b'=' {
+                    cursor += 1;
+                    while cursor < len && matches!(bytes[cursor], b' ' | b'\t') {
+                        cursor += 1;
+                    }
+                    out.push_str(&text[pos..cursor]);
+                    if cursor < len {
+                        if bytes[cursor] == b'\'' {
+                            pos = scan_quoted_string(bytes, cursor + 1, true);
+                        } else {
+                            let mut val_end = cursor;
+                            while val_end < len && !bytes[val_end].is_ascii_whitespace() {
+                                val_end += 1;
+                            }
+                            pos = val_end;
+                        }
+                        out.push_str(REDACTED_SECRET);
+                    } else {
+                        pos = cursor;
+                    }
+                }
+            }
+            continue;
+        }
+        let ch_len = text[pos..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[pos..pos + ch_len]);
+        pos += ch_len;
+    }
+
+    out
+}
+
+fn quoted_string_prefix(bytes: &[u8], pos: usize) -> Option<(usize, bool)> {
+    match bytes[pos] {
+        b'\'' => Some((1, false)),
+        b'E' | b'e' if bytes.get(pos + 1) == Some(&b'\'') => Some((2, true)),
+        b'N' | b'n' if bytes.get(pos + 1) == Some(&b'\'') => Some((2, false)),
+        b'U' | b'u' if bytes.get(pos + 1) == Some(&b'&') && bytes.get(pos + 2) == Some(&b'\'') => {
+            Some((3, false))
+        }
+        _ => None,
+    }
+}
+
+/// Skips PostgreSQL newline-separated string literal continuations after a redacted literal.
+fn skip_continued_quoted_literals(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    loop {
+        let mut cursor = pos;
+        let mut saw_newline = false;
+        while cursor < len {
+            let byte = bytes[cursor];
+            if byte.is_ascii_whitespace() {
+                if matches!(byte, b'\n' | b'\r') {
+                    saw_newline = true;
+                }
+                cursor += 1;
+            } else if byte == b'-' && bytes.get(cursor + 1) == Some(&b'-') {
+                let end = scan_line_comment(bytes, cursor);
+                if bytes[cursor..end].contains(&b'\n') {
+                    saw_newline = true;
+                }
+                cursor = end;
+            } else if byte == b'/' && bytes.get(cursor + 1) == Some(&b'*') {
+                let end = scan_block_comment(bytes, cursor);
+                if bytes[cursor..end]
+                    .iter()
+                    .any(|&b| matches!(b, b'\n' | b'\r'))
+                {
+                    saw_newline = true;
+                }
+                cursor = end;
+            } else {
+                break;
+            }
+        }
+        if saw_newline
+            && cursor < len
+            && let Some((prefix_len, _)) = quoted_string_prefix(bytes, cursor)
+        {
+            pos = scan_quoted_string(bytes, cursor + prefix_len, true);
+            continue;
+        }
+        return pos;
+    }
+}
+
+fn scan_line_comment(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    pos += 2;
+    while pos < len {
+        if bytes[pos] == b'\n' {
+            return pos + 1;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+fn scan_block_comment(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    pos += 2;
+    let mut depth = 1usize;
+    while pos < len && depth > 0 {
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            depth += 1;
+            pos += 2;
+        } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+            depth -= 1;
+            pos += 2;
+        } else {
+            pos += 1;
+        }
+    }
+    pos
+}
+
+fn scan_double_quoted_ident(bytes: &[u8], mut pos: usize) -> usize {
+    let len = bytes.len();
+    pos += 1;
+    while pos < len {
+        if bytes[pos] == b'"' {
+            pos += 1;
+            if bytes.get(pos) == Some(&b'"') {
+                pos += 1;
+                continue;
+            }
+            break;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+fn scan_dollar_string(bytes: &[u8], pos: usize, delimiter_len: usize) -> (usize, bool) {
+    let len = bytes.len();
+    let delimiter = &bytes[pos..pos + delimiter_len];
+    let mut cursor = pos + delimiter_len;
+    while cursor + delimiter_len <= len {
+        if &bytes[cursor..cursor + delimiter_len] == delimiter {
+            return (cursor + delimiter_len, true);
+        }
+        cursor += 1;
+    }
+    (len, false)
 }
 
 fn scan_quoted_string(bytes: &[u8], mut pos: usize, backslash_escapes: bool) -> usize {
@@ -1003,6 +1138,12 @@ mod tests {
         dir
     }
 
+    fn read_to_string(dir: &Path, run_id: &str) -> Result<String, RunLogError> {
+        let mut buf = Vec::new();
+        copy_to_in(dir, run_id, &mut buf)?;
+        Ok(String::from_utf8(buf).unwrap())
+    }
+
     fn sample_header(
         run_id: &str,
         started_secs: u64,
@@ -1026,42 +1167,6 @@ mod tests {
             SecretString::from("toksecret1234567890abcdef1234567"),
             SecretString::from("pwloginsecret1234567890abcdef123"),
         )
-    }
-
-    #[test]
-    fn xdg_state_home_takes_precedence_over_home() {
-        let dir = resolve_runs_dir(
-            Some(OsStr::new("/var/tmp/state")),
-            Some(OsStr::new("/Users/alice")),
-        )
-        .unwrap();
-        assert_eq!(dir, PathBuf::from("/var/tmp/state/dbvalet/runs"));
-    }
-
-    #[test]
-    fn empty_or_relative_xdg_state_home_falls_back_to_home() {
-        let empty =
-            resolve_runs_dir(Some(OsStr::new("")), Some(OsStr::new("/Users/alice"))).unwrap();
-        assert_eq!(
-            empty,
-            PathBuf::from("/Users/alice/.local/state/dbvalet/runs")
-        );
-
-        let relative = resolve_runs_dir(
-            Some(OsStr::new("relative/state")),
-            Some(OsStr::new("/Users/alice")),
-        )
-        .unwrap();
-        assert_eq!(
-            relative,
-            PathBuf::from("/Users/alice/.local/state/dbvalet/runs")
-        );
-    }
-
-    #[test]
-    fn missing_state_and_home_environment_variables_returns_an_error() {
-        let err = resolve_runs_dir(None, None).unwrap_err();
-        assert!(matches!(err, RunLogError::NoStateDir));
     }
 
     #[test]
@@ -1156,11 +1261,52 @@ mod tests {
     }
 
     #[test]
+    fn format_quote_literal_dblink_sslpassword_and_nonstandard_escapes_are_redacted() {
+        let cases = [
+            (
+                "DO $$ BEGIN EXECUTE format('ALTER ROLE a PASSWORD %L', 'pw-format-03'); END $$",
+                "pw-format-03",
+            ),
+            (
+                "DO $$ BEGIN EXECUTE 'ALTER ROLE a PASSWORD ' || quote_literal('pw-concat-04'); END $$",
+                "pw-concat-04",
+            ),
+            (
+                "SELECT dblink_connect('c', 'host=h user=u password=pw-dblink-05')",
+                "pw-dblink-05",
+            ),
+            (
+                "SELECT dblink('postgresql://u:pw-uri-07@host/db', 'SELECT 1')",
+                "pw-uri-07",
+            ),
+            (
+                "SET standard_conforming_strings = off; ALTER ROLE a PASSWORD 'ab\\'pw-scs-02'",
+                "pw-scs-02",
+            ),
+            (
+                "CREATE USER MAPPING FOR a SERVER s OPTIONS (sslpassword 'pw-ssl-06')",
+                "pw-ssl-06",
+            ),
+        ];
+        for (sql, leaked) in cases {
+            let redacted = redact_sql(sql);
+            assert!(
+                !redacted.contains(leaked),
+                "input: {sql}\nredacted: {redacted}"
+            );
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "input: {sql}\nredacted: {redacted}"
+            );
+        }
+    }
+
+    #[test]
     fn non_password_sql_and_password_null_are_preserved() {
         assert_eq!(redact_sql("SELECT 1"), "SELECT 1");
         assert_eq!(
-            redact_sql("SELECT password FROM users"),
-            "SELECT password FROM users"
+            redact_sql("SELECT password FROM users WHERE name = 'alice'"),
+            "SELECT password FROM users WHERE name = 'alice'"
         );
         assert_eq!(
             redact_sql("ALTER ROLE alice PASSWORD NULL"),
@@ -1173,23 +1319,77 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_run_log_writes_header_redacts_secrets_and_sets_owner_only_permissions() {
-        let dir = temp_runs_dir("open-and-write");
+    fn command_header_redacts_passwords_after_long_flags_and_globs() {
+        let secrets = sample_secrets();
+        for (args, leaked) in [
+            (
+                vec!["psql", "--command=ALTER ROLE a PASSWORD 'pw-long-35'"],
+                "pw-long-35",
+            ),
+            (
+                vec![
+                    "sh",
+                    "-c",
+                    "psql --no-psqlrc -c \"ALTER ROLE a PASSWORD 'pw-dashdash-37'\"",
+                ],
+                "pw-dashdash-37",
+            ),
+            (
+                vec![
+                    "sh",
+                    "-c",
+                    "ls /*.txt; psql -c \"ALTER ROLE a PASSWORD 'pw-glob-38'\"",
+                ],
+                "pw-glob-38",
+            ),
+            (
+                vec!["mytool", "--password", "pw-next-arg-39"],
+                "pw-next-arg-39",
+            ),
+        ] {
+            let cmd: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            let formatted = format_command(&cmd, &secrets);
+            assert!(!formatted.contains(leaked), "{formatted}");
+            assert!(formatted.contains("[REDACTED]"), "{formatted}");
+        }
+    }
+
+    #[test]
+    fn command_header_redacts_uri_env_and_conninfo_passwords() {
+        let secrets = sample_secrets();
+        for (args, leaked) in [
+            (
+                vec![
+                    "pg_dump",
+                    "postgresql://admin:pw-url-31@prod.example.com/db",
+                ],
+                "pw-url-31",
+            ),
+            (vec!["env", "PGPASSWORD=pw-env-32", "psql"], "pw-env-32"),
+            (
+                vec!["psql", "host=h password=pw-conninfo-33"],
+                "pw-conninfo-33",
+            ),
+        ] {
+            let cmd: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            let formatted = format_command(&cmd, &secrets);
+            assert!(!formatted.contains(leaked), "{formatted}");
+            assert!(formatted.contains("[REDACTED]"), "{formatted}");
+        }
+    }
+
+    #[test]
+    fn opening_a_run_log_writes_the_header_with_owner_only_permissions() {
+        let dir = temp_runs_dir("open-header");
         let header = sample_header(
             "aaaaaaaaaaaaaaaa",
             1_795_688_130,
-            &["psql", "-c", "ALTER ROLE x PASSWORD 'cli-secret-99'"],
+            &["psql", "-c", "select 1"],
             true,
         );
-        let log = open_in(&dir, &header, sample_secrets()).unwrap();
-        log.statement(StatementKind::Query, "select 1");
-        log.statement(
-            StatementKind::Query,
-            "SELECT 'toksecret1234567890abcdef1234567', 'pwloginsecret1234567890abcdef123'",
-        );
-        log.statement(StatementKind::Parse, "SELECT $1::int\nFROM items");
+        let _log = open_in(&dir, &header, sample_secrets()).unwrap();
 
-        let content = read_in(&dir, "aaaaaaaaaaaaaaaa").unwrap();
+        let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
         assert!(content.contains("run_id: aaaaaaaaaaaaaaaa\n"), "{content}");
         assert!(
             content.contains("started_at: 2026-11-26T10:15:30Z\n"),
@@ -1203,6 +1403,36 @@ mod tests {
         );
         assert!(content.contains("max_ttl: 480m\n"), "{content}");
         assert!(content.contains("sql_log: enabled\n"), "{content}");
+        assert!(
+            content.contains("command: psql -c 'select 1'\n"),
+            "{content}"
+        );
+
+        let path = dir.join("20261126T101530.000000000Z-aaaaaaaaaaaaaaaa.log");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logged_statements_redact_sql_passwords_and_runtime_secrets() {
+        let dir = temp_runs_dir("log-statements");
+        let header = sample_header(
+            "aaaaaaaaaaaaaaaa",
+            1_795_688_130,
+            &["psql", "-c", "ALTER ROLE x PASSWORD 'cli-secret-99'"],
+            true,
+        );
+        let log = open_in(&dir, &header, sample_secrets()).unwrap();
+        log.statement(StatementKind::Query, "select 1", false);
+        log.statement(
+            StatementKind::Query,
+            "SELECT 'toksecret1234567890abcdef1234567', 'pwloginsecret1234567890abcdef123'",
+            false,
+        );
+        log.statement(StatementKind::Parse, "SELECT $1::int\nFROM items", false);
+
+        let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
         assert!(content.contains("[Q] select 1\n"), "{content}");
         assert!(
             content.contains("[P] SELECT $1::int FROM items\n"),
@@ -1217,10 +1447,21 @@ mod tests {
             !content.contains("pwloginsecret1234567890abcdef123"),
             "{content}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        let path = dir.join("20261126T101530.000000000Z-aaaaaaaaaaaaaaaa.log");
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+    #[test]
+    fn a_token_straddling_the_truncation_boundary_is_scrubbed_before_truncating() {
+        let dir = temp_runs_dir("truncate-boundary");
+        let header = sample_header("aaaaaaaaaaaaaaaa", 1_795_688_130, &["psql"], true);
+        let log = open_in(&dir, &header, sample_secrets()).unwrap();
+        let padding = "x".repeat(MAX_LOGGED_QUERY_BYTES - 10);
+        let sql = format!("SELECT '{padding}toksecret1234567890abcdef1234567'");
+        log.statement(StatementKind::Query, &sql, true);
+
+        let content = read_to_string(&dir, "aaaaaaaaaaaaaaaa").unwrap();
+        assert!(!content.contains("toksecret"), "{content}");
+        assert!(content.contains(" /* truncated */\n"), "{content}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1256,44 +1497,38 @@ mod tests {
         let dir = temp_runs_dir("read-not-found");
         fs::create_dir_all(&dir).unwrap();
         assert!(matches!(
-            read_in(&dir, "nonexistent12345"),
+            read_to_string(&dir, "zzzzzzzzzzzzzzzz"),
             Err(RunLogError::NotFound { .. })
         ));
         assert!(matches!(
-            read_in(&dir, "../Cargo.toml"),
+            read_to_string(&dir, "../Cargo.toml"),
             Err(RunLogError::NotFound { .. })
         ));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn secrets_and_run_log_debug_output_never_contain_passwords_or_tokens() {
+    fn secrets_header_and_run_log_debug_output_never_contain_passwords_or_tokens() {
+        let dir = temp_runs_dir("debug-redaction");
         let secrets = sample_secrets();
-        let debug = format!("{secrets:?}");
-        assert!(
-            !debug.contains("toksecret1234567890abcdef1234567"),
-            "{debug}"
+        let header = sample_header(
+            "aaaaaaaaaaaaaaaa",
+            1_795_688_130,
+            &["psql", "--command=ALTER ROLE a PASSWORD 'pw-dbg-99'"],
+            true,
         );
-        assert!(
-            !debug.contains("pwloginsecret1234567890abcdef123"),
-            "{debug}"
-        );
-    }
+        let log = open_in(&dir, &header, secrets.clone()).unwrap();
 
-    #[test]
-    fn shell_wrapped_sql_passwords_in_command_header_are_redacted() {
-        let secrets = sample_secrets();
-        let cmd = vec![
-            OsString::from("sh"),
-            OsString::from("-c"),
-            OsString::from(
-                "psql -c \"ALTER ROLE a PASSWORD 'pw-dq-111'\" || true; \
-                 psql -c 'CREATE ROLE b LOGIN PASSWORD $$pw-sq-222$$' || true",
-            ),
-        ];
-        let formatted = format_command(&cmd, &secrets);
-        assert!(!formatted.contains("pw-dq-111"), "{formatted}");
-        assert!(!formatted.contains("pw-sq-222"), "{formatted}");
-        assert!(formatted.contains("[REDACTED]"), "{formatted}");
+        let combined = format!("{secrets:?}\n{header:?}\n{log:?}");
+        assert!(
+            !combined.contains("toksecret1234567890abcdef1234567"),
+            "{combined}"
+        );
+        assert!(
+            !combined.contains("pwloginsecret1234567890abcdef123"),
+            "{combined}"
+        );
+        assert!(!combined.contains("pw-dbg-99"), "{combined}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
