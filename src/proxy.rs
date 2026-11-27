@@ -231,6 +231,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LeaseStream<T> {
         Pin::new(&mut self.socket).poll_shutdown(cx)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
