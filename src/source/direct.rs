@@ -204,11 +204,14 @@ impl CredentialSource for DirectSource {
             ))
             .await
             .map_err(create_failed)?;
-        // Kept so end_sessions can still match backends by usesysid if another actor drops the role.
+        // Best-effort: kept so end_sessions can still match backends by usesysid if another
+        // actor drops the role. A lookup failure here shouldn't abort a run whose login already
+        // exists, and the ledger entry is already on disk.
         let role_oid: Option<u32> = client
             .query_opt("SELECT oid FROM pg_roles WHERE rolname = $1", &[&user])
             .await
-            .map_err(create_failed)?
+            .ok()
+            .flatten()
             .map(|row| row.get(0));
 
         let active_push = Arc::new(ActivePush::default());
@@ -256,6 +259,7 @@ struct ActivePushState {
     in_flight: Option<InFlightPush>,
 }
 
+#[derive(Clone)]
 struct InFlightPush {
     id: u64,
     cancel_token: CancelToken,
@@ -324,11 +328,12 @@ impl ActivePush {
     }
 
     /// Cancels the currently running `ALTER ROLE` (for example after a push timeout) while
-    /// allowing later pushes to run.
+    /// allowing later pushes to run. Leaves the record in place until `PushGuard` drops, so
+    /// a concurrent teardown still waits for the push to settle.
     pub(super) async fn cancel_in_flight(&self) {
         let in_flight = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.in_flight.take()
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.in_flight.clone()
         };
         if let Some(in_flight) = in_flight {
             cancel_and_wait(in_flight).await;

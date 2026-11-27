@@ -31,6 +31,9 @@ const LONGEST_LEASE: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 const SUSPEND_CLOCK_POLL: Duration = Duration::from_secs(1);
 /// Minimum poll interval for short-timing tests so polling never spins.
 const MIN_SUSPEND_CLOCK_POLL: Duration = Duration::from_millis(50);
+/// Short retry delay after a failed push when `VALID UNTIL` is within one push interval
+/// (for example right after waking from suspend while networking reconnects).
+const URGENT_PUSH_RETRY: Duration = Duration::from_secs(5);
 /// In a debug build only, how many milliseconds a lease's minute lasts, so e2e tests reach
 /// pushes and max_ttl in seconds. A release build doesn't contain the code that reads it.
 #[cfg(any(debug_assertions, test))]
@@ -312,6 +315,31 @@ impl LeaseClock {
             .duration_since(database_now)
             .ok()
     }
+
+    /// Delay before the next push: one full interval normally, or a short retry after a failure
+    /// when `confirmed_expiry` is within one push interval of lapsing.
+    fn next_push_delay(
+        &self,
+        now_with_suspend: Duration,
+        confirmed_expiry: SystemTime,
+        failed: bool,
+    ) -> Duration {
+        if !failed {
+            return self.push_interval;
+        }
+        let elapsed = now_with_suspend.saturating_sub(self.started_with_suspend);
+        let valid_for = confirmed_expiry
+            .duration_since(self.started)
+            .unwrap_or(Duration::ZERO);
+        let remaining_validity = valid_for.saturating_sub(elapsed);
+        if remaining_validity <= self.push_interval {
+            URGENT_PUSH_RETRY
+                .min(self.push_interval / 4)
+                .max(MIN_SUSPEND_CLOCK_POLL)
+        } else {
+            self.push_interval
+        }
+    }
 }
 
 /// How long `real` lasts for a lease. Only a debug build's tests can shorten it.
@@ -503,8 +531,7 @@ where
             () = &mut host_deadline_reached => return KeepAliveStop::MaxTtl,
             pushed = push(confirmed_expiry) => pushed,
         };
-        next_push_at = clock.suspend_clock.now() + clock.push_interval;
-        match pushed {
+        let failed = match pushed {
             // After this machine slept, max_ttl comes sooner than the monotonic clock says.
             Ok(direct::PushOutcome::Pushed {
                 database_now,
@@ -520,13 +547,17 @@ where
                     }
                     None => return KeepAliveStop::MaxTtl,
                 }
+                false
             }
             Ok(direct::PushOutcome::ReachedMaxTtl) => return KeepAliveStop::MaxTtl,
             Ok(direct::PushOutcome::AlreadyGone) => return KeepAliveStop::AlreadyGone,
             Err(err) => {
                 let _ = writeln!(io::stderr(), "dbvalet: {err}");
+                true
             }
-        }
+        };
+        let now = clock.suspend_clock.now();
+        next_push_at = now + clock.next_push_delay(now, confirmed_expiry, failed);
     }
 }
 
@@ -671,6 +702,88 @@ mod tests {
         assert!(
             !drive.is_finished(),
             "a short suspend must not end the lease"
+        );
+        drive.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_push_after_a_short_suspend_retries_before_valid_until_lapses() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let elapsed_secs = Arc::new(AtomicU64::new(0));
+        let reader = Arc::clone(&elapsed_secs);
+        let suspend_clock = SuspendClock::fake(
+            Arc::new(move || Duration::from_secs(reader.load(Ordering::Relaxed))),
+            Duration::from_millis(5),
+        );
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let clock = LeaseClock::with_timings(
+            started,
+            Instant::now(),
+            Duration::ZERO,
+            suspend_clock,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(15 * 60),
+            Duration::from_secs(5 * 60),
+        );
+        let initial_expiry = clock.next_expiry(started);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_in_push = Arc::clone(&attempts);
+        let (first_failed_tx, first_failed_rx) = tokio::sync::oneshot::channel();
+        let (retry_ok_tx, retry_ok_rx) = tokio::sync::oneshot::channel();
+        let mut first_failed_tx = Some(first_failed_tx);
+        let mut retry_ok_tx = Some(retry_ok_tx);
+        let drive = tokio::spawn(drive_keep_alive(clock, initial_expiry, move |_confirmed| {
+            let attempt = attempts_in_push.fetch_add(1, Ordering::Relaxed) + 1;
+            let first_tx = if attempt == 1 {
+                first_failed_tx.take()
+            } else {
+                None
+            };
+            let retry_tx = if attempt == 2 {
+                retry_ok_tx.take()
+            } else {
+                None
+            };
+            async move {
+                if attempt == 1 {
+                    if let Some(tx) = first_tx {
+                        let _ = tx.send(());
+                    }
+                    Err(SourceError::PushExpiry {
+                        login: "dbvalet_aaaaaaaaaaaaaaaa".to_owned(),
+                        reason: "network still reconnecting".to_owned(),
+                    })
+                } else {
+                    if let Some(tx) = retry_tx {
+                        let _ = tx.send(());
+                    }
+                    Ok(direct::PushOutcome::Pushed {
+                        database_now: started + Duration::from_secs(12 * 60 + 10),
+                        expiry: started + Duration::from_secs(27 * 60 + 10),
+                    })
+                }
+            }
+        }));
+
+        // Wake at 12 min (3 min before VALID UNTIL); the first push fails.
+        elapsed_secs.store(12 * 60, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_millis(500), first_failed_rx)
+            .await
+            .expect("first push after wake did not run")
+            .unwrap();
+
+        // Advance to 12 min 10 s — well before the 15-minute VALID UNTIL lapses.
+        elapsed_secs.store(12 * 60 + 10, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_millis(500), retry_ok_rx)
+            .await
+            .expect("failed push after wake was not retried before VALID UNTIL lapsed")
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(
+            !drive.is_finished(),
+            "a recovered push must not end the lease"
         );
         drive.abort();
     }
