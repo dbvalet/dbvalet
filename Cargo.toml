@@ -35,7 +35,6 @@ subtle = "2.6.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "net", "io-util", "process", "sync", "time"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }
-tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs"] }
 tokio-util = { version = "0.7.20", default-features = false }
 toml = { version = "1.2.3", default-features = false, features = ["parse", "serde", "std"] }

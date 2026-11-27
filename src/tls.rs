@@ -2,23 +2,33 @@
 //! the admin connection and the proxy's upstream connections.
 
 use std::error::Error as StdError;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use rustls::{CertificateError, ClientConfig, RootCertStore};
+use rustls::{CertificateError, ClientConfig, ClientConnection, RootCertStore};
 use rustls_pki_types::pem::{self, PemObject};
 use rustls_pki_types::{CertificateDer, ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_postgres::tls::{
+    ChannelBinding as PgChannelBinding, MakeTlsConnect, TlsConnect, TlsStream as PgTlsStream,
+};
+use tokio_rustls::TlsConnector;
 use x509_cert::Certificate;
-use x509_cert::der::Decode;
+use x509_cert::der::asn1::{ContextSpecific, UintRef};
 use x509_cert::der::oid::ObjectIdentifier;
 use x509_cert::der::oid::db::rfc5912::{
-    ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_MD_5, ID_SHA_1, ID_SHA_256,
-    ID_SHA_384, ID_SHA_512, MD_5_WITH_RSA_ENCRYPTION, SHA_1_WITH_RSA_ENCRYPTION,
+    ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_MD_5, ID_RSASSA_PSS, ID_SHA_1,
+    ID_SHA_256, ID_SHA_384, ID_SHA_512, MD_5_WITH_RSA_ENCRYPTION, SHA_1_WITH_RSA_ENCRYPTION,
     SHA_256_WITH_RSA_ENCRYPTION, SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
 };
+use x509_cert::der::{Decode, DecodeValue, FixedTag, Header, Reader, Tag, TagNumber};
+use x509_cert::spki::{AlgorithmIdentifierOwned, AlgorithmIdentifierRef};
 
 use crate::endpoint::{Endpoint, Tls, TrustRoot};
 
@@ -204,12 +214,131 @@ pub fn describe_tls_io_error(endpoint: &Endpoint, err: &io::Error) -> String {
     format!("TLS handshake failed: {err}")
 }
 
+/// `tokio-postgres` TLS connector backed by `tokio-rustls` and [`server_end_point_digest`].
+#[derive(Clone)]
+pub struct MakeRustlsConnect {
+    config: Arc<ClientConfig>,
+}
+
+impl MakeRustlsConnect {
+    pub fn new(config: ClientConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+}
+
+pub struct RustlsConnect {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+pub struct RustlsConnectFuture<S>(tokio_rustls::Connect<S>);
+
+pub struct RustlsStream<S>(tokio_rustls::client::TlsStream<S>);
+
+impl<S> MakeTlsConnect<S> for MakeRustlsConnect
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Stream = RustlsStream<S>;
+    type TlsConnect = RustlsConnect;
+    type Error = TlsError;
+
+    fn make_tls_connect(&mut self, domain: &str) -> Result<Self::TlsConnect, Self::Error> {
+        let server_name = server_name(domain)?;
+        Ok(RustlsConnect {
+            connector: TlsConnector::from(Arc::clone(&self.config)),
+            server_name,
+        })
+    }
+}
+
+impl<S> TlsConnect<S> for RustlsConnect
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Stream = RustlsStream<S>;
+    type Error = io::Error;
+    type Future = RustlsConnectFuture<S>;
+
+    fn connect(self, stream: S) -> Self::Future {
+        RustlsConnectFuture(self.connector.connect(self.server_name, stream))
+    }
+}
+
+impl<S> Future for RustlsConnectFuture<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    type Output = io::Result<RustlsStream<S>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx).map_ok(RustlsStream)
+    }
+}
+
+impl<S> PgTlsStream for RustlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn channel_binding(&self) -> PgChannelBinding {
+        let (_, session) = self.0.get_ref();
+        match peer_end_point_digest(session) {
+            Some(digest) => PgChannelBinding::tls_server_end_point(digest),
+            None => PgChannelBinding::none(),
+        }
+    }
+}
+
+impl<S> AsyncRead for RustlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for RustlsStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+/// RFC 5929 `tls-server-end-point` digest of the leaf certificate presented by `session`.
+pub fn peer_end_point_digest(session: &ClientConnection) -> Option<Vec<u8>> {
+    session
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .and_then(|cert| server_end_point_digest(cert.as_ref()))
+}
+
 /// Hash of the peer's DER-encoded leaf certificate for RFC 5929 §4.1 `tls-server-end-point`
 /// SCRAM-SHA-256-PLUS channel binding. Returns `None` for certificates using pure signature
-/// algorithms (such as Ed25519) that define no hash function.
+/// algorithms (such as Ed25519) or malformed parameters that define no usable hash function.
 pub fn server_end_point_digest(cert_der: &[u8]) -> Option<Vec<u8>> {
     let cert = Certificate::from_der(cert_der).ok()?;
-    let algorithm = channel_binding_hash(cert.signature_algorithm.oid)?;
+    let algorithm = channel_binding_hash(&cert.signature_algorithm)?;
     Some(algorithm.digest(cert_der))
 }
 
@@ -230,10 +359,52 @@ impl ChannelBindingHash {
     }
 }
 
-/// Maps a certificate's signature algorithm OID to its RFC 5929 §4.1 channel-binding hash.
+/// RFC 4055 §3.1 `RSASSA-PSS-params`; all fields are optional explicit context-specific tags.
+struct RsaPssParams<'a> {
+    hash_algorithm: Option<AlgorithmIdentifierRef<'a>>,
+}
+
+impl<'a> DecodeValue<'a> for RsaPssParams<'a> {
+    fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> x509_cert::der::Result<Self> {
+        reader.read_nested(header.length, |reader| {
+            let hash_algorithm = decode_optional_explicit(reader, TagNumber::N0)?;
+            let _mask_gen: Option<AlgorithmIdentifierRef<'a>> =
+                decode_optional_explicit(reader, TagNumber::N1)?;
+            let _salt_length: Option<UintRef<'a>> =
+                decode_optional_explicit(reader, TagNumber::N2)?;
+            let _trailer_field: Option<UintRef<'a>> =
+                decode_optional_explicit(reader, TagNumber::N3)?;
+            Ok(Self { hash_algorithm })
+        })
+    }
+}
+
+impl FixedTag for RsaPssParams<'_> {
+    const TAG: Tag = Tag::Sequence;
+}
+
+/// Decodes an optional explicit context-specific field without skipping unexpected earlier tags.
+fn decode_optional_explicit<'a, R: Reader<'a>, T: Decode<'a>>(
+    reader: &mut R,
+    tag_number: TagNumber,
+) -> x509_cert::der::Result<Option<T>> {
+    let expected = Tag::ContextSpecific {
+        number: tag_number,
+        constructed: true,
+    };
+    if reader.is_finished() || reader.peek_tag()? != expected {
+        return Ok(None);
+    }
+    let field = ContextSpecific::<T>::decode(reader)?;
+    Ok(Some(field.value))
+}
+
+/// Maps a certificate's signature algorithm to its RFC 5929 §4.1 channel-binding hash.
 /// MD5 and SHA-1 are upgraded to SHA-256 per RFC 5929 §4.1.
-fn channel_binding_hash(oid: ObjectIdentifier) -> Option<ChannelBindingHash> {
-    match oid {
+fn channel_binding_hash(
+    signature_algorithm: &AlgorithmIdentifierOwned,
+) -> Option<ChannelBindingHash> {
+    match signature_algorithm.oid {
         ID_MD_5
         | MD_5_WITH_RSA_ENCRYPTION
         | ID_SHA_1
@@ -247,6 +418,25 @@ fn channel_binding_hash(oid: ObjectIdentifier) -> Option<ChannelBindingHash> {
         ID_SHA_512 | SHA_512_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_512 => {
             Some(ChannelBindingHash::Sha512)
         }
+        ID_RSASSA_PSS => {
+            let params = signature_algorithm
+                .parameters
+                .as_ref()?
+                .decode_as::<RsaPssParams<'_>>()
+                .ok()?;
+            // RFC 4055 §3.1 defaults omitted hashAlgorithm to SHA-1.
+            let hash_oid = params.hash_algorithm.map_or(ID_SHA_1, |alg| alg.oid);
+            digest_oid_to_channel_binding_hash(hash_oid)
+        }
+        _ => None,
+    }
+}
+
+fn digest_oid_to_channel_binding_hash(oid: ObjectIdentifier) -> Option<ChannelBindingHash> {
+    match oid {
+        ID_MD_5 | ID_SHA_1 | ID_SHA_256 => Some(ChannelBindingHash::Sha256),
+        ID_SHA_384 => Some(ChannelBindingHash::Sha384),
+        ID_SHA_512 => Some(ChannelBindingHash::Sha512),
         _ => None,
     }
 }
@@ -255,19 +445,21 @@ fn channel_binding_hash(oid: ObjectIdentifier) -> Option<ChannelBindingHash> {
 mod tests {
     use super::*;
     use crate::endpoint::ChannelBinding;
-    use x509_cert::der::Encode;
-    use x509_cert::der::asn1::BitString;
+    use tokio::io::DuplexStream;
+    use x509_cert::der::asn1::{BitString, Null};
+    use x509_cert::der::oid::db::rfc5912::{ID_MGF_1, ID_SHA_224};
     use x509_cert::der::oid::db::rfc8410::ID_ED_25519;
+    use x509_cert::der::{Any, Encode, TagMode};
     use x509_cert::name::Name;
     use x509_cert::serial_number::SerialNumber;
     use x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
     use x509_cert::time::{Time, Validity};
 
-    fn minimal_cert_der(sig_oid: ObjectIdentifier) -> Vec<u8> {
-        let alg = AlgorithmIdentifierOwned {
-            oid: sig_oid,
-            parameters: None,
-        };
+    fn sig_alg(oid: ObjectIdentifier, parameters: Option<Any>) -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned { oid, parameters }
+    }
+
+    fn minimal_cert_der_with_alg(alg: AlgorithmIdentifierOwned) -> Vec<u8> {
         let cert = Certificate {
             tbs_certificate: x509_cert::certificate::TbsCertificate {
                 version: x509_cert::certificate::Version::V3,
@@ -303,41 +495,87 @@ mod tests {
         cert.to_der().unwrap()
     }
 
+    fn minimal_cert_der(sig_oid: ObjectIdentifier) -> Vec<u8> {
+        minimal_cert_der_with_alg(sig_alg(sig_oid, None))
+    }
+
+    fn encode_sequence(body: &[u8]) -> Any {
+        let mut der = vec![0x30];
+        assert!(body.len() < 128, "test helper expects short-form DER");
+        der.push(u8::try_from(body.len()).unwrap());
+        der.extend_from_slice(body);
+        Any::from_der(&der).unwrap()
+    }
+
+    fn rsassa_pss_params(hash_oid: ObjectIdentifier, salt_len: u8) -> Any {
+        let hash_alg = sig_alg(hash_oid, Some(Any::from(Null)));
+        let hash_field = ContextSpecific {
+            tag_number: TagNumber::N0,
+            tag_mode: TagMode::Explicit,
+            value: hash_alg.clone(),
+        };
+        let mgf_alg = sig_alg(
+            ID_MGF_1,
+            Some(Any::from_der(&hash_alg.to_der().unwrap()).unwrap()),
+        );
+        let mgf_field = ContextSpecific {
+            tag_number: TagNumber::N1,
+            tag_mode: TagMode::Explicit,
+            value: mgf_alg,
+        };
+        let salt_field = ContextSpecific {
+            tag_number: TagNumber::N2,
+            tag_mode: TagMode::Explicit,
+            value: salt_len,
+        };
+        let trailer_field = ContextSpecific {
+            tag_number: TagNumber::N3,
+            tag_mode: TagMode::Explicit,
+            value: 1u8,
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&hash_field.to_der().unwrap());
+        body.extend_from_slice(&mgf_field.to_der().unwrap());
+        body.extend_from_slice(&salt_field.to_der().unwrap());
+        body.extend_from_slice(&trailer_field.to_der().unwrap());
+        encode_sequence(&body)
+    }
+
     #[test]
     fn rfc_5929_maps_sha256_sha384_sha512_and_upgrades_sha1_and_md5_to_sha256() {
         assert_eq!(
-            channel_binding_hash(SHA_256_WITH_RSA_ENCRYPTION),
+            channel_binding_hash(&sig_alg(SHA_256_WITH_RSA_ENCRYPTION, None)),
             Some(ChannelBindingHash::Sha256)
         );
         assert_eq!(
-            channel_binding_hash(ECDSA_WITH_SHA_256),
+            channel_binding_hash(&sig_alg(ECDSA_WITH_SHA_256, None)),
             Some(ChannelBindingHash::Sha256)
         );
         assert_eq!(
-            channel_binding_hash(SHA_1_WITH_RSA_ENCRYPTION),
+            channel_binding_hash(&sig_alg(SHA_1_WITH_RSA_ENCRYPTION, None)),
             Some(ChannelBindingHash::Sha256)
         );
         assert_eq!(
-            channel_binding_hash(MD_5_WITH_RSA_ENCRYPTION),
+            channel_binding_hash(&sig_alg(MD_5_WITH_RSA_ENCRYPTION, None)),
             Some(ChannelBindingHash::Sha256)
         );
         assert_eq!(
-            channel_binding_hash(SHA_384_WITH_RSA_ENCRYPTION),
+            channel_binding_hash(&sig_alg(SHA_384_WITH_RSA_ENCRYPTION, None)),
             Some(ChannelBindingHash::Sha384)
         );
         assert_eq!(
-            channel_binding_hash(ECDSA_WITH_SHA_384),
+            channel_binding_hash(&sig_alg(ECDSA_WITH_SHA_384, None)),
             Some(ChannelBindingHash::Sha384)
         );
         assert_eq!(
-            channel_binding_hash(SHA_512_WITH_RSA_ENCRYPTION),
+            channel_binding_hash(&sig_alg(SHA_512_WITH_RSA_ENCRYPTION, None)),
             Some(ChannelBindingHash::Sha512)
         );
         assert_eq!(
-            channel_binding_hash(ECDSA_WITH_SHA_512),
+            channel_binding_hash(&sig_alg(ECDSA_WITH_SHA_512, None)),
             Some(ChannelBindingHash::Sha512)
         );
-        assert_eq!(channel_binding_hash(ID_ED_25519), None);
+        assert_eq!(channel_binding_hash(&sig_alg(ID_ED_25519, None)), None);
     }
 
     #[test]
@@ -366,9 +604,127 @@ mod tests {
             Sha512::digest(&sha512_der).to_vec()
         );
 
+        let ec512_der = minimal_cert_der(ECDSA_WITH_SHA_512);
+        assert_eq!(
+            server_end_point_digest(&ec512_der).unwrap(),
+            Sha512::digest(&ec512_der).to_vec()
+        );
+
         let ed25519_der = minimal_cert_der(ID_ED_25519);
         assert_eq!(server_end_point_digest(&ed25519_der), None);
         assert_eq!(server_end_point_digest(b"not-a-der-cert"), None);
+    }
+
+    #[test]
+    fn server_end_point_digest_uses_the_hash_from_rsassa_pss_parameters() {
+        let pss_sha256 = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(ID_SHA_256, 32)),
+        ));
+        assert_eq!(
+            server_end_point_digest(&pss_sha256).unwrap(),
+            Sha256::digest(&pss_sha256).to_vec()
+        );
+
+        let pss_sha384 = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(ID_SHA_384, 48)),
+        ));
+        assert_eq!(
+            server_end_point_digest(&pss_sha384).unwrap(),
+            Sha384::digest(&pss_sha384).to_vec()
+        );
+
+        let pss_sha512 = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(ID_SHA_512, 64)),
+        ));
+        assert_eq!(
+            server_end_point_digest(&pss_sha512).unwrap(),
+            Sha512::digest(&pss_sha512).to_vec()
+        );
+
+        let pss_sha1 = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(ID_SHA_1, 20)),
+        ));
+        assert_eq!(
+            server_end_point_digest(&pss_sha1).unwrap(),
+            Sha256::digest(&pss_sha1).to_vec()
+        );
+
+        let pss_default_empty_seq =
+            minimal_cert_der_with_alg(sig_alg(ID_RSASSA_PSS, Some(encode_sequence(&[]))));
+        assert_eq!(
+            server_end_point_digest(&pss_default_empty_seq).unwrap(),
+            Sha256::digest(&pss_default_empty_seq).to_vec()
+        );
+    }
+
+    #[test]
+    fn rsassa_pss_with_missing_malformed_or_unsupported_parameters_returns_none() {
+        let missing_params = minimal_cert_der_with_alg(sig_alg(ID_RSASSA_PSS, None));
+        assert_eq!(server_end_point_digest(&missing_params), None);
+
+        let null_params = minimal_cert_der_with_alg(sig_alg(ID_RSASSA_PSS, Some(Any::from(Null))));
+        assert_eq!(server_end_point_digest(&null_params), None);
+
+        let sha224_params = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(ID_SHA_224, 28)),
+        ));
+        assert_eq!(server_end_point_digest(&sha224_params), None);
+
+        let non_digest_oid = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(rsassa_pss_params(SHA_256_WITH_RSA_ENCRYPTION, 32)),
+        ));
+        assert_eq!(server_end_point_digest(&non_digest_oid), None);
+
+        let first = ContextSpecific {
+            tag_number: TagNumber::N0,
+            tag_mode: TagMode::Explicit,
+            value: sig_alg(ID_SHA_256, None),
+        };
+        let second = ContextSpecific {
+            tag_number: TagNumber::N0,
+            tag_mode: TagMode::Explicit,
+            value: sig_alg(ID_SHA_512, None),
+        };
+        let mut duplicate_body = first.to_der().unwrap();
+        duplicate_body.extend_from_slice(&second.to_der().unwrap());
+        let duplicate_tag = minimal_cert_der_with_alg(sig_alg(
+            ID_RSASSA_PSS,
+            Some(encode_sequence(&duplicate_body)),
+        ));
+        assert_eq!(server_end_point_digest(&duplicate_tag), None);
+    }
+
+    #[test]
+    fn make_rustls_connect_accepts_valid_hostnames_and_refuses_invalid_ones() {
+        let config = client_config(&TrustRoot::System).unwrap();
+        let mut connector = MakeRustlsConnect::new(config);
+        assert!(
+            <MakeRustlsConnect as MakeTlsConnect<DuplexStream>>::make_tls_connect(
+                &mut connector,
+                "localhost",
+            )
+            .is_ok()
+        );
+        assert!(
+            <MakeRustlsConnect as MakeTlsConnect<DuplexStream>>::make_tls_connect(
+                &mut connector,
+                "127.0.0.1",
+            )
+            .is_ok()
+        );
+        assert!(
+            <MakeRustlsConnect as MakeTlsConnect<DuplexStream>>::make_tls_connect(
+                &mut connector,
+                "",
+            )
+            .is_err()
+        );
     }
 
     #[test]

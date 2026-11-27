@@ -648,7 +648,7 @@ async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, St
                 // Always Require (never Prefer), so tokio-postgres can never downgrade to plaintext.
                 config.ssl_mode(SslMode::Require);
                 let tls_config = tls::client_config(trust_root).map_err(|err| err.to_string())?;
-                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
+                let tls = tls::MakeRustlsConnect::new(tls_config);
                 let (client, connection) = config
                     .connect(tls)
                     .await

@@ -386,12 +386,7 @@ async fn negotiate_upstream_tls(
         .map_err(|err| {
             UpstreamRefusal::Failed(tls::describe_tls_io_error(&access.endpoint, &err))
         })?;
-    let digest = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .and_then(|cert| tls::server_end_point_digest(cert.as_ref()));
+    let digest = tls::peer_end_point_digest(tls_stream.get_ref().1);
     Ok((Either::Right(Box::new(tls_stream)), digest))
 }
 
