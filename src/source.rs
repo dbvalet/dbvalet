@@ -77,6 +77,8 @@ pub enum SourceError {
         quoted: String,
         version: String,
     },
+    #[error("refusing group role `{member_of}`: {reason}")]
+    DangerousRole { member_of: String, reason: String },
     #[error("couldn't create a temporary login: {reason}")]
     CreateLogin { reason: String },
     #[error(
