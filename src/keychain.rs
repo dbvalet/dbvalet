@@ -23,7 +23,7 @@ const KEYCHAIN_SERVICE: &str = "dbvalet";
 const DEFAULT_PORT: u16 = 5432;
 /// In a debug build only, `1` keeps admin logins in memory for one process, so the CLI tests
 /// never reach the OS keychain. A release build doesn't contain the code that reads it.
-#[cfg(any(debug_assertions, test))]
+#[cfg(debug_assertions)]
 const TEST_KEYCHAIN_VAR: &str = "DBVALET_TEST_KEYCHAIN";
 
 #[cfg(target_os = "linux")]
@@ -132,18 +132,12 @@ fn entry(alias: &DatabaseAlias) -> Result<Entry, KeychainError> {
 
 #[cfg(any(debug_assertions, test))]
 fn use_test_keychain() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(TEST_KEYCHAIN_VAR).is_some_and(|value| value == "1") {
+        return true;
+    }
     // Unit tests always get the test store, so none can reach the developer's keychain.
-    cfg!(test) || test_keychain_requested()
-}
-
-#[cfg(debug_assertions)]
-fn test_keychain_requested() -> bool {
-    std::env::var_os(TEST_KEYCHAIN_VAR).is_some_and(|value| value == "1")
-}
-
-#[cfg(all(test, not(debug_assertions)))]
-fn test_keychain_requested() -> bool {
-    false
+    cfg!(test)
 }
 
 // Entry's logging formats the mock's raw secret, so use the credential API directly.
@@ -983,13 +977,5 @@ mod tests {
             login.password().expose_secret() == PASSWORD,
             "stored password did not round-trip"
         );
-    }
-
-    #[test]
-    #[cfg(not(debug_assertions))]
-    #[ignore = "CI runs this in a release build, with DBVALET_TEST_KEYCHAIN=1"]
-    fn a_release_build_ignores_the_test_keychain() {
-        assert_eq!(std::env::var(TEST_KEYCHAIN_VAR).as_deref(), Ok("1"));
-        assert!(!test_keychain_requested());
     }
 }

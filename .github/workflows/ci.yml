@@ -33,20 +33,14 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - name: A release build ignores the test-only lease minute and keychain
+      - name: A release build ignores the test-only lease minute
         run: cargo test --locked --release --lib a_release_build -- --ignored
         env:
           DBVALET_TEST_MINUTE_MS: "1"
-          DBVALET_TEST_KEYCHAIN: "1"
       - name: The release binary contains no test keychain switch
         run: |
           cargo build --locked --release --bin dbvalet
-          python3 - <<'PY'
-          from pathlib import Path
-
-          if b"DBVALET_TEST_KEYCHAIN" in Path("target/release/dbvalet").read_bytes():
-              raise SystemExit("The release binary contains the test keychain switch")
-          PY
+          if grep -aq DBVALET_TEST_KEYCHAIN target/release/dbvalet; then exit 1; fi
 
   e2e:
     name: e2e (PostgreSQL ${{ matrix.postgres }})
