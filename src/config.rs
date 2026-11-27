@@ -2,13 +2,16 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::DatabaseAlias;
 
 pub const FILE_NAME: &str = "dbvalet.toml";
+const SECONDS_PER_MINUTE: u64 = 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,7 +22,16 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabasePolicy {
+    #[serde(default)]
+    pub(crate) max_ttl_minutes: Option<NonZeroU64>,
     pub(crate) roles: BTreeMap<String, RoleGrant>,
+}
+
+impl DatabasePolicy {
+    pub fn max_ttl(&self) -> Option<Duration> {
+        self.max_ttl_minutes
+            .map(|minutes| Duration::from_secs(minutes.get().saturating_mul(SECONDS_PER_MINUTE)))
+    }
 }
 
 /// The group role a temporary login joins, and whether its transactions default to read-only.
@@ -126,5 +138,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("database alias"), "{err}");
+    }
+
+    #[test]
+    fn a_database_with_max_ttl_minutes_is_parsed() {
+        let config = parse(
+            r#"
+            [databases.app]
+            max_ttl_minutes = 480
+
+            [databases.app.roles]
+            reader = { member_of = "dbvalet_reader", read_only = true }
+            "#,
+        )
+        .unwrap();
+        let app: DatabaseAlias = "app".parse().unwrap();
+        assert_eq!(
+            config.databases[&app].max_ttl(),
+            Some(std::time::Duration::from_secs(480 * 60))
+        );
+    }
+
+    #[test]
+    fn a_zero_max_ttl_minutes_is_refused() {
+        let err = parse(
+            r#"
+            [databases.app]
+            max_ttl_minutes = 0
+
+            [databases.app.roles]
+            reader = { member_of = "dbvalet_reader", read_only = true }
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("nonzero"), "{err}");
     }
 }
