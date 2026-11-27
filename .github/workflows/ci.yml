@@ -82,11 +82,14 @@ jobs:
           rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Run the e2e tests against the real Secret Service
+        env:
+          POSTGRES_MAJOR: ${{ matrix.postgres }}
         # The keyring password is a throwaway for this runner's empty login keyring.
         run: >-
           dbus-run-session -- sh -c
           'printf e2e-throwaway | gnome-keyring-daemon --unlock --components=secrets >/dev/null
-          && cargo test --locked --test e2e -- --ignored'
+          && cargo test --locked --test e2e -- --ignored
+          && bash tests/run-tls-e2e.sh "$POSTGRES_MAJOR"'
 
   e2e-pg14:
     name: e2e (PostgreSQL 14 refusal)

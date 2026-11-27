@@ -18,9 +18,10 @@ use super::{
     UpstreamLogin,
 };
 use crate::config::RoleGrant;
-use crate::endpoint::Tls;
+use crate::endpoint::{ChannelBinding, Endpoint, Tls, TrustRoot};
 use crate::keychain::{self, AdminLogin};
 use crate::ledger::{self, State};
+use crate::tls;
 use crate::{DatabaseAlias, LOGIN_PREFIX, RUN_ID_BYTES, is_login_name, random_base32};
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
@@ -228,7 +229,7 @@ impl CredentialSource for DirectSource {
             active_push,
         };
         Ok(MintOutcome::Created(Lease::start(
-            UpstreamLogin { user, password },
+            UpstreamLogin::new(user, password),
             valid_until.trim_matches('\'').to_owned(),
             live,
             clock,
@@ -379,6 +380,7 @@ struct ActivePushState {
 struct InFlightPush {
     id: u64,
     cancel_token: CancelToken,
+    cancel_tls: Option<tls::MakeRustlsConnect>,
     done: watch::Receiver<bool>,
 }
 
@@ -412,7 +414,11 @@ impl Drop for PushGuard {
 }
 
 impl ActivePush {
-    fn begin(self: &Arc<Self>, cancel_token: CancelToken) -> Option<PushGuard> {
+    fn begin(
+        self: &Arc<Self>,
+        cancel_token: CancelToken,
+        cancel_tls: Option<tls::MakeRustlsConnect>,
+    ) -> Option<PushGuard> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
             return None;
@@ -422,6 +428,7 @@ impl ActivePush {
         state.in_flight = Some(InFlightPush {
             id,
             cancel_token,
+            cancel_tls,
             done: done_rx,
         });
         Some(PushGuard {
@@ -467,11 +474,13 @@ async fn cancel_and_wait(mut in_flight: InFlightPush) {
         if remaining.is_zero() {
             return;
         }
-        let _ = tokio::time::timeout(
-            remaining.min(Duration::from_secs(2)),
-            in_flight.cancel_token.cancel_query(NoTls),
-        )
-        .await;
+        let cancel = async {
+            match in_flight.cancel_tls.clone() {
+                Some(tls) => in_flight.cancel_token.cancel_query(tls).await,
+                None => in_flight.cancel_token.cancel_query(NoTls).await,
+            }
+        };
+        let _ = tokio::time::timeout(remaining.min(Duration::from_secs(2)), cancel).await;
         let wait = remaining.min(Duration::from_millis(200));
         if tokio::time::timeout(wait, in_flight.done.changed())
             .await
@@ -511,11 +520,13 @@ pub(super) async fn push_expiry(
         login: user.to_owned(),
         reason,
     };
-    let client = connect(alias, admin).await.map_err(|reason| {
-        push_failed(format!(
-            "can't connect as the admin login for `{alias}`: {reason}"
-        ))
-    })?;
+    let (client, cancel_tls) = connect_with_cancel_tls(alias, admin)
+        .await
+        .map_err(|reason| {
+            push_failed(format!(
+                "can't connect as the admin login for `{alias}`: {reason}"
+            ))
+        })?;
     let sql_failed = |err: tokio_postgres::Error| push_failed(describe_sql_error(&err));
     let row = client
         .query_one(
@@ -542,7 +553,7 @@ pub(super) async fn push_expiry(
     let valid_until = timestamp_literal(&client, expiry)
         .await
         .map_err(sql_failed)?;
-    let Some(guard) = active_push.begin(client.cancel_token()) else {
+    let Some(guard) = active_push.begin(client.cancel_token(), cancel_tls) else {
         // Teardown already closed pushes; leave the rest to teardown.
         return Ok(PushOutcome::ReachedMaxTtl);
     };
@@ -855,6 +866,7 @@ pub async fn doctor(
         "`{user}` connects to {}",
         admin.endpoint()
     )));
+    checks.push(tls_check(admin.endpoint()));
 
     match read_rights(&client).await {
         Ok(rights) => {
@@ -1039,6 +1051,19 @@ async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
     })
 }
 
+fn tls_check(endpoint: &Endpoint) -> Check {
+    match endpoint.tls() {
+        Tls::VerifyFull(TrustRoot::System) => {
+            Check::passed("TLS verify-full using the OS trust store".to_owned())
+        }
+        Tls::VerifyFull(TrustRoot::PemFile(path)) => Check::passed(format!(
+            "TLS verify-full using sslrootcert `{}`",
+            path.display()
+        )),
+        Tls::Plaintext => Check::passed("plaintext on localhost (--allow-plaintext)".to_owned()),
+    }
+}
+
 fn version_check(rights: &Rights) -> Check {
     let version = &rights.server_version;
     if rights.server_version_num >= MINIMUM_SERVER_VERSION_NUM {
@@ -1137,12 +1162,16 @@ fn describe_sql_error(err: &tokio_postgres::Error) -> String {
 }
 
 async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, String> {
+    connect_with_cancel_tls(alias, admin)
+        .await
+        .map(|(client, _)| client)
+}
+
+async fn connect_with_cancel_tls(
+    alias: &DatabaseAlias,
+    admin: &AdminLogin,
+) -> Result<(Client, Option<tls::MakeRustlsConnect>), String> {
     let endpoint = admin.endpoint();
-    if endpoint.tls() == Tls::VerifyFull {
-        return Err("TLS connections aren't supported yet: \
-                    use --allow-plaintext with a database on localhost"
-            .to_owned());
-    }
     let mut config = tokio_postgres::Config::new();
     config
         .host(endpoint.host())
@@ -1150,18 +1179,40 @@ async fn connect(alias: &DatabaseAlias, admin: &AdminLogin) -> Result<Client, St
         .dbname(endpoint.database())
         .user(admin.user())
         .password(admin.password().expose_secret())
-        .ssl_mode(SslMode::Disable);
+        .channel_binding(match endpoint.channel_binding() {
+            ChannelBinding::Disable => tokio_postgres::config::ChannelBinding::Disable,
+            ChannelBinding::Prefer => tokio_postgres::config::ChannelBinding::Prefer,
+            ChannelBinding::Require => tokio_postgres::config::ChannelBinding::Require,
+        });
     let connecting = async {
-        let (client, connection) = config
-            .connect(NoTls)
-            .await
-            .map_err(|err| describe_connect_error(alias, admin, &err))?;
-        tokio::spawn(connection);
+        let (client, cancel_tls) = match endpoint.tls() {
+            Tls::Plaintext => {
+                config.ssl_mode(SslMode::Disable);
+                let (client, connection) = config
+                    .connect(NoTls)
+                    .await
+                    .map_err(|err| describe_connect_error(alias, admin, &err))?;
+                tokio::spawn(connection);
+                (client, None)
+            }
+            Tls::VerifyFull(trust_root) => {
+                // Always Require (never Prefer), so tokio-postgres can never downgrade to plaintext.
+                config.ssl_mode(SslMode::Require);
+                let tls_config = tls::client_config(trust_root).map_err(|err| err.to_string())?;
+                let tls = tls::MakeRustlsConnect::new(tls_config);
+                let (client, connection) = config
+                    .connect(tls.clone())
+                    .await
+                    .map_err(|err| describe_connect_error(alias, admin, &err))?;
+                tokio::spawn(connection);
+                (client, Some(tls))
+            }
+        };
         client
             .batch_execute(&format!("SET lock_timeout = '{ADMIN_LOCK_TIMEOUT}'"))
             .await
             .map_err(|err| describe_sql_error(&err))?;
-        Ok(client)
+        Ok((client, cancel_tls))
     };
     tokio::time::timeout(ADMIN_CONNECT_TIMEOUT, connecting)
         .await
@@ -1182,6 +1233,9 @@ fn describe_connect_error(
 ) -> String {
     if let Some(db) = err.as_db_error() {
         return describe_db_connect_error(alias, admin.user(), db.code(), db.message());
+    }
+    if let Some(tls_reason) = tls::describe_error_chain(admin.endpoint(), err) {
+        return tls_reason;
     }
     if let Some(io_err) = find_io_error(err) {
         return format!(
@@ -1627,6 +1681,43 @@ mod tests {
         assert!(
             sql.contains("DROP ROLE \"dbvalet_aaaaaaaaaaaaaaaa\";"),
             "{sql}"
+        );
+    }
+
+    #[test]
+    fn doctor_tls_check_names_the_tls_state_and_trust_root() {
+        let system =
+            Endpoint::new("db.example.com".to_owned(), 5432, "app".to_owned(), false).unwrap();
+        let system_check = tls_check(&system);
+        assert!(system_check.passed);
+        assert_eq!(
+            system_check.message,
+            "TLS verify-full using the OS trust store"
+        );
+
+        let custom = Endpoint::with_tls_options(
+            "db.example.com".to_owned(),
+            5432,
+            "app".to_owned(),
+            false,
+            TrustRoot::PemFile(std::path::PathBuf::from("/etc/ssl/rds-ca.pem")),
+            ChannelBinding::Prefer,
+        )
+        .unwrap();
+        let custom_check = tls_check(&custom);
+        assert!(custom_check.passed);
+        assert_eq!(
+            custom_check.message,
+            "TLS verify-full using sslrootcert `/etc/ssl/rds-ca.pem`"
+        );
+
+        let plaintext =
+            Endpoint::new("localhost".to_owned(), 5432, "postgres".to_owned(), true).unwrap();
+        let plaintext_check = tls_check(&plaintext);
+        assert!(plaintext_check.passed);
+        assert_eq!(
+            plaintext_check.message,
+            "plaintext on localhost (--allow-plaintext)"
         );
     }
 

@@ -11,18 +11,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
-use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
+use fallible_iterator::FallibleIterator;
+use postgres_protocol::authentication::sasl::{self, ChannelBinding, ScramSha256};
 use postgres_protocol::message::{backend, frontend};
+use rustls_pki_types::ServerName;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_util::either::Either;
 
-use crate::endpoint::{Endpoint, Tls};
+use crate::endpoint::{ChannelBinding as ChannelBindingMode, Endpoint, Tls};
 use crate::runlog::{MAX_LOGGED_QUERY_BYTES, ObservedSql, RunLog, StatementKind};
 use crate::source::{AccessDeadline, UpstreamLogin};
+use crate::tls::{self, TlsError};
 
 /// PostgreSQL refuses longer startup packets too.
 const MAX_STARTUP_PACKET_LEN: usize = 10_000;
@@ -46,7 +52,6 @@ const AUTHENTICATION_OK: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
 const AUTHENTICATION_CLEARTEXT_PASSWORD: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 const PASSWORD_MESSAGE_TAG: u8 = b'p';
 const ERROR_RESPONSE_TAG: u8 = b'E';
-const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 const INVALID_PASSWORD_SQLSTATE: &str = "28P01";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 
@@ -59,19 +64,22 @@ pub struct Proxy {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error(
-        "TLS connections to the database aren't supported yet: \
-         use --allow-plaintext with a database on localhost"
-    )]
-    TlsNotSupported,
+    #[error(transparent)]
+    Tls(#[from] TlsError),
     #[error("couldn't listen on 127.0.0.1")]
     Listen(#[source] io::Error),
+}
+
+struct UpstreamTls {
+    connector: TlsConnector,
+    server_name: ServerName<'static>,
 }
 
 /// What every client connection is checked against and relayed as.
 struct Access {
     token: SecretString,
     endpoint: Endpoint,
+    tls: Option<UpstreamTls>,
     login: UpstreamLogin,
     sql_log: Option<RunLog>,
     deadline: AccessDeadline,
@@ -85,9 +93,17 @@ pub async fn start(
     sql_log: Option<RunLog>,
     deadline: AccessDeadline,
 ) -> Result<Proxy, ProxyError> {
-    if endpoint.tls() != Tls::Plaintext {
-        return Err(ProxyError::TlsNotSupported);
-    }
+    let tls = match endpoint.tls() {
+        Tls::Plaintext => None,
+        Tls::VerifyFull(trust_root) => {
+            let config = tls::client_config(trust_root)?;
+            let server_name = tls::server_name(endpoint.host())?;
+            Some(UpstreamTls {
+                connector: TlsConnector::from(Arc::new(config)),
+                server_name,
+            })
+        }
+    };
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(ProxyError::Listen)?;
@@ -95,6 +111,7 @@ pub async fn start(
     let access = Arc::new(Access {
         token,
         endpoint,
+        tls,
         login,
         sql_log,
         deadline,
@@ -178,15 +195,7 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
     client.write_all(&unread).await?;
     match &access.sql_log {
         Some(log) => {
-            relay_with_log(
-                client,
-                &mut server,
-                &access.deadline,
-                &parameters,
-                &unread,
-                log,
-            )
-            .await?;
+            relay_with_log(client, server, &access.deadline, &parameters, &unread, log).await?;
         }
         None => {
             let mut client = LeaseStream {
@@ -241,16 +250,16 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LeaseStream<T> {
     }
 }
 
-async fn relay_with_log(
+async fn relay_with_log<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut TcpStream,
-    server: &mut TcpStream,
+    server: S,
     deadline: &AccessDeadline,
     startup_parameters: &[(String, String)],
     initial_server_bytes: &[u8],
     sql_log: &RunLog,
 ) -> io::Result<()> {
     let (mut client_read, client_write) = client.split();
-    let (mut server_read, server_write) = server.split();
+    let (mut server_read, server_write) = tokio::io::split(server);
     let mut client_write = LeaseStream {
         socket: client_write,
         deadline: deadline.clone(),
@@ -281,6 +290,7 @@ async fn relay_with_log(
                 sql_log.statement(kind, sql);
             });
             server_write.write_all(&buf[..n]).await?;
+            server_write.flush().await?;
         }
     };
 
@@ -764,21 +774,24 @@ enum UpstreamRefusal {
     Failed(String),
 }
 
+type UpstreamStream = Either<TcpStream, Box<TlsStream<TcpStream>>>;
+
 /// Starts an upstream session as the temporary login with the client's parameters, except
 /// `user` and `database`. Returns it after `AuthenticationOk`, with the bytes read past it.
 async fn connect_upstream(
     access: &Access,
     client_parameters: &[(String, String)],
-) -> Result<(TcpStream, BytesMut), UpstreamRefusal> {
+) -> Result<(UpstreamStream, BytesMut), UpstreamRefusal> {
     let endpoint = &access.endpoint;
     let login = &access.login;
-    let mut server = TcpStream::connect((endpoint.host(), endpoint.port()))
+    let tcp = TcpStream::connect((endpoint.host(), endpoint.port()))
         .await
         .map_err(|err| {
             UpstreamRefusal::Failed(format!(
                 "dbvalet couldn't reach the database at {endpoint}: {err}"
             ))
         })?;
+    let (mut server, peer_cert_digest) = negotiate_upstream_tls(tcp, access).await?;
     let parameters = client_parameters
         .iter()
         .filter(|(name, _)| name != "user" && name != "database")
@@ -787,6 +800,7 @@ async fn connect_upstream(
     let mut out = BytesMut::new();
     frontend::startup_message(parameters, &mut out).map_err(failed)?;
     server.write_all(&out).await.map_err(failed)?;
+    server.flush().await.map_err(failed)?;
 
     let mut unread = BytesMut::new();
     let mut scram: Option<ScramSha256> = None;
@@ -794,12 +808,15 @@ async fn connect_upstream(
     loop {
         out.clear();
         match read_backend_message(&mut server, &mut unread).await? {
-            backend::Message::AuthenticationSasl(_) if scram.is_none() => {
-                let started = ScramSha256::new(
-                    login.password().expose_secret().as_bytes(),
-                    ChannelBinding::unsupported(),
-                );
-                frontend::sasl_initial_response(SCRAM_SHA_256, started.message(), &mut out)
+            backend::Message::AuthenticationSasl(body) if scram.is_none() => {
+                let (mechanism, binding) = choose_sasl_mechanism(
+                    body,
+                    endpoint.channel_binding(),
+                    peer_cert_digest.as_deref(),
+                )?;
+                let started =
+                    ScramSha256::new(login.password().expose_secret().as_bytes(), binding);
+                frontend::sasl_initial_response(mechanism, started.message(), &mut out)
                     .map_err(failed)?;
                 scram = Some(started);
             }
@@ -814,6 +831,13 @@ async fn connect_upstream(
                 server_verified = true;
             }
             backend::Message::AuthenticationOk if scram.is_none() || server_verified => {
+                if scram.is_none() && endpoint.channel_binding() == ChannelBindingMode::Require {
+                    return Err(UpstreamRefusal::Failed(
+                        "the database didn't complete SCRAM-SHA-256-PLUS channel binding, \
+                         which channel_binding=require needs"
+                            .to_owned(),
+                    ));
+                }
                 return Ok((server, unread));
             }
             backend::Message::AuthenticationSasl(_) | backend::Message::AuthenticationOk => {
@@ -826,11 +850,95 @@ async fn connect_upstream(
             }
         }
         server.write_all(&out).await.map_err(failed)?;
+        server.flush().await.map_err(failed)?;
     }
 }
 
+/// Runs PostgreSQL `SSLRequest` and the rustls `verify-full` handshake when TLS is enabled,
+/// returning the stream and any RFC 5929 `tls-server-end-point` peer certificate digest.
+async fn negotiate_upstream_tls(
+    mut tcp: TcpStream,
+    access: &Access,
+) -> Result<(UpstreamStream, Option<Vec<u8>>), UpstreamRefusal> {
+    let Some(tls) = &access.tls else {
+        return Ok((Either::Left(tcp), None));
+    };
+    let mut request = BytesMut::with_capacity(ENCRYPTION_REQUEST_LEN);
+    frontend::ssl_request(&mut request);
+    tcp.write_all(&request).await.map_err(failed)?;
+    let mut reply = [0u8; 1];
+    tcp.read_exact(&mut reply).await.map_err(failed)?;
+    match reply[0] {
+        b'S' => {}
+        b'N' => {
+            return Err(UpstreamRefusal::Failed(tls::describe_tls_refused(
+                &access.endpoint,
+            )));
+        }
+        _ => {
+            return Err(UpstreamRefusal::Failed(
+                "the database sent an unexpected reply to SSLRequest".to_owned(),
+            ));
+        }
+    }
+    let tls_stream = tls
+        .connector
+        .connect(tls.server_name.clone(), tcp)
+        .await
+        .map_err(|err| {
+            UpstreamRefusal::Failed(tls::describe_tls_io_error(&access.endpoint, &err))
+        })?;
+    let digest = tls::peer_end_point_digest(tls_stream.get_ref().1);
+    Ok((Either::Right(Box::new(tls_stream)), digest))
+}
+
+fn choose_sasl_mechanism(
+    body: backend::AuthenticationSaslBody,
+    mode: ChannelBindingMode,
+    peer_cert_digest: Option<&[u8]>,
+) -> Result<(&'static str, ChannelBinding), UpstreamRefusal> {
+    let mut offered = Vec::new();
+    let mut mechanisms = body.mechanisms();
+    while let Some(mechanism) = mechanisms.next().map_err(failed)? {
+        offered.push(mechanism);
+    }
+    select_sasl_mechanism(&offered, mode, peer_cert_digest)
+}
+
+fn select_sasl_mechanism(
+    offered: &[&str],
+    mode: ChannelBindingMode,
+    peer_cert_digest: Option<&[u8]>,
+) -> Result<(&'static str, ChannelBinding), UpstreamRefusal> {
+    let has_scram = offered.contains(&sasl::SCRAM_SHA_256);
+    let has_scram_plus = offered.contains(&sasl::SCRAM_SHA_256_PLUS);
+    let usable_digest = match mode {
+        ChannelBindingMode::Disable => None,
+        ChannelBindingMode::Prefer | ChannelBindingMode::Require => peer_cert_digest,
+    };
+    if has_scram_plus && let Some(digest) = usable_digest {
+        return Ok((
+            sasl::SCRAM_SHA_256_PLUS,
+            ChannelBinding::tls_server_end_point(digest.to_vec()),
+        ));
+    }
+    if mode == ChannelBindingMode::Require {
+        return Err(UpstreamRefusal::Failed(
+            "the database didn't complete SCRAM-SHA-256-PLUS channel binding, \
+             which channel_binding=require needs"
+                .to_owned(),
+        ));
+    }
+    if has_scram {
+        return Ok((sasl::SCRAM_SHA_256, ChannelBinding::unsupported()));
+    }
+    Err(UpstreamRefusal::Failed(
+        "the database didn't offer SCRAM-SHA-256 or SCRAM-SHA-256-PLUS authentication".to_owned(),
+    ))
+}
+
 async fn read_backend_message(
-    server: &mut TcpStream,
+    server: &mut UpstreamStream,
     unread: &mut BytesMut,
 ) -> Result<backend::Message, UpstreamRefusal> {
     loop {
@@ -962,6 +1070,87 @@ mod tests {
             &token
         ));
         assert!(!token_matches(&b"\0".to_vec().into(), &token));
+    }
+
+    #[test]
+    fn sasl_selection_uses_scram_plus_when_offered_with_a_peer_cert_digest() {
+        let (mechanism, binding) = select_sasl_mechanism(
+            &[sasl::SCRAM_SHA_256, sasl::SCRAM_SHA_256_PLUS],
+            ChannelBindingMode::Prefer,
+            Some(&[0xAB; 32]),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(mechanism, sasl::SCRAM_SHA_256_PLUS);
+        let msg = ScramSha256::new(b"pw", binding);
+        assert!(msg.message().starts_with(b"p=tls-server-end-point,,"));
+    }
+
+    #[test]
+    fn sasl_selection_falls_back_to_scram_sha_256_when_channel_binding_is_unavailable_or_disabled()
+    {
+        let (mechanism, binding) = select_sasl_mechanism(
+            &[sasl::SCRAM_SHA_256, sasl::SCRAM_SHA_256_PLUS],
+            ChannelBindingMode::Prefer,
+            None,
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(mechanism, sasl::SCRAM_SHA_256);
+        assert!(
+            ScramSha256::new(b"pw", binding)
+                .message()
+                .starts_with(b"n,,")
+        );
+
+        let (mechanism, binding) = select_sasl_mechanism(
+            &[sasl::SCRAM_SHA_256, sasl::SCRAM_SHA_256_PLUS],
+            ChannelBindingMode::Disable,
+            Some(&[0xAB; 32]),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(mechanism, sasl::SCRAM_SHA_256);
+        assert!(
+            ScramSha256::new(b"pw", binding)
+                .message()
+                .starts_with(b"n,,")
+        );
+
+        let (mechanism, binding) = select_sasl_mechanism(
+            &[sasl::SCRAM_SHA_256],
+            ChannelBindingMode::Prefer,
+            Some(&[0xAB; 32]),
+        )
+        .ok()
+        .unwrap();
+        assert_eq!(mechanism, sasl::SCRAM_SHA_256);
+        assert!(
+            ScramSha256::new(b"pw", binding)
+                .message()
+                .starts_with(b"n,,")
+        );
+    }
+
+    #[test]
+    fn sasl_selection_refuses_missing_channel_binding_when_required_and_unknown_mechanisms() {
+        assert!(
+            select_sasl_mechanism(
+                &[sasl::SCRAM_SHA_256],
+                ChannelBindingMode::Require,
+                Some(&[0xAB; 32]),
+            )
+            .is_err()
+        );
+        assert!(
+            select_sasl_mechanism(
+                &[sasl::SCRAM_SHA_256, sasl::SCRAM_SHA_256_PLUS],
+                ChannelBindingMode::Require,
+                None,
+            )
+            .is_err()
+        );
+        assert!(select_sasl_mechanism(&["GSSAPI"], ChannelBindingMode::Prefer, None).is_err());
     }
 
     fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
