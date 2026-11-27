@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::iter::Peekable;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::CharIndices;
 use std::sync::Arc;
 
@@ -11,7 +11,8 @@ use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 use crate::DatabaseAlias;
-use crate::endpoint::{self, ChannelBinding, Endpoint, EndpointError, TrustRoot};
+use crate::endpoint::{self, ChannelBinding, Endpoint, EndpointError, Tls, TrustRoot};
+use crate::tls::{self, TlsError};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("dbvalet supports macOS and Linux only");
@@ -45,7 +46,7 @@ impl AdminLogin {
     }
 }
 
-/// No variant carries any part of the connection string beyond a validated host.
+/// No variant carries any part of the connection string beyond a validated host or CA path.
 #[derive(Debug, thiserror::Error)]
 pub enum KeychainError {
     #[error("no admin login is stored for `{alias}`: run `dbvalet login {alias}`")]
@@ -69,15 +70,28 @@ pub enum KeychainError {
     Unavailable { reason: String },
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
+    #[error(transparent)]
+    TrustRoot(#[from] TlsError),
 }
 
-/// Checks the connection string's format, then stores it as typed.
+/// Checks the connection string's format and its `sslrootcert` file, then stores it as typed.
 pub fn store(alias: &DatabaseAlias, connection_string: SecretString) -> Result<(), KeychainError> {
-    // Without plaintext every host is accepted, so this checks the format only.
-    parse(alias, &connection_string, false)?;
+    check_for_store(alias, &connection_string)?;
     entry(alias)?
         .set_password(connection_string.expose_secret())
         .map_err(|err| keyring_failure(alias, err))
+}
+
+fn check_for_store(
+    alias: &DatabaseAlias,
+    connection_string: &SecretString,
+) -> Result<(), KeychainError> {
+    // Without plaintext every host is accepted, so this checks the format and the CA file only.
+    let login = parse(alias, connection_string, false)?;
+    if let Tls::VerifyFull(trust_root @ TrustRoot::PemFile(_)) = login.endpoint().tls() {
+        tls::client_config(trust_root)?;
+    }
+    Ok(())
 }
 
 pub fn load(alias: &DatabaseAlias, allow_plaintext: bool) -> Result<AdminLogin, KeychainError> {
@@ -359,6 +373,8 @@ fn parse_trust_root(path: &str) -> Result<TrustRoot, &'static str> {
         _ if path.chars().any(|c| c.is_control() || c == '\u{FFFD}') => {
             Err("its sslrootcert path contains control or invalid characters")
         }
+        // dbvalet reads it again later, from whatever directory `gc` or a run starts in.
+        _ if Path::new(path).is_relative() => Err("its sslrootcert path isn't absolute"),
         _ => Ok(TrustRoot::PemFile(PathBuf::from(path))),
     }
 }
@@ -816,6 +832,46 @@ mod tests {
             login.endpoint().tls(),
             &endpoint::Tls::VerifyFull(TrustRoot::PemFile(PathBuf::from("/real/ca.pem")))
         );
+    }
+
+    #[test]
+    fn a_relative_sslrootcert_path_is_refused_without_printing_the_password() {
+        for connection_string in [
+            "postgresql://admin:pw-unit-7f3a9c@localhost:5432/app?sslrootcert=ca.pem",
+            "host=localhost user=admin password=pw-unit-7f3a9c sslrootcert=./certs/ca.pem",
+        ] {
+            let err = parse_error(connection_string);
+            assert!(
+                matches!(
+                    err,
+                    KeychainError::BadConnectionString {
+                        problem: "its sslrootcert path isn't absolute",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            assert_hides_password(&err);
+        }
+    }
+
+    #[test]
+    fn checking_for_store_refuses_an_sslrootcert_file_it_cant_read() {
+        let err = check_for_store(
+            &alias(),
+            &SecretString::from(
+                "postgresql://admin:pw-unit-7f3a9c@db.example.com/app\
+                 ?sslrootcert=/nonexistent/dbvalet-unit-test/ca.pem",
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "couldn't read the sslrootcert file `/nonexistent/dbvalet-unit-test/ca.pem`"
+            ),
+            "{err}"
+        );
+        assert_hides_password(&err);
     }
 
     #[test]

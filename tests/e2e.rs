@@ -3051,10 +3051,11 @@ fn doctor_and_run_without_allow_plaintext_refuse_a_server_without_tls() {
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn login_accepts_sslmode_verify_full_and_sslrootcert() {
+    // `login` loads the file, so it must hold real CA certificates: the Debian/Ubuntu bundle does.
     let stored = login(
         "e2e-login-sslrootcert",
         "postgresql://admin:pw-e2e-sslrootcert-12ab@db.example.com:5432/app\
-         ?sslmode=verify-full&sslrootcert=/etc/ssl/rds-ca.pem",
+         ?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt",
     );
     assert!(
         stored.status.success(),

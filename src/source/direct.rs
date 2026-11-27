@@ -1174,7 +1174,6 @@ async fn connect_with_cancel_tls(
     let endpoint = admin.endpoint();
     let mut config = tokio_postgres::Config::new();
     config
-        .host(endpoint.host())
         .port(endpoint.port())
         .dbname(endpoint.database())
         .user(admin.user())
@@ -1188,16 +1187,33 @@ async fn connect_with_cancel_tls(
         let (client, cancel_tls) = match endpoint.tls() {
             Tls::Plaintext => {
                 config.ssl_mode(SslMode::Disable);
-                let (client, connection) = config
-                    .connect(NoTls)
-                    .await
-                    .map_err(|err| describe_connect_error(alias, admin, &err))?;
+                // Like the proxy, move on only when nothing listens, so both reach one server.
+                let mut refused = None;
+                let mut connected = None;
+                for host in endpoint.dial_hosts() {
+                    let mut attempt = config.clone();
+                    attempt.host(host);
+                    match attempt.connect(NoTls).await {
+                        Ok(pair) => {
+                            connected = Some(pair);
+                            break;
+                        }
+                        Err(err) if nothing_listens(&err) => {
+                            refused.get_or_insert(err);
+                        }
+                        Err(err) => return Err(describe_connect_error(alias, admin, &err)),
+                    }
+                }
+                let (client, connection) = connected.ok_or_else(|| {
+                    let err = refused.expect("dial_hosts is never empty");
+                    describe_connect_error(alias, admin, &err)
+                })?;
                 tokio::spawn(connection);
                 (client, None)
             }
             Tls::VerifyFull(trust_root) => {
                 // Always Require (never Prefer), so tokio-postgres can never downgrade to plaintext.
-                config.ssl_mode(SslMode::Require);
+                config.host(endpoint.host()).ssl_mode(SslMode::Require);
                 let tls_config = tls::client_config(trust_root).map_err(|err| err.to_string())?;
                 let tls = tls::MakeRustlsConnect::new(tls_config);
                 let (client, connection) = config
@@ -1300,6 +1316,15 @@ fn describe_query_error(err: &tokio_postgres::Error) -> String {
         );
     }
     "the connection ended before PostgreSQL answered: try running `dbvalet doctor` again".to_owned()
+}
+
+fn nothing_listens(err: &tokio_postgres::Error) -> bool {
+    find_io_error(err).is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
+        )
+    })
 }
 
 fn find_io_error<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a io::Error> {

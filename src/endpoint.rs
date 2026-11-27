@@ -117,6 +117,17 @@ impl Endpoint {
     pub fn is_loopback(&self) -> bool {
         is_loopback(&self.host)
     }
+
+    /// The hosts to dial, in order. Plaintext `localhost` dials the loopback addresses without
+    /// resolving the name, so a resolver can't send plaintext off this machine.
+    pub fn dial_hosts(&self) -> Vec<&str> {
+        match self.tls {
+            Tls::Plaintext if self.host.eq_ignore_ascii_case("localhost") => {
+                vec!["127.0.0.1", "::1"]
+            }
+            _ => vec![&self.host],
+        }
+    }
 }
 
 pub(crate) fn is_valid_host(host: &str) -> bool {
@@ -189,6 +200,24 @@ mod tests {
         assert!(with_plaintext("0.0.0.0").is_err());
         assert!(with_plaintext("::").is_err());
         assert!(with_plaintext("localhost.example.com").is_err());
+    }
+
+    #[test]
+    fn plaintext_localhost_dials_loopback_addresses_without_resolving_the_name() {
+        assert_eq!(
+            with_plaintext("localhost").unwrap().dial_hosts(),
+            ["127.0.0.1", "::1"]
+        );
+        assert_eq!(
+            with_plaintext("LocalHost").unwrap().dial_hosts(),
+            ["127.0.0.1", "::1"]
+        );
+        assert_eq!(
+            with_plaintext("127.0.0.2").unwrap().dial_hosts(),
+            ["127.0.0.2"]
+        );
+        let tls = Endpoint::new("localhost".to_owned(), 5432, "postgres".to_owned(), false);
+        assert_eq!(tls.unwrap().dial_hosts(), ["localhost"]);
     }
 
     #[test]
