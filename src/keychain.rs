@@ -24,7 +24,7 @@ const DEFAULT_PORT: u16 = 5432;
 /// In a debug build only, `1` keeps admin logins in memory for one process, so the CLI tests
 /// never reach the OS keychain. A release build doesn't contain the code that reads it.
 #[cfg(debug_assertions)]
-const TEST_KEYCHAIN_VAR: &str = "DBVALET_TEST_KEYCHAIN";
+pub const TEST_KEYCHAIN_VAR: &str = "DBVALET_TEST_KEYCHAIN";
 
 #[cfg(target_os = "linux")]
 const UNAVAILABLE_FIX: &str = ": install gnome-keyring, or run dbvalet under dbus-run-session";
