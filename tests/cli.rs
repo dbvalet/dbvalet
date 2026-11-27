@@ -4,6 +4,9 @@
 //! Every command also sets `DBVALET_TEST_KEYCHAIN=1`, so even a `login` that wrongly accepts
 //! its input stores it in memory, never in the developer's OS keychain.
 
+// The spawned binary needs debug assertions to honor the test keychain switch.
+#![cfg(debug_assertions)]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 

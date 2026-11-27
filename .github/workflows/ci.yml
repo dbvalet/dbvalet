@@ -38,6 +38,15 @@ jobs:
         env:
           DBVALET_TEST_MINUTE_MS: "1"
           DBVALET_TEST_KEYCHAIN: "1"
+      - name: The release binary contains no test keychain switch
+        run: |
+          cargo build --locked --release --bin dbvalet
+          python3 - <<'PY'
+          from pathlib import Path
+
+          if b"DBVALET_TEST_KEYCHAIN" in Path("target/release/dbvalet").read_bytes():
+              raise SystemExit("The release binary contains the test keychain switch")
+          PY
 
   e2e:
     name: e2e (PostgreSQL ${{ matrix.postgres }})
