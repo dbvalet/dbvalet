@@ -2,7 +2,6 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::process::ExitStatus;
 use std::time::{Duration, SystemTime};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -13,7 +12,8 @@ use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
 use crate::runlog::{self, RunHeader, RunLogError, RunSecrets};
-use crate::source::{CredentialSource, Lease, SourceError};
+use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT, WaitOutcome};
+use crate::source::{CredentialSource, Lease, MintOutcome, SourceError};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -36,6 +36,8 @@ pub enum RunError {
     Proxy(#[from] ProxyError),
     #[error(transparent)]
     RunLog(#[from] RunLogError),
+    #[error("couldn't install signal handlers")]
+    Signals(#[source] io::Error),
     #[error("couldn't start `{program}`")]
     Spawn {
         program: String,
@@ -56,13 +58,25 @@ pub async fn run<S: CredentialSource>(
     options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<ExitStatus, RunError> {
+) -> Result<WaitOutcome, RunError> {
     assert!(!command.is_empty(), "run needs a command");
     for err in source.sweep().await?.failures {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
-    let lease = source.mint(options.grant).await?;
-    let finished = run_child(&lease, options, upstream, command).await;
+    // Install signal handlers before minting so SIGINT, SIGTERM or SIGHUP can't kill
+    // dbvalet while CREATE ROLE is in flight and release the ledger lock early.
+    let mut signals = RunSignals::install().map_err(RunError::Signals)?;
+    if let Some(signal) = signals.poll_pending().await {
+        return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
+    }
+    let lease = match source.mint(options.grant, signals.next_signal()).await? {
+        MintOutcome::Created(lease) => lease,
+        MintOutcome::Interrupted(signal) => return Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
+    };
+    let finished = match signals.poll_pending().await {
+        Some(signal) => Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
+        None => run_child(&mut signals, &lease, options, upstream, command).await,
+    };
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
     }
@@ -70,11 +84,12 @@ pub async fn run<S: CredentialSource>(
 }
 
 async fn run_child(
+    signals: &mut RunSignals,
     lease: &Lease,
     options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
-) -> Result<ExitStatus, RunError> {
+) -> Result<WaitOutcome, RunError> {
     let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let header = RunHeader {
@@ -99,16 +114,47 @@ async fn run_child(
         options.sql_log.then_some(run_log),
     )
     .await?;
-    let mut child = child_command(command, login.user(), &token, proxy.port(), &database);
-    let finished = match child.spawn() {
-        Ok(mut running) => running.wait().await.map_err(RunError::Wait),
-        Err(source) => Err(RunError::Spawn {
-            program: command[0].to_string_lossy().into_owned(),
-            source,
-        }),
-    };
+    let finished = spawn_and_wait(
+        signals,
+        command,
+        login.user(),
+        &token,
+        proxy.port(),
+        &database,
+    )
+    .await;
+    if let Ok(WaitOutcome::TimedOut(signal)) = finished {
+        let _ = writeln!(
+            io::stderr(),
+            "dbvalet: child didn't exit within {}s after {}; tearing down the temporary login",
+            SIGNAL_WAIT_TIMEOUT.as_secs(),
+            signal.name()
+        );
+    }
     proxy.stop().await;
     finished
+}
+
+async fn spawn_and_wait(
+    signals: &mut RunSignals,
+    command: &[OsString],
+    user: &str,
+    token: &SecretString,
+    port: u16,
+    database: &str,
+) -> Result<WaitOutcome, RunError> {
+    if let Some(signal) = signals.poll_pending().await {
+        return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
+    }
+    let program = command[0].to_string_lossy().into_owned();
+    let child = child_command(command, user, token, port, database);
+    // Spawn on the current-thread runtime's main thread so PR_SET_PDEATHSIG fires only when dbvalet exits.
+    let mut running =
+        signals::spawn_child(child).map_err(|source| RunError::Spawn { program, source })?;
+    signals
+        .wait(&mut running, SIGNAL_WAIT_TIMEOUT)
+        .await
+        .map_err(RunError::Wait)
 }
 
 /// The child inherits dbvalet's environment minus every `PG*` variable and `DATABASE_URL`,
@@ -120,7 +166,7 @@ fn child_command(
     port: u16,
     database: &str,
 ) -> tokio::process::Command {
-    let (program, args) = command.split_first().expect("the CLI requires a command");
+    let (program, args) = command.split_first().expect("run needs a command");
     let mut child = tokio::process::Command::new(program);
     child.args(args);
     for (name, _) in std::env::vars_os() {

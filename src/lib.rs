@@ -16,6 +16,7 @@ pub mod policy;
 pub mod proxy;
 pub mod run;
 pub mod runlog;
+pub mod signals;
 pub mod source;
 
 /// Every temporary login's name starts with this.
