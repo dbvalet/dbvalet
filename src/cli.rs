@@ -130,10 +130,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let config = config::find_and_load(&cwd)?;
             let (alias, database) = policy::choose_database(&config, db.as_ref())?;
             let grant = policy::choose_role(alias, database, &role)?;
+            let max_ttl = policy::max_ttl(database);
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
             let source = DirectSource::new(alias.clone(), admin);
-            let outcome = run::run(&source, grant, upstream, &command).await?;
+            let outcome = run::run(&source, grant, max_ttl, upstream, &command).await?;
             Ok(exit_code(outcome))
         }
         Command::Gc { allow_plaintext } => {
