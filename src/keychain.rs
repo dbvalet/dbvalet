@@ -19,6 +19,10 @@ compile_error!("dbvalet supports macOS and Linux only");
 
 const KEYCHAIN_SERVICE: &str = "dbvalet";
 const DEFAULT_PORT: u16 = 5432;
+/// In a debug build only, `1` keeps admin logins in memory for one process, so the CLI tests
+/// never reach the OS keychain. A release build doesn't contain the code that reads it.
+#[cfg(any(debug_assertions, test))]
+const TEST_KEYCHAIN_VAR: &str = "DBVALET_TEST_KEYCHAIN";
 
 #[cfg(target_os = "linux")]
 const UNAVAILABLE_FIX: &str = ": install gnome-keyring, or run dbvalet under dbus-run-session";
@@ -108,13 +112,42 @@ fn entry(alias: &DatabaseAlias) -> Result<Entry, KeychainError> {
         .map_err(|err| keyring_failure(alias, err))
 }
 
-#[cfg(target_os = "macos")]
 fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+    // Unit tests always get the test store, so none can reach the developer's keychain.
+    #[cfg(any(debug_assertions, test))]
+    if cfg!(test) || test_keychain_requested() {
+        return Ok(test_store());
+    }
+    os_store()
+}
+
+#[cfg(any(debug_assertions, test))]
+fn test_keychain_requested() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(TEST_KEYCHAIN_VAR).is_some_and(|value| value == "1") {
+        return true;
+    }
+    false
+}
+
+/// One store for the whole process, so a `load` sees what an earlier `store` kept.
+#[cfg(any(debug_assertions, test))]
+fn test_store() -> Arc<CredentialStore> {
+    static TEST_STORE: std::sync::OnceLock<Arc<CredentialStore>> = std::sync::OnceLock::new();
+    TEST_STORE
+        .get_or_init(|| {
+            keyring_core::mock::Store::new().expect("creating the mock store never fails")
+        })
+        .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn os_store() -> keyring_core::Result<Arc<CredentialStore>> {
     Ok(apple_native_keyring_store::keychain::Store::new()?)
 }
 
 #[cfg(target_os = "linux")]
-fn platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+fn os_store() -> keyring_core::Result<Arc<CredentialStore>> {
     Ok(dbus_secret_service_keyring_store::Store::new()?)
 }
 
@@ -908,5 +941,27 @@ mod tests {
             }
         ));
         assert_hides_password(&empty_kv_cert);
+    }
+
+    #[test]
+    fn a_stored_login_loads_back_from_the_test_store_in_the_same_process() {
+        let alias: DatabaseAlias = "unit-test-round-trip".parse().unwrap();
+        store(
+            &alias,
+            SecretString::from("postgresql://admin:pw-unit-7f3a9c@localhost:5432/app"),
+        )
+        .unwrap();
+
+        let login = load(&alias, true).unwrap();
+        assert_eq!(login.endpoint().to_string(), "localhost:5432/app");
+        assert_eq!(login.password().expose_secret(), PASSWORD);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    #[ignore = "CI runs this in a release build, with DBVALET_TEST_KEYCHAIN=1"]
+    fn a_release_build_ignores_the_test_keychain() {
+        assert_eq!(std::env::var(TEST_KEYCHAIN_VAR).as_deref(), Ok("1"));
+        assert!(!test_keychain_requested());
     }
 }

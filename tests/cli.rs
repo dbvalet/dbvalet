@@ -1,6 +1,8 @@
 //! The binary's behaviour that needs no database.
 //!
 //! `login` tests use only `cli-test-*` aliases and inputs refused before anything is stored.
+//! Every command also sets `DBVALET_TEST_KEYCHAIN=1`, so even a `login` that wrongly accepts
+//! its input stores it in memory, never in the developer's OS keychain.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -9,7 +11,11 @@ const DBVALET: &str = env!("CARGO_BIN_EXE_dbvalet");
 
 #[test]
 fn version_prints_the_crate_version_and_exits_zero() {
-    let output = Command::new(DBVALET).arg("--version").output().unwrap();
+    let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
+        .arg("--version")
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     assert_eq!(
@@ -21,6 +27,7 @@ fn version_prints_the_crate_version_and_exits_zero() {
 #[test]
 fn login_with_a_malformed_connection_string_fails_without_printing_the_password() {
     let mut login = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .args(["login", "cli-test-malformed"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -46,6 +53,7 @@ fn login_with_a_malformed_connection_string_fails_without_printing_the_password(
 #[test]
 fn login_refuses_multi_line_piped_stdin_without_printing_either_password() {
     let mut login = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .args(["login", "cli-test-multiline"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -78,6 +86,7 @@ fn login_refuses_multi_line_piped_stdin_without_printing_either_password() {
 #[test]
 fn login_refuses_unencoded_at_in_password_without_printing_it() {
     let mut login = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .args(["login", "cli-test-at"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -102,6 +111,23 @@ fn login_refuses_unencoded_at_in_password_without_printing_it() {
     assert!(!stderr.contains("cret-PART-9a1"), "stderr: {stderr}");
 }
 
+#[test]
+fn doctor_with_the_test_keychain_reports_that_no_admin_login_is_stored() {
+    let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
+        .current_dir(env!("CARGO_TARGET_TMPDIR"))
+        .args(["doctor", "cli-test-unstored"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "FAIL no admin login is stored for `cli-test-unstored`: \
+         run `dbvalet login cli-test-unstored`\n"
+    );
+}
+
 fn project(name: &str, config: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(dir.join("nested")).unwrap();
@@ -118,6 +144,7 @@ fn run_with_an_unlisted_role_is_refused_before_reading_the_keychain_and_lists_th
     );
 
     let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .current_dir(&dir)
         .args([
             "run",
@@ -153,6 +180,7 @@ fn run_with_two_databases_and_no_db_flag_is_refused_and_lists_the_aliases() {
     );
 
     let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .current_dir(dir.join("nested"))
         .args(["run", "--", "sh", "-c", "echo child-ran"])
         .output()
@@ -182,6 +210,7 @@ fn log_with_no_runs_prints_empty_notice_and_exits_zero() {
     let state = state_home("cli-test-log-empty");
 
     let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .env("XDG_STATE_HOME", &state)
         .args(["log"])
         .output()
@@ -233,6 +262,7 @@ fn log_lists_runs_newest_first() {
     .unwrap();
 
     let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .env("XDG_STATE_HOME", &state)
         .args(["log"])
         .output()
@@ -272,6 +302,7 @@ fn log_with_a_run_id_prints_that_run_log_and_fails_when_missing() {
     .unwrap();
 
     let found = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .env("XDG_STATE_HOME", &state)
         .args(["log", "cccccccccccccccc"])
         .output()
@@ -284,6 +315,7 @@ fn log_with_a_run_id_prints_that_run_log_and_fails_when_missing() {
     assert_eq!(String::from_utf8(found.stdout).unwrap(), body);
 
     let missing = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .env("XDG_STATE_HOME", &state)
         .args(["log", "dddddddddddddddd"])
         .output()
@@ -302,6 +334,7 @@ fn gc_with_an_empty_ledger_and_no_dbvalet_toml_has_nothing_to_clean_up() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let output = Command::new(DBVALET)
+        .env("DBVALET_TEST_KEYCHAIN", "1")
         .current_dir(&dir)
         .env("XDG_STATE_HOME", dir.join("state"))
         .arg("gc")
