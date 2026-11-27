@@ -428,6 +428,7 @@ dependencies = [
  "fallible-iterator",
  "getrandom 0.4.3",
  "keyring-core",
+ "percent-encoding",
  "postgres-protocol",
  "rpassword",
  "rustls",
@@ -442,6 +443,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tokio-rustls",
+ "tokio-util",
  "toml",
  "x509-cert",
 ]

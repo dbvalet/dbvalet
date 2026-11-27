@@ -1,11 +1,13 @@
 //! The admin login, kept in the OS keychain under a database alias.
 
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::path::PathBuf;
 use std::str::CharIndices;
 use std::sync::Arc;
 
 use keyring_core::{CredentialStore, Entry};
+use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 use crate::DatabaseAlias;
@@ -222,9 +224,9 @@ fn strip_url_tls_params(raw: &str) -> Result<StrippedConnectionString, &'static 
             return Err("it isn't a PostgreSQL connection string");
         };
         match key {
-            "sslmode" => validate_sslmode(&percent_decode_utf8(value)?)?,
+            "sslmode" => validate_sslmode(&decode_url_tls_option(value)?)?,
             "sslrootcert" => {
-                trust_root = parse_trust_root(percent_decode_utf8(value)?)?;
+                trust_root = parse_trust_root(&decode_url_tls_option(value)?)?;
             }
             _ => {
                 buf.push(if buf.len() == base.len() { '?' } else { '&' });
@@ -268,7 +270,7 @@ fn strip_kv_tls_params(raw: &str) -> Result<StrippedConnectionString, &'static s
         let pair_end = chars.peek().map_or(raw.len(), |&(index, _)| index);
         match key {
             "sslmode" => validate_sslmode(value.as_deref().unwrap_or(""))?,
-            "sslrootcert" => trust_root = parse_trust_root(value.unwrap_or_default())?,
+            "sslrootcert" => trust_root = parse_trust_root(value.as_deref().unwrap_or_default())?,
             _ => {
                 let buf = forwarded.expose_secret_mut();
                 if !buf.is_empty() {
@@ -350,8 +352,8 @@ fn validate_sslmode(mode: &str) -> Result<(), &'static str> {
     }
 }
 
-fn parse_trust_root(path: String) -> Result<TrustRoot, &'static str> {
-    match path.as_str() {
+fn parse_trust_root(path: &str) -> Result<TrustRoot, &'static str> {
+    match path {
         "" => Err("its sslrootcert path is empty"),
         "system" => Ok(TrustRoot::System),
         _ if path.chars().any(|c| c.is_control() || c == '\u{FFFD}') => {
@@ -361,34 +363,16 @@ fn parse_trust_root(path: String) -> Result<TrustRoot, &'static str> {
     }
 }
 
-fn percent_decode_utf8(input: &str) -> Result<String, &'static str> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return Err("it isn't a PostgreSQL connection string");
-            }
-            let hi = hex_nibble(bytes[index + 1])?;
-            let lo = hex_nibble(bytes[index + 2])?;
-            out.push((hi << 4) | lo);
-            index += 3;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
+fn decode_url_tls_option(input: &str) -> Result<Cow<'_, str>, &'static str> {
+    const BAD_URL: &str = "it isn't a PostgreSQL connection string";
+    // The decoder leaves malformed escapes in place. TLS options must reject them.
+    for (index, _) in input.match_indices('%') {
+        let digits = input.as_bytes().get(index + 1..index + 3);
+        if !digits.is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit)) {
+            return Err(BAD_URL);
         }
     }
-    String::from_utf8(out).map_err(|_| "it isn't a PostgreSQL connection string")
-}
-
-fn hex_nibble(byte: u8) -> Result<u8, &'static str> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err("it isn't a PostgreSQL connection string"),
-    }
+    percent_decode_str(input).decode_utf8().map_err(|_| BAD_URL)
 }
 
 /// Checks URL structure before tokio-postgres parses it, because tokio-postgres splits

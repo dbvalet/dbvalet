@@ -4,9 +4,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -15,11 +13,13 @@ use postgres_protocol::message::{backend, frontend};
 use rustls_pki_types::ServerName;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_util::either::Either;
 
 use crate::endpoint::{ChannelBinding as ChannelBindingMode, Endpoint, Tls};
 use crate::source::UpstreamLogin;
@@ -272,50 +272,7 @@ enum UpstreamRefusal {
     Failed(String),
 }
 
-enum UpstreamStream {
-    Plaintext(TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for UpstreamStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plaintext(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for UpstreamStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plaintext(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plaintext(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plaintext(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
+type UpstreamStream = Either<TcpStream, Box<TlsStream<TcpStream>>>;
 
 /// Starts an upstream session as the temporary login with the client's parameters, except
 /// `user` and `database`. Returns it after `AuthenticationOk`, with the bytes read past it.
@@ -402,7 +359,7 @@ async fn negotiate_upstream_tls(
     access: &Access,
 ) -> Result<(UpstreamStream, Option<Vec<u8>>), UpstreamRefusal> {
     let Some(tls) = &access.tls else {
-        return Ok((UpstreamStream::Plaintext(tcp), None));
+        return Ok((Either::Left(tcp), None));
     };
     let mut request = BytesMut::with_capacity(ENCRYPTION_REQUEST_LEN);
     frontend::ssl_request(&mut request);
@@ -435,7 +392,7 @@ async fn negotiate_upstream_tls(
         .peer_certificates()
         .and_then(|certs| certs.first())
         .and_then(|cert| tls::server_end_point_digest(cert.as_ref()));
-    Ok((UpstreamStream::Tls(Box::new(tls_stream)), digest))
+    Ok((Either::Right(Box::new(tls_stream)), digest))
 }
 
 fn choose_sasl_mechanism(
