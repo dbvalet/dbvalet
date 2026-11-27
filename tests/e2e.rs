@@ -1357,12 +1357,12 @@ fn a_sweep_keeps_the_ledger_until_the_creation_transaction_finishes() {
     std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
     std::fs::write(&entry, "read-only\n").unwrap();
 
-    let swept = gc_in(&dir);
+    let swept = gc_command(&dir).output().unwrap();
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
     assert!(entry.exists());
 
     rt.block_on(creator.batch_execute("ROLLBACK")).unwrap();
-    let swept = gc_in(&dir);
+    let swept = gc_command(&dir).output().unwrap();
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
     assert!(!entry.exists());
 }
