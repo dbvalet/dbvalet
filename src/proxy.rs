@@ -784,14 +784,21 @@ async fn connect_upstream(
 ) -> Result<(UpstreamStream, BytesMut), UpstreamRefusal> {
     let endpoint = &access.endpoint;
     let login = &access.login;
-    let mut dialed = Err(io::Error::from(io::ErrorKind::NotFound));
+    let mut first_err = None;
+    let mut tcp = None;
     for host in endpoint.dial_hosts() {
-        dialed = TcpStream::connect((host, endpoint.port())).await;
-        if dialed.is_ok() {
-            break;
+        match TcpStream::connect((host, endpoint.port())).await {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(err) => {
+                first_err.get_or_insert(err);
+            }
         }
     }
-    let tcp = dialed.map_err(|err| {
+    let tcp = tcp.ok_or_else(|| {
+        let err = first_err.expect("dial_hosts is never empty");
         UpstreamRefusal::Failed(format!(
             "dbvalet couldn't reach the database at {endpoint}: {err}"
         ))

@@ -407,7 +407,7 @@ fn sslmode_verify_ca_still_refuses_a_wrong_hostname() {
 
 #[test]
 #[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
-fn missing_and_empty_sslrootcert_files_fail_naming_the_path() {
+fn login_refuses_missing_and_empty_sslrootcert_files_naming_the_path() {
     let port = tls_port();
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-tls-bad-rootcert");
     std::fs::create_dir_all(&dir).unwrap();
@@ -415,58 +415,63 @@ fn missing_and_empty_sslrootcert_files_fail_naming_the_path() {
     let empty = dir.join("empty-ca.pem");
     std::fs::write(&empty, b"").unwrap();
 
-    let stored_missing = login(
-        "e2e-tls-missing-ca",
-        &format!(
-            "postgresql://e2e_tls_valid_admin:pw-e2e-tls-valid-1a2b@localhost:{port}/postgres\
-             ?sslmode=verify-full&sslrootcert={}",
-            missing.display()
-        ),
-    );
-    assert!(
-        stored_missing.status.success(),
-        "login: {}",
-        text(&stored_missing.stderr)
-    );
-    let checked_missing = Command::new(DBVALET)
-        .args(["doctor", "e2e-tls-missing-ca"])
-        .output()
-        .unwrap();
-    let stdout_missing = text(&checked_missing.stdout);
-    assert!(!checked_missing.status.success(), "{stdout_missing}");
-    assert!(
-        stdout_missing.contains("missing-ca.pem"),
-        "should name missing path: {stdout_missing}"
-    );
+    for (alias, path) in [
+        ("e2e-tls-missing-ca", &missing),
+        ("e2e-tls-empty-ca", &empty),
+    ] {
+        let stored = login(
+            alias,
+            &format!(
+                "postgresql://e2e_tls_valid_admin:pw-e2e-tls-valid-1a2b@localhost:{port}/postgres\
+                 ?sslmode=verify-full&sslrootcert={}",
+                path.display()
+            ),
+        );
+        let stderr = text(&stored.stderr);
+        assert!(!stored.status.success(), "login {alias}: {stderr}");
+        assert!(
+            stderr.contains(&path.display().to_string()),
+            "should name the path: {stderr}"
+        );
+        assert!(!stderr.contains("pw-e2e-tls-valid-1a2b"), "{stderr}");
+    }
+}
 
-    let stored_empty = login(
-        "e2e-tls-empty-ca",
+#[test]
+#[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
+fn doctor_names_an_sslrootcert_file_removed_after_login() {
+    let port = tls_port();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-tls-removed-rootcert");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("removed-ca.pem");
+    std::fs::copy(ca_cert(), &path).unwrap();
+
+    let stored = login(
+        "e2e-tls-removed-ca",
         &format!(
             "postgresql://e2e_tls_valid_admin:pw-e2e-tls-valid-1a2b@localhost:{port}/postgres\
              ?sslmode=verify-full&sslrootcert={}",
-            empty.display()
+            path.display()
         ),
     );
-    assert!(
-        stored_empty.status.success(),
-        "login: {}",
-        text(&stored_empty.stderr)
-    );
-    let checked_empty = Command::new(DBVALET)
-        .args(["doctor", "e2e-tls-empty-ca"])
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    std::fs::remove_file(&path).unwrap();
+
+    let checked = Command::new(DBVALET)
+        .args(["doctor", "e2e-tls-removed-ca"])
         .output()
         .unwrap();
-    let stdout_empty = text(&checked_empty.stdout);
-    assert!(!checked_empty.status.success(), "{stdout_empty}");
+    let stdout = text(&checked.stdout);
+    assert!(!checked.status.success(), "{stdout}");
     assert!(
-        stdout_empty.contains("empty-ca.pem"),
-        "should name empty path: {stdout_empty}"
+        stdout.contains("removed-ca.pem"),
+        "should name the path: {stdout}"
     );
 }
 
 #[test]
 #[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
-fn a_ca_bundle_with_an_invalid_certificate_is_refused() {
+fn login_refuses_a_ca_bundle_with_an_invalid_certificate() {
     let port = tls_port();
     let project = write_project("e2e-tls-invalid-ca");
     let path = project.join("invalid-ca.pem");
@@ -481,17 +486,8 @@ fn a_ca_bundle_with_an_invalid_certificate_is_refused() {
             path.display()
         ),
     );
-    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
-
-    let check = Command::new(DBVALET)
-        .args(["doctor", "e2e-tls-invalid-ca"])
-        .output()
-        .unwrap();
-    let stdout = text(&check.stdout);
-    assert!(!check.status.success(), "doctor: {stdout}");
-    assert!(stdout.contains("invalid-ca.pem"), "doctor: {stdout}");
-    assert!(
-        stdout.contains("invalid CA certificate"),
-        "doctor: {stdout}"
-    );
+    let stderr = text(&stored.stderr);
+    assert!(!stored.status.success(), "login: {stderr}");
+    assert!(stderr.contains("invalid-ca.pem"), "login: {stderr}");
+    assert!(stderr.contains("invalid CA certificate"), "login: {stderr}");
 }

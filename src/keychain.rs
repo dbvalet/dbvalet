@@ -46,7 +46,7 @@ impl AdminLogin {
     }
 }
 
-/// No variant carries any part of the connection string beyond a validated host.
+/// No variant carries any part of the connection string beyond a validated host or CA path.
 #[derive(Debug, thiserror::Error)]
 pub enum KeychainError {
     #[error("no admin login is stored for `{alias}`: run `dbvalet login {alias}`")]
@@ -86,7 +86,7 @@ fn check_for_store(
     alias: &DatabaseAlias,
     connection_string: &SecretString,
 ) -> Result<(), KeychainError> {
-    // Without plaintext every host is accepted, so this checks the format only.
+    // Without plaintext every host is accepted, so this checks the format and the CA file only.
     let login = parse(alias, connection_string, false)?;
     if let Tls::VerifyFull(trust_root @ TrustRoot::PemFile(_)) = login.endpoint().tls() {
         tls::client_config(trust_root)?;
