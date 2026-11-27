@@ -2505,3 +2505,184 @@ fn dbvalet_log_lists_runs_newest_first() {
     assert!(lines[0].contains(&second_id), "{listed}");
     assert!(lines[1].contains(&first_id), "{listed}");
 }
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_unicode_statement_containing_password_returns_the_same_result_with_and_without_sql_log() {
+    let dir = project_with_reader("e2e-log-unicode-fwd");
+    let state = isolated_state_home("e2e-log-unicode-fwd");
+    let query = "SELECT 'Forgot your password? Réinitialisez-le'";
+
+    let _sweeping = sweeping();
+    let logged = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-AtXc",
+            query,
+        ])
+        .output()
+        .unwrap();
+    let unlogged = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--no-sql-log",
+            "--",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-AtXc",
+            query,
+        ])
+        .output()
+        .unwrap();
+
+    assert!(logged.status.success(), "stderr: {}", text(&logged.stderr));
+    assert!(
+        unlogged.status.success(),
+        "stderr: {}",
+        text(&unlogged.stderr)
+    );
+    assert_eq!(logged.stdout, unlogged.stdout);
+    assert_eq!(
+        text(&logged.stdout),
+        "Forgot your password? Réinitialisez-le\n"
+    );
+
+    let listed = text(&dbvalet_log(&state, &[]).stdout);
+    let logged_id = listed
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let shown = text(&dbvalet_log(&state, &[logged_id]).stdout);
+    assert!(shown.contains(&format!(" [Q] {query}\n")), "{shown}");
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn non_utf8_and_complex_password_statements_are_omitted_or_redacted_without_changing_results() {
+    let dir = project_with_reader("e2e-log-hardening");
+    let state = isolated_state_home("e2e-log-hardening");
+
+    let script = concat!(
+        "echo \"login=$PGUSER\"; ",
+        "echo \"token=$PGPASSWORD\"; ",
+        "printf \"SELECT 'caf\\351';\\n\" | PGCLIENTENCODING=LATIN1 psql -v ON_ERROR_STOP=1 -AtX | od -An -tx1 | tr -d ' \\n'; echo; ",
+        "printf \"SELECT 'caf\\303\\251';\\n\" | PGCLIENTENCODING=LATIN1 psql -v ON_ERROR_STOP=1 -AtX >/dev/null; ",
+        "printf \"ALTER ROLE CURRENT_USER PASSWORD -- note\\r'synthetic-e2e-cr';\\n\" | psql -X >/dev/null 2>&1 || true; ",
+        "printf \"ALTER ROLE CURRENT_USER PASSWORD\\013'synthetic-e2e-vt';\\n\" | psql -X >/dev/null 2>&1 || true; ",
+        "psql -X -c \"DO \\$a\\$ BEGIN EXECUTE \\$b\\$ DO \\$c\\$ BEGIN EXECUTE \\$d\\$ DO \\$e\\$ BEGIN ALTER ROLE CURRENT_USER PASSWORD 'synthetic-e2e-deep'; END \\$e\\$ \\$d\\$; END \\$c\\$ \\$b\\$; END \\$a\\$\" >/dev/null 2>&1 || true; ",
+        "psql -X -c \"DO \\$\\$ BEGIN EXECUTE 'ALTER ROLE ' || quote_ident(current_user) || ' PASSWORD ' || quote_literal('synthetic-e2e-split'); END \\$\\$\" >/dev/null 2>&1 || true; ",
+        "psql -v ON_ERROR_STOP=1 -AtXc \"SELECT 'postgresql://u@db.example/app?pass%77ord=synthetic-e2e-uri'\" >/dev/null; ",
+        "psql -v ON_ERROR_STOP=1 -AtXc \"SELECT 1\""
+    );
+
+    let _sweeping = sweeping();
+    let output = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args(["run", "--allow-plaintext", "--", "sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+
+    let stdout = text(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let run_id = lines[0].strip_prefix("login=dbvalet_").unwrap().to_owned();
+    let token = lines[1].strip_prefix("token=").unwrap().to_owned();
+    // `caf\xe9\n` in hex proves PostgreSQL executed the LATIN1 query untouched.
+    assert_eq!(lines[2], "636166e90a", "stdout: {stdout}");
+    assert_eq!(lines[3], "1", "stdout: {stdout}");
+
+    let shown = dbvalet_log(&state, &[&run_id]);
+    assert!(shown.status.success(), "stderr: {}", text(&shown.stderr));
+    let log = text(&shown.stdout);
+    assert!(log.contains("/* omitted: non-UTF-8 */"), "{log}");
+    assert!(
+        log.contains("/* omitted: non-UTF-8 client_encoding */"),
+        "{log}"
+    );
+    assert!(log.contains(" [Q] SELECT 1\n"), "{log}");
+    for secret in [
+        token.as_str(),
+        "synthetic-e2e-cr",
+        "synthetic-e2e-vt",
+        "synthetic-e2e-deep",
+        "synthetic-e2e-split",
+        "synthetic-e2e-uri",
+    ] {
+        assert!(!log.contains(secret), "leaked {secret:?} in:\n{log}");
+    }
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn unicode_line_separators_and_direction_overrides_are_escaped_in_dbvalet_log_output() {
+    let dir = project_with_reader("e2e-log-bidi");
+    let state = isolated_state_home("e2e-log-bidi");
+    let query = "SELECT 'a\u{2028}b\u{2029}c\u{202e}d\u{2066}e'";
+
+    let _sweeping = sweeping();
+    let run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", &state)
+        .args([
+            "run",
+            "--allow-plaintext",
+            "--",
+            "psql",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-AtXc",
+            query,
+        ])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "stderr: {}", text(&run.stderr));
+    assert_eq!(text(&run.stdout), "a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\n");
+
+    let listed_out = dbvalet_log(&state, &[]);
+    assert!(
+        listed_out.status.success(),
+        "stderr: {}",
+        text(&listed_out.stderr)
+    );
+    let listed = text(&listed_out.stdout);
+    let run_id = listed
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let shown_out = dbvalet_log(&state, &[run_id]);
+    assert!(
+        shown_out.status.success(),
+        "stderr: {}",
+        text(&shown_out.stderr)
+    );
+    let shown = text(&shown_out.stdout);
+
+    for output in [&listed, &shown] {
+        for forbidden in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}'] {
+            assert!(
+                !output.contains(forbidden),
+                "raw {forbidden:?} in:\n{output}"
+            );
+        }
+        assert!(output.contains("\\u{2028}"), "{output}");
+        assert!(output.contains("\\u{202e}"), "{output}");
+    }
+}
