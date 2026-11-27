@@ -24,7 +24,7 @@ pub struct RunOptions<'a> {
     pub database: &'a DatabaseAlias,
     pub role: &'a str,
     pub grant: &'a RoleGrant,
-    pub max_ttl: Option<Duration>,
+    pub max_ttl: Duration,
     pub sql_log: bool,
 }
 
@@ -51,7 +51,7 @@ pub enum RunError {
 }
 
 /// Sweeps what earlier runs left, runs `command` against a new temporary login through the
-/// proxy, then drops the login.
+/// proxy, then drops the login. At `max_ttl` the lease drops it while `command` keeps running.
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
@@ -69,7 +69,10 @@ pub async fn run<S: CredentialSource>(
     if let Some(signal) = signals.poll_pending().await {
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
-    let lease = match source.mint(options.grant, signals.next_signal()).await? {
+    let lease = match source
+        .mint(options.grant, options.max_ttl, signals.next_signal())
+        .await?
+    {
         MintOutcome::Created(lease) => lease,
         MintOutcome::Interrupted(signal) => return Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
     };
@@ -83,6 +86,7 @@ pub async fn run<S: CredentialSource>(
     finished
 }
 
+/// Leaves the proxy to the lease, whose teardown stops it.
 async fn run_child(
     signals: &mut RunSignals,
     lease: &Lease,
@@ -98,7 +102,7 @@ async fn run_child(
         database: options.database.clone(),
         role: options.role.to_owned(),
         valid_until: lease.valid_until().to_owned(),
-        max_ttl: options.max_ttl,
+        max_ttl: Some(options.max_ttl),
         command: command.to_vec(),
         sql_log: options.sql_log,
     };
@@ -112,17 +116,12 @@ async fn run_child(
         login.clone(),
         token.clone(),
         options.sql_log.then_some(run_log),
+        lease.access_deadline(),
     )
     .await?;
-    let finished = spawn_and_wait(
-        signals,
-        command,
-        login.user(),
-        &token,
-        proxy.port(),
-        &database,
-    )
-    .await;
+    let port = proxy.port();
+    lease.attach_proxy(proxy).await;
+    let finished = spawn_and_wait(signals, command, login.user(), &token, port, &database).await;
     if let Ok(WaitOutcome::TimedOut(signal)) = finished {
         let _ = writeln!(
             io::stderr(),
@@ -131,7 +130,6 @@ async fn run_child(
             signal.name()
         );
     }
-    proxy.stop().await;
     finished
 }
 

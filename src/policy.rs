@@ -1,7 +1,12 @@
 //! Which database and role a run uses, decided from `dbvalet.toml` alone.
 
+use std::time::{Duration, SystemTime};
+
 use crate::DatabaseAlias;
 use crate::config::{Config, DatabasePolicy, RoleGrant};
+
+/// A database's max_ttl when dbvalet.toml doesn't set `max_ttl_minutes`: 480 minutes.
+pub const DEFAULT_MAX_TTL: Duration = Duration::from_secs(480 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -54,6 +59,25 @@ pub fn choose_role<'a>(
             alias: alias.clone(),
             allowed: join(policy.roles.keys().map(String::as_str)),
         })
+}
+
+/// The database's max_ttl, or [`DEFAULT_MAX_TTL`] when dbvalet.toml doesn't set one.
+pub fn max_ttl(policy: &DatabasePolicy) -> Duration {
+    policy.max_ttl().unwrap_or(DEFAULT_MAX_TTL)
+}
+
+/// The next `VALID UNTIL`: `ahead` of `now`, but never past `started + max_ttl`.
+pub fn next_expiry(
+    now: SystemTime,
+    started: SystemTime,
+    max_ttl: Duration,
+    ahead: Duration,
+) -> SystemTime {
+    let ahead_of_now = now + ahead;
+    // A max_ttl too far off for the clock to represent caps nothing.
+    started
+        .checked_add(max_ttl)
+        .map_or(ahead_of_now, |end| ahead_of_now.min(end))
 }
 
 fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
@@ -151,5 +175,61 @@ mod tests {
             err.to_string(),
             "the role `admin` isn't allowed for `app`: dbvalet.toml allows reader, writer"
         );
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn at_minute(minute: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + MINUTE * 1_000_000 + MINUTE * u32::try_from(minute).unwrap()
+    }
+
+    #[test]
+    fn a_database_without_max_ttl_minutes_gets_480_minutes() {
+        let config = parse_for_test(ONE_DATABASE);
+        let (_, policy) = choose_database(&config, None).unwrap();
+        assert_eq!(max_ttl(policy), Duration::from_secs(480 * 60));
+    }
+
+    #[test]
+    fn a_database_with_max_ttl_minutes_gets_that_max_ttl() {
+        let config = parse_for_test(
+            r#"
+            [databases.app]
+            max_ttl_minutes = 30
+            [databases.app.roles]
+            reader = { member_of = "dbvalet_reader", read_only = true }
+            "#,
+        );
+        let (_, policy) = choose_database(&config, None).unwrap();
+        assert_eq!(max_ttl(policy), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn the_next_expiry_is_the_lead_ahead_of_now_while_max_ttl_is_further_off() {
+        let expiry = next_expiry(at_minute(10), at_minute(0), MINUTE * 480, MINUTE * 15);
+        assert_eq!(expiry, at_minute(25));
+    }
+
+    #[test]
+    fn the_next_expiry_is_capped_at_the_start_plus_max_ttl() {
+        let expiry = next_expiry(at_minute(470), at_minute(0), MINUTE * 480, MINUTE * 15);
+        assert_eq!(expiry, at_minute(480));
+    }
+
+    #[test]
+    fn the_first_expiry_of_a_max_ttl_shorter_than_the_lead_is_the_max_ttl() {
+        let expiry = next_expiry(at_minute(0), at_minute(0), MINUTE * 10, MINUTE * 15);
+        assert_eq!(expiry, at_minute(10));
+    }
+
+    #[test]
+    fn a_max_ttl_too_far_off_for_the_clock_leaves_the_expiry_at_the_lead() {
+        let expiry = next_expiry(
+            at_minute(10),
+            at_minute(0),
+            Duration::from_secs(u64::MAX),
+            MINUTE * 15,
+        );
+        assert_eq!(expiry, at_minute(25));
     }
 }

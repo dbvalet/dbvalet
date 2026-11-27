@@ -138,6 +138,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let config = config::find_and_load(&cwd)?;
             let (alias, database) = policy::choose_database(&config, db.as_ref())?;
             let grant = policy::choose_role(alias, database, &role)?;
+            let max_ttl = policy::max_ttl(database);
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
             let source = DirectSource::new(alias.clone(), admin);
@@ -145,7 +146,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 database: alias,
                 role: &role,
                 grant,
-                max_ttl: database.max_ttl(),
+                max_ttl,
                 sql_log: !no_sql_log,
             };
             let outcome = run::run(&source, &options, upstream, &command).await?;

@@ -5,22 +5,24 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 use bytes::BytesMut;
 use postgres_protocol::authentication::sasl::{ChannelBinding, ScramSha256};
 use postgres_protocol::message::{backend, frontend};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::endpoint::{Endpoint, Tls};
 use crate::runlog::{MAX_LOGGED_QUERY_BYTES, ObservedSql, RunLog, StatementKind};
-use crate::source::UpstreamLogin;
+use crate::source::{AccessDeadline, UpstreamLogin};
 
 /// PostgreSQL refuses longer startup packets too.
 const MAX_STARTUP_PACKET_LEN: usize = 10_000;
@@ -72,6 +74,7 @@ struct Access {
     endpoint: Endpoint,
     login: UpstreamLogin,
     sql_log: Option<RunLog>,
+    deadline: AccessDeadline,
 }
 
 /// Listens on a random port of 127.0.0.1 until [`Proxy::stop`].
@@ -80,6 +83,7 @@ pub async fn start(
     login: UpstreamLogin,
     token: SecretString,
     sql_log: Option<RunLog>,
+    deadline: AccessDeadline,
 ) -> Result<Proxy, ProxyError> {
     if endpoint.tls() != Tls::Plaintext {
         return Err(ProxyError::TlsNotSupported);
@@ -93,6 +97,7 @@ pub async fn start(
         endpoint,
         login,
         sql_log,
+        deadline,
     });
     let (stop, stopped) = oneshot::channel();
     let accept_loop = tokio::spawn(accept(listener, access, stopped));
@@ -154,6 +159,14 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
         )
         .await;
     }
+    if access.deadline.has_passed() {
+        return refuse(
+            client,
+            CONNECTION_FAILURE_SQLSTATE,
+            "this run reached its max_ttl",
+        )
+        .await;
+    }
     let (mut server, unread) = match connect_upstream(access, &parameters).await {
         Ok(connected) => connected,
         Err(UpstreamRefusal::ErrorResponse(error)) => return client.write_all(&error).await,
@@ -164,23 +177,88 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
     client.write_all(&AUTHENTICATION_OK).await?;
     client.write_all(&unread).await?;
     match &access.sql_log {
-        Some(log) => relay_with_log(client, &mut server, &parameters, &unread, log).await?,
+        Some(log) => {
+            relay_with_log(
+                client,
+                &mut server,
+                &access.deadline,
+                &parameters,
+                &unread,
+                log,
+            )
+            .await?;
+        }
         None => {
-            tokio::io::copy_bidirectional(client, &mut server).await?;
+            let mut client = LeaseStream {
+                socket: client,
+                deadline: access.deadline.clone(),
+            };
+            let mut server = LeaseStream {
+                socket: &mut server,
+                deadline: access.deadline.clone(),
+            };
+            tokio::io::copy_bidirectional(&mut client, &mut server).await?;
         }
     }
     Ok(())
 }
 
+// Guard writes as well as the teardown timer: an already-ready socket may be
+// polled before the timer on resume, including a write that was pending at suspend.
+struct LeaseStream<T> {
+    socket: T,
+    deadline: AccessDeadline,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for LeaseStream<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for LeaseStream<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.deadline.has_passed() {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        Pin::new(&mut self.socket).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
 async fn relay_with_log(
     client: &mut TcpStream,
     server: &mut TcpStream,
+    deadline: &AccessDeadline,
     startup_parameters: &[(String, String)],
     initial_server_bytes: &[u8],
     sql_log: &RunLog,
 ) -> io::Result<()> {
-    let (mut client_read, mut client_write) = client.split();
-    let (mut server_read, mut server_write) = server.split();
+    let (mut client_read, client_write) = client.split();
+    let (mut server_read, server_write) = server.split();
+    let mut client_write = LeaseStream {
+        socket: client_write,
+        deadline: deadline.clone(),
+    };
+    let mut server_write = LeaseStream {
+        socket: server_write,
+        deadline: deadline.clone(),
+    };
     let non_utf8_encoding = AtomicBool::new(startup_requests_non_utf8(startup_parameters));
     let mut encoding_observer = EncodingObserver::new();
     encoding_observer.observe(initial_server_bytes, &non_utf8_encoding);
@@ -193,6 +271,9 @@ async fn relay_with_log(
             if n == 0 {
                 let _ = server_write.shutdown().await;
                 return Ok::<(), io::Error>(());
+            }
+            if deadline.has_passed() {
+                return Err(io::ErrorKind::TimedOut.into());
             }
             // Synchronous local file write before forwarding is intentional: it guarantees
             // every statement is on disk before PostgreSQL can reply and let the child exit.
@@ -790,6 +871,49 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_expired_proxy_connection_cannot_write_to_its_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut stream = LeaseStream {
+            socket: &mut socket,
+            deadline: AccessDeadline::at(std::time::Duration::ZERO),
+        };
+
+        let error = stream.write_all(b"test").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            peer.try_read(&mut [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_split_write_half_cannot_write_to_its_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let (_, write_half) = socket.split();
+        let mut stream = LeaseStream {
+            socket: write_half,
+            deadline: AccessDeadline::at(std::time::Duration::ZERO),
+        };
+
+        let error = stream.write_all(b"test").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            peer.try_read(&mut [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn startup_parameters_are_parsed_in_order_including_empty_values() {
