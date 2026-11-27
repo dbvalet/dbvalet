@@ -37,6 +37,16 @@ jobs:
         run: cargo test --locked --release --lib a_release_build -- --ignored
         env:
           DBVALET_TEST_MINUTE_MS: "1"
+      - name: Only the debug binary contains the test keychain switch
+        run: |
+          cargo build --locked --bin dbvalet
+          cargo build --locked --release --bin dbvalet
+          switch=DBVALET_TEST_KEYCHAIN
+          # The debug match proves the needle is still the switch's name.
+          grep -aq "$switch" target/debug/dbvalet
+          # Exit 1 is "no match"; 2 (a missing binary) must fail too.
+          status=0; grep -aq "$switch" target/release/dbvalet || status=$?
+          test "$status" -eq 1
 
   e2e:
     name: e2e (PostgreSQL ${{ matrix.postgres }})
