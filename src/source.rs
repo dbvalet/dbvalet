@@ -69,6 +69,11 @@ pub enum SourceError {
     Random(#[source] getrandom::Error),
 }
 
+pub enum MintOutcome {
+    Created(Lease),
+    Interrupted(i32),
+}
+
 #[expect(
     async_fn_in_trait,
     reason = "run is generic over the source on a single-threaded runtime, so no Send bound is needed"
@@ -76,7 +81,11 @@ pub enum SourceError {
 pub trait CredentialSource {
     /// Drops the logins that ended runs left behind. A failure on one login doesn't stop the rest.
     async fn sweep(&self) -> Result<SweepReport, SourceError>;
-    async fn mint(&self, grant: &RoleGrant) -> Result<Lease, SourceError>;
+    async fn mint(
+        &self,
+        grant: &RoleGrant,
+        interrupted: impl Future<Output = i32>,
+    ) -> Result<MintOutcome, SourceError>;
 }
 
 /// What a sweep cleaned up, and what it couldn't.

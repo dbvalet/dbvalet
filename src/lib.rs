@@ -13,6 +13,7 @@ pub mod ledger;
 pub mod policy;
 pub mod proxy;
 pub mod run;
+pub mod signals;
 pub mod source;
 pub mod tls;
 

@@ -3,7 +3,11 @@ use std::process::ExitCode;
 use clap::Parser;
 use dbvalet::cli::{self, Cli};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<ExitCode> {
-    Ok(cli::run(Cli::parse()).await?)
+fn main() -> anyhow::Result<ExitCode> {
+    // Keep the single-threaded runtime so child spawns stay on the main thread; Linux
+    // delivers PR_SET_PDEATHSIG when the spawning thread exits, not when the process does.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(runtime.block_on(cli::run(Cli::parse()))?)
 }
