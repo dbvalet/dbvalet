@@ -4,7 +4,9 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -13,7 +15,7 @@ use postgres_protocol::message::{backend, frontend};
 use rustls_pki_types::ServerName;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
@@ -22,7 +24,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_util::either::Either;
 
 use crate::endpoint::{ChannelBinding as ChannelBindingMode, Endpoint, Tls};
-use crate::source::UpstreamLogin;
+use crate::source::{AccessDeadline, UpstreamLogin};
 use crate::tls::{self, TlsError};
 
 /// PostgreSQL refuses longer startup packets too.
@@ -70,6 +72,7 @@ struct Access {
     endpoint: Endpoint,
     tls: Option<UpstreamTls>,
     login: UpstreamLogin,
+    deadline: AccessDeadline,
 }
 
 /// Listens on a random port of 127.0.0.1 until [`Proxy::stop`].
@@ -77,6 +80,7 @@ pub async fn start(
     endpoint: Endpoint,
     login: UpstreamLogin,
     token: SecretString,
+    deadline: AccessDeadline,
 ) -> Result<Proxy, ProxyError> {
     let tls = match endpoint.tls() {
         Tls::Plaintext => None,
@@ -98,6 +102,7 @@ pub async fn start(
         endpoint,
         tls,
         login,
+        deadline,
     });
     let (stop, stopped) = oneshot::channel();
     let accept_loop = tokio::spawn(accept(listener, access, stopped));
@@ -159,6 +164,14 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
         )
         .await;
     }
+    if access.deadline.has_passed() {
+        return refuse(
+            client,
+            CONNECTION_FAILURE_SQLSTATE,
+            "this run reached its max_ttl",
+        )
+        .await;
+    }
     let (mut server, unread) = match connect_upstream(access, &parameters).await {
         Ok(connected) => connected,
         Err(UpstreamRefusal::ErrorResponse(error)) => return client.write_all(&error).await,
@@ -168,8 +181,54 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
     };
     client.write_all(&AUTHENTICATION_OK).await?;
     client.write_all(&unread).await?;
-    tokio::io::copy_bidirectional(client, &mut server).await?;
+    let mut client = LeaseStream {
+        socket: client,
+        deadline: access.deadline.clone(),
+    };
+    let mut server = LeaseStream {
+        socket: &mut server,
+        deadline: access.deadline.clone(),
+    };
+    tokio::io::copy_bidirectional(&mut client, &mut server).await?;
     Ok(())
+}
+
+// Guard writes as well as the teardown timer: an already-ready socket may be
+// polled before the timer on resume, including a write that was pending at suspend.
+struct LeaseStream<'a, S> {
+    socket: &'a mut S,
+    deadline: AccessDeadline,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for LeaseStream<'_, S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.socket).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for LeaseStream<'_, S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.deadline.has_passed() {
+            return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+        }
+        Pin::new(&mut *self.socket).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.socket).poll_shutdown(cx)
+    }
 }
 
 /// Answers each SSL or GSS encryption request with `N` until the startup message comes,
@@ -477,6 +536,27 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_expired_proxy_connection_cannot_write_to_its_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut stream = LeaseStream {
+            socket: &mut socket,
+            deadline: AccessDeadline::at(std::time::Duration::ZERO),
+        };
+
+        let error = stream.write_all(b"test").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            peer.try_read(&mut [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn startup_parameters_are_parsed_in_order_including_empty_values() {

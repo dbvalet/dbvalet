@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 
@@ -10,7 +11,7 @@ use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
 use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT, WaitOutcome};
-use crate::source::{CredentialSource, MintOutcome, SourceError, UpstreamLogin};
+use crate::source::{CredentialSource, Lease, MintOutcome, SourceError};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
@@ -36,11 +37,12 @@ pub enum RunError {
 }
 
 /// Sweeps what earlier runs left, runs `command` against a new temporary login through the
-/// proxy, then drops the login.
+/// proxy, then drops the login. At `max_ttl` the lease drops it while `command` keeps running.
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
     grant: &RoleGrant,
+    max_ttl: Duration,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<WaitOutcome, RunError> {
@@ -54,13 +56,13 @@ pub async fn run<S: CredentialSource>(
     if let Some(signal) = signals.poll_pending().await {
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
-    let lease = match source.mint(grant, signals.next_signal()).await? {
+    let lease = match source.mint(grant, max_ttl, signals.next_signal()).await? {
         MintOutcome::Created(lease) => lease,
         MintOutcome::Interrupted(signal) => return Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
     };
     let finished = match signals.poll_pending().await {
         Some(signal) => Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
-        None => run_child(&mut signals, lease.login(), upstream, command).await,
+        None => run_child(&mut signals, &lease, upstream, command).await,
     };
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
@@ -68,24 +70,26 @@ pub async fn run<S: CredentialSource>(
     finished
 }
 
+/// Leaves the proxy to the lease, whose teardown stops it.
 async fn run_child(
     signals: &mut RunSignals,
-    login: &UpstreamLogin,
+    lease: &Lease,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<WaitOutcome, RunError> {
+    let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
     let database = upstream.database().to_owned();
-    let proxy = proxy::start(upstream, login.clone(), token.clone()).await?;
-    let finished = spawn_and_wait(
-        signals,
-        command,
-        login.user(),
-        &token,
-        proxy.port(),
-        &database,
+    let proxy = proxy::start(
+        upstream,
+        login.clone(),
+        token.clone(),
+        lease.access_deadline(),
     )
-    .await;
+    .await?;
+    let port = proxy.port();
+    lease.attach_proxy(proxy).await;
+    let finished = spawn_and_wait(signals, command, login.user(), &token, port, &database).await;
     if let Ok(WaitOutcome::TimedOut(signal)) = finished {
         let _ = writeln!(
             io::stderr(),
@@ -94,7 +98,6 @@ async fn run_child(
             signal.name()
         );
     }
-    proxy.stop().await;
     finished
 }
 

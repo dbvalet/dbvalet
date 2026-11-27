@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use dbvalet::endpoint::{ChannelBinding, Endpoint, TrustRoot};
 use dbvalet::proxy;
-use dbvalet::source::UpstreamLogin;
+use dbvalet::source::{AccessDeadline, UpstreamLogin};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::SslMode;
@@ -110,7 +110,14 @@ fn run_tls(dir: &Path, command: &[&str]) -> Output {
 async fn proxy_refusal(endpoint: Endpoint) -> DbError {
     let login = UpstreamLogin::new("postgres".to_owned(), SecretString::from("e2e-throwaway"));
     let token = SecretString::from("e2e-proxy-tls-token");
-    let proxy = proxy::start(endpoint, login, token.clone()).await.unwrap();
+    let proxy = proxy::start(
+        endpoint,
+        login,
+        token.clone(),
+        AccessDeadline::after(Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
     let mut config = tokio_postgres::Config::new();
     config
         .host("127.0.0.1")
