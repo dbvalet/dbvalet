@@ -784,13 +784,18 @@ async fn connect_upstream(
 ) -> Result<(UpstreamStream, BytesMut), UpstreamRefusal> {
     let endpoint = &access.endpoint;
     let login = &access.login;
-    let tcp = TcpStream::connect((endpoint.host(), endpoint.port()))
-        .await
-        .map_err(|err| {
-            UpstreamRefusal::Failed(format!(
-                "dbvalet couldn't reach the database at {endpoint}: {err}"
-            ))
-        })?;
+    let mut dialed = Err(io::Error::from(io::ErrorKind::NotFound));
+    for host in endpoint.dial_hosts() {
+        dialed = TcpStream::connect((host, endpoint.port())).await;
+        if dialed.is_ok() {
+            break;
+        }
+    }
+    let tcp = dialed.map_err(|err| {
+        UpstreamRefusal::Failed(format!(
+            "dbvalet couldn't reach the database at {endpoint}: {err}"
+        ))
+    })?;
     let (mut server, peer_cert_digest) = negotiate_upstream_tls(tcp, access).await?;
     let parameters = client_parameters
         .iter()

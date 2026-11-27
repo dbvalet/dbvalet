@@ -1173,8 +1173,10 @@ async fn connect_with_cancel_tls(
 ) -> Result<(Client, Option<tls::MakeRustlsConnect>), String> {
     let endpoint = admin.endpoint();
     let mut config = tokio_postgres::Config::new();
+    for host in endpoint.dial_hosts() {
+        config.host(host);
+    }
     config
-        .host(endpoint.host())
         .port(endpoint.port())
         .dbname(endpoint.database())
         .user(admin.user())
