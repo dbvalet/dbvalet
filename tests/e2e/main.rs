@@ -3,91 +3,21 @@
 //!
 //! Every test uses its own alias and admin role, so they can run in parallel.
 
-use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 
-const DBVALET: &str = env!("CARGO_BIN_EXE_dbvalet");
-const SUPERUSER_URL: &str = "postgresql://postgres:e2e-throwaway@localhost:5432/postgres";
-
-/// A test that makes an expired `dbvalet_` login holds this for writing until its own sweep has
-/// run. Every other run and gc holds it for reading: their sweeps would otherwise drop that
-/// login first, without its ledger entry. A test takes it at most once, so it never nests.
-static EXPIRED_FIXTURE: RwLock<()> = RwLock::new(());
-
-fn sweeping() -> RwLockReadGuard<'static, ()> {
-    EXPIRED_FIXTURE
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-fn sweeping_alone() -> RwLockWriteGuard<'static, ()> {
-    EXPIRED_FIXTURE
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-}
-
-fn superuser_sql(sql: &str) {
-    runtime().block_on(async {
-        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        client.batch_execute(sql).await.unwrap();
-    });
-}
-
-fn server_version_num() -> i32 {
-    runtime().block_on(async {
-        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        let row = client
-            .query_one("SELECT current_setting('server_version_num')::int", &[])
-            .await
-            .unwrap();
-        row.get(0)
-    })
-}
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-}
-
-fn login(alias: &str, connection_string: &str) -> Output {
-    let mut login = Command::new(DBVALET)
-        .args(["login", alias])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = login.stdin.take().unwrap();
-    writeln!(stdin, "{connection_string}").unwrap();
-    drop(stdin);
-    login.wait_with_output().unwrap()
-}
-
-fn doctor(alias: &str) -> Output {
-    Command::new(DBVALET)
-        .args(["doctor", "--allow-plaintext", alias])
-        .output()
-        .unwrap()
-}
-
-fn text(bytes: &[u8]) -> String {
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
+mod support;
+use support::{
+    DBVALET, SUPERUSER_URL, create_reader_group, doctor, gc_command, gc_in, ledger_entry, login,
+    passwords_of, printed, project_with_reader, project_with_reader_and_admin, run_command, run_in,
+    runtime, server_version_num, superuser_count, superuser_sql, sweeping, sweeping_alone, text,
+    wait_for_active_query,
+};
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
@@ -405,74 +335,6 @@ fn doctor_names_the_fix_for_nologin_expired_and_missing_database_connections() {
     );
 }
 
-/// Creates the shared read-only group role; tests running in parallel may race to create it.
-fn create_reader_group() {
-    superuser_sql(
-        "DO $$ BEGIN
-             CREATE ROLE dbvalet_reader NOLOGIN;
-         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
-         END $$;",
-    );
-}
-
-/// Stores a superuser admin login under `alias` and writes a `dbvalet.toml` that lists
-/// `alias` with a read-only `reader` role. Returns the directory holding the file.
-fn project_with_reader(alias: &str) -> PathBuf {
-    project_with_reader_and_admin(alias, "SUPERUSER")
-}
-
-/// Like [`project_with_reader`], with an admin that has `attributes` and ADMIN OPTION on
-/// `dbvalet_reader`, which `dbvalet init` will grant.
-fn project_with_reader_and_admin(alias: &str, attributes: &str) -> PathBuf {
-    create_reader_group();
-    let admin = alias.replace('-', "_");
-    superuser_sql(&format!(
-        "DROP ROLE IF EXISTS {admin};
-         CREATE ROLE {admin} LOGIN {attributes} PASSWORD 'pw-{alias}-admin';
-         GRANT dbvalet_reader TO {admin} WITH ADMIN OPTION;"
-    ));
-    let stored = login(
-        alias,
-        &format!("postgresql://{admin}:pw-{alias}-admin@localhost:5432/postgres"),
-    );
-    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(alias);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("dbvalet.toml"),
-        format!(
-            "[databases.{alias}.roles]\n\
-             reader = {{ member_of = \"dbvalet_reader\", read_only = true }}\n"
-        ),
-    )
-    .unwrap();
-    dir
-}
-
-fn run_command(dir: &Path, command: &[&str]) -> Command {
-    let mut run = Command::new(DBVALET);
-    run.current_dir(dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .args(["run", "--allow-plaintext", "--"])
-        .args(command);
-    run
-}
-
-fn run_in(dir: &Path, command: &[&str]) -> Output {
-    let _sweeping = sweeping();
-    run_command(dir, command).output().unwrap()
-}
-
-fn superuser_count(sql: &str, name: &str) -> i64 {
-    runtime().block_on(async {
-        let (client, connection) = tokio_postgres::connect(SUPERUSER_URL, tokio_postgres::NoTls)
-            .await
-            .unwrap();
-        tokio::spawn(connection);
-        client.query_one(sql, &[&name]).await.unwrap().get(0)
-    })
-}
-
 /// A run whose child prints its login name and waits on stdin, so the test can copy the
 /// login's SCRAM verifier from `pg_authid` into a `witness` role before the login is dropped.
 /// Logging in as the witness then tells whether a string is the temporary login's password.
@@ -524,27 +386,6 @@ fn run_with_password_witness(dir: &Path, script: &str, witness: &str) -> Output 
     let mut output = run.wait_with_output().unwrap();
     output.stdout = format!("{seen}{rest}").into_bytes();
     output
-}
-
-/// Every word of 16 or more letters and digits in `text` that logs in as `witness`.
-fn passwords_of(witness: &str, text: &str) -> Vec<String> {
-    let words: BTreeSet<&str> = text
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| word.len() >= 16)
-        .collect();
-    runtime().block_on(async {
-        let mut found = Vec::new();
-        for word in words {
-            let url = format!("postgresql://{witness}:{word}@localhost:5432/postgres");
-            if tokio_postgres::connect(&url, tokio_postgres::NoTls)
-                .await
-                .is_ok()
-            {
-                found.push(word.to_owned());
-            }
-        }
-        found
-    })
 }
 
 #[test]
@@ -1054,19 +895,6 @@ fn a_read_only_run_leaves_no_large_objects_after_teardown() {
     );
 }
 
-fn gc_command(dir: &Path) -> Command {
-    let mut gc = Command::new(DBVALET);
-    gc.current_dir(dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .args(["gc", "--allow-plaintext"]);
-    gc
-}
-
-fn gc_in(dir: &Path) -> Output {
-    let _sweeping = sweeping();
-    gc_command(dir).output().unwrap()
-}
-
 /// Runs `command` to the end, failing the test if it takes longer than `limit`.
 fn output_within(mut command: Command, limit: Duration) -> Output {
     let mut child = command
@@ -1109,13 +937,6 @@ fn start_run_until_ready(dir: &Path, run_args: &[&str], script: &str) -> (Child,
     (run, seen)
 }
 
-/// The value of the first `key=value` line the child printed.
-fn printed<'a>(seen: &'a str, key: &str) -> &'a str {
-    seen.lines()
-        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
-        .unwrap()
-}
-
 /// A NOLOGIN group for a writable `writer` role, owning a schema of the same name, so tests
 /// running in parallel never change the same schema's privileges at once.
 fn create_writer_group(group: &str) {
@@ -1126,25 +947,6 @@ fn create_writer_group(group: &str) {
          END $$;
          CREATE SCHEMA IF NOT EXISTS {group} AUTHORIZATION {group};"
     ));
-}
-
-/// Where a run in `dir` keeps the ledger entry for `login` on `alias`.
-fn ledger_entry(dir: &Path, alias: &str, login: &str) -> PathBuf {
-    dir.join("state/dbvalet/ledger")
-        .join(format!("{alias}.{login}"))
-}
-
-/// Waits up to 10 s for a session of `login` to be running a query.
-fn wait_for_active_query(login: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while superuser_count(
-        "SELECT count(*) FROM pg_stat_activity WHERE usename = $1 AND state = 'active'",
-        login,
-    ) == 0
-    {
-        assert!(Instant::now() < deadline, "no active query for {login}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 /// Starts a run in `dir` whose child keeps a `pg_sleep` query running through the proxy and
