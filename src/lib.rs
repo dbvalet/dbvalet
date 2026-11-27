@@ -1,6 +1,8 @@
 //! Temporary PostgreSQL logins for AI coding agents, behind a local proxy.
 
+use std::ffi::OsString;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
@@ -13,6 +15,7 @@ pub mod ledger;
 pub mod policy;
 pub mod proxy;
 pub mod run;
+pub mod runlog;
 pub mod signals;
 pub mod source;
 pub mod tls;
@@ -23,14 +26,34 @@ pub(crate) const LOGIN_PREFIX: &str = "dbvalet_";
 pub(crate) const RUN_ID_BYTES: usize = 10;
 const RUN_ID_CHARS: usize = RUN_ID_BYTES * 8 / 5;
 
+/// Whether `run_id` is a valid 16-character lowercase base32 run ID (`^[a-z2-7]{16}$`).
+pub(crate) fn is_run_id(run_id: &str) -> bool {
+    run_id.len() == RUN_ID_CHARS
+        && run_id
+            .bytes()
+            .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
+}
+
 /// Whether `name` is a temporary login's name: `^dbvalet_[a-z2-7]{16}$`.
 pub(crate) fn is_login_name(name: &str) -> bool {
-    name.strip_prefix(LOGIN_PREFIX).is_some_and(|run_id| {
-        run_id.len() == RUN_ID_CHARS
-            && run_id
-                .bytes()
-                .all(|c| matches!(c, b'a'..=b'z' | b'2'..=b'7'))
-    })
+    name.strip_prefix(LOGIN_PREFIX).is_some_and(is_run_id)
+}
+
+/// `$XDG_STATE_HOME/dbvalet`, else `~/.local/state/dbvalet`. The XDG spec says to ignore a
+/// relative `XDG_STATE_HOME`.
+pub(crate) fn state_dir() -> Option<PathBuf> {
+    resolve_state_dir(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+fn resolve_state_dir(xdg_state_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let base = match xdg_state_home
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        Some(dir) => dir,
+        None => PathBuf::from(home.filter(|home| !home.is_empty())?).join(".local/state"),
+    };
+    Some(base.join("dbvalet"))
 }
 
 /// Lowercase RFC 4648 base32: safe in an unquoted SQL identifier, a URL and an environment value.
@@ -138,5 +161,31 @@ mod tests {
         assert!("-app".parse::<DatabaseAlias>().is_err());
         assert!("my app".parse::<DatabaseAlias>().is_err());
         assert!("../app".parse::<DatabaseAlias>().is_err());
+    }
+
+    #[test]
+    fn an_absolute_xdg_state_home_holds_the_state_directory() {
+        assert_eq!(
+            resolve_state_dir(Some("/xdg/state".into()), Some("/home/dev".into())),
+            Some(PathBuf::from("/xdg/state/dbvalet"))
+        );
+    }
+
+    #[test]
+    fn a_relative_or_missing_xdg_state_home_falls_back_to_home() {
+        assert_eq!(
+            resolve_state_dir(Some("relative/state".into()), Some("/home/dev".into())),
+            Some(PathBuf::from("/home/dev/.local/state/dbvalet"))
+        );
+        assert_eq!(
+            resolve_state_dir(None, Some("/home/dev".into())),
+            Some(PathBuf::from("/home/dev/.local/state/dbvalet"))
+        );
+    }
+
+    #[test]
+    fn without_xdg_state_home_or_home_there_is_no_state_directory() {
+        assert_eq!(resolve_state_dir(None, None), None);
+        assert_eq!(resolve_state_dir(None, Some("".into())), None);
     }
 }

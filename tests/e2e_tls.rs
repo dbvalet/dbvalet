@@ -114,6 +114,7 @@ async fn proxy_refusal(endpoint: Endpoint) -> DbError {
         endpoint,
         login,
         token.clone(),
+        None,
         AccessDeadline::after(Duration::from_secs(60)),
     )
     .await

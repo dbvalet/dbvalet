@@ -1,5 +1,6 @@
 //! The command line, mapped onto library calls.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
@@ -14,7 +15,8 @@ use crate::config::{self, ConfigError};
 use crate::keychain::{self, KeychainError};
 use crate::ledger;
 use crate::policy::{self, PolicyError};
-use crate::run::{self, RunError};
+use crate::run::{self, RunError, RunOptions};
+use crate::runlog::{self, RunLogError};
 use crate::signals::WaitOutcome;
 use crate::source::CredentialSource;
 use crate::source::direct::{self, DirectSource};
@@ -52,9 +54,22 @@ enum Command {
         /// Connect without TLS. Allowed only for a database on localhost.
         #[arg(long)]
         allow_plaintext: bool,
+        /// Record only the run header, without command arguments or SQL statements.
+        #[arg(long)]
+        no_sql_log: bool,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
+    },
+    /// List recent runs (newest first), or print one run's log.
+    ///
+    /// The run token and temporary login password are always scrubbed. SQL password redaction
+    /// (such as `ALTER ROLE ... PASSWORD '[REDACTED]'`) is lexical and best-effort; use
+    /// `dbvalet run --no-sql-log` when query text must stay off disk.
+    /// Statements over the 64 KiB capture limit are recorded as a truncation marker.
+    Log {
+        /// The run ID to print. Omit to list recent runs.
+        run_id: Option<String>,
     },
     /// Drop the temporary logins that killed runs left behind.
     ///
@@ -84,6 +99,10 @@ pub enum CliError {
     Policy(#[from] PolicyError),
     #[error(transparent)]
     Run(#[from] RunError),
+    #[error(transparent)]
+    RunLog(#[from] RunLogError),
+    #[error("couldn't write to stdout")]
+    WriteStdout(#[source] io::Error),
 }
 
 pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
@@ -98,7 +117,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             alias,
             allow_plaintext,
         } => {
-            let checks = direct::doctor(&alias, allow_plaintext).await;
+            let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let roles = match config::find_and_load(&cwd) {
+                Ok(config) => config
+                    .databases
+                    .get(&alias)
+                    .map(|policy| policy.roles.clone())
+                    .unwrap_or_default(),
+                Err(ConfigError::NotFound { .. }) => BTreeMap::new(),
+                Err(err) => return Err(err.into()),
+            };
+            let checks = direct::doctor(&alias, allow_plaintext, &roles).await;
             for check in &checks {
                 println!("{check}");
             }
@@ -113,6 +142,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             db,
             role,
             allow_plaintext,
+            no_sql_log,
             command,
         } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
@@ -123,8 +153,39 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
             let source = DirectSource::new(alias.clone(), admin);
-            let outcome = run::run(&source, grant, max_ttl, upstream, &command).await?;
+            let options = RunOptions {
+                database: alias,
+                role: &role,
+                grant,
+                max_ttl,
+                sql_log: !no_sql_log,
+            };
+            let outcome = run::run(&source, &options, upstream, &command).await?;
             Ok(exit_code(outcome))
+        }
+        Command::Log { run_id: None } => {
+            let runs = runlog::list()?;
+            let mut stdout = io::stdout().lock();
+            if runs.is_empty() {
+                write_stdout(&mut stdout, b"No runs logged yet.\n")?;
+            } else {
+                for summary in &runs {
+                    write_stdout(&mut stdout, format!("{summary}\n").as_bytes())?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Log {
+            run_id: Some(run_id),
+        } => {
+            let mut stdout = io::stdout().lock();
+            match runlog::copy_to(&run_id, &mut stdout) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(RunLogError::WriteOutput(err)) if err.kind() == io::ErrorKind::BrokenPipe => {
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(err) => Err(err.into()),
+            }
         }
         Command::Gc { allow_plaintext } => {
             let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
@@ -157,6 +218,15 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 ExitCode::FAILURE
             })
         }
+    }
+}
+
+/// Writes to stdout, treating a closed downstream pipe (`head`, `less`) as a clean stop.
+fn write_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
+    match stdout.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(CliError::WriteStdout(err)),
     }
 }
 
