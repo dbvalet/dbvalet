@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::{CertificateError, ClientConfig, ClientConnection, RootCertStore};
-use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -106,19 +106,13 @@ fn load_root_certs(path: &Path) -> Result<RootCertStore, TlsError> {
             path: path.to_path_buf(),
         });
     }
-    let mut pem = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_ROOT_CERT_BYTES + 1).read_to_end(&mut pem))
-        .map_err(read_error)?;
-    if pem.len() as u64 > MAX_ROOT_CERT_BYTES {
-        return Err(TlsError::RootCertTooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_ROOT_CERT_BYTES,
-        });
-    }
+    let pem = read_capped(path, File::open(path).map_err(read_error)?)?;
     let mut roots = RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(&pem) {
-        let cert = cert.map_err(|err| map_pem_error(path, err))?;
+        // PEM parse errors can quote raw file contents.
+        let cert = cert.map_err(|_| TlsError::InvalidRootCertPem {
+            path: path.to_path_buf(),
+        })?;
         roots
             .add(cert)
             .map_err(|source| TlsError::InvalidRootCertificate {
@@ -134,17 +128,23 @@ fn load_root_certs(path: &Path) -> Result<RootCertStore, TlsError> {
     Ok(roots)
 }
 
-fn map_pem_error(path: &Path, err: pem::Error) -> TlsError {
-    match err {
-        pem::Error::Io(source) => TlsError::ReadRootCert {
+fn read_capped(path: &Path, source: impl Read) -> Result<Vec<u8>, TlsError> {
+    let mut pem = Vec::new();
+    // One byte past the cap tells an oversized file, or one growing while read, from one at it.
+    source
+        .take(MAX_ROOT_CERT_BYTES + 1)
+        .read_to_end(&mut pem)
+        .map_err(|source| TlsError::ReadRootCert {
             path: path.to_path_buf(),
             source,
-        },
-        // PEM parse errors can quote raw file contents.
-        _ => TlsError::InvalidRootCertPem {
+        })?;
+    if pem.len() as u64 > MAX_ROOT_CERT_BYTES {
+        return Err(TlsError::RootCertTooLarge {
             path: path.to_path_buf(),
-        },
+            limit: MAX_ROOT_CERT_BYTES,
+        });
     }
+    Ok(pem)
 }
 
 pub fn describe_tls_refused(endpoint: &Endpoint) -> String {
@@ -825,6 +825,14 @@ mod tests {
             )
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_a_source_larger_than_the_cap_stops_one_byte_past_it() {
+        let mut source = std::io::Cursor::new(vec![b'\n'; 2 * 1024 * 1024]);
+        let err = read_capped(Path::new("/etc/ssl/ca.pem"), &mut source).unwrap_err();
+        assert!(matches!(err, TlsError::RootCertTooLarge { .. }), "{err}");
+        assert_eq!(source.position(), 1_048_577);
     }
 
     #[test]
