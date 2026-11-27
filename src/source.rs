@@ -19,6 +19,10 @@ pub struct UpstreamLogin {
 }
 
 impl UpstreamLogin {
+    pub fn new(user: String, password: SecretString) -> Self {
+        Self { user, password }
+    }
+
     pub fn user(&self) -> &str {
         &self.user
     }
@@ -122,10 +126,10 @@ mod tests {
 
     #[test]
     fn an_upstream_login_debug_output_hides_the_password() {
-        let login = UpstreamLogin {
-            user: "dbvalet_aaaaaaaaaaaaaaaa".to_owned(),
-            password: SecretString::from("pw-upstream-unit-3e7"),
-        };
+        let login = UpstreamLogin::new(
+            "dbvalet_aaaaaaaaaaaaaaaa".to_owned(),
+            SecretString::from("pw-upstream-unit-3e7"),
+        );
         assert!(!format!("{login:?}").contains("pw-upstream-unit-3e7"));
     }
 }

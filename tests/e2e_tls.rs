@@ -10,6 +10,15 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
+
+use dbvalet::endpoint::{ChannelBinding, Endpoint, TrustRoot};
+use dbvalet::proxy;
+use dbvalet::source::UpstreamLogin;
+use secrecy::{ExposeSecret, SecretString};
+use tokio_postgres::NoTls;
+use tokio_postgres::config::SslMode;
+use tokio_postgres::error::{DbError, SqlState};
 
 const DBVALET: &str = env!("CARGO_BIN_EXE_dbvalet");
 
@@ -96,6 +105,67 @@ fn run_tls(dir: &Path, command: &[&str]) -> Output {
         .args(command)
         .output()
         .unwrap()
+}
+
+async fn proxy_refusal(endpoint: Endpoint) -> DbError {
+    let login = UpstreamLogin::new("postgres".to_owned(), SecretString::from("e2e-throwaway"));
+    let token = SecretString::from("e2e-proxy-tls-token");
+    let proxy = proxy::start(endpoint, login, token.clone()).await.unwrap();
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host("127.0.0.1")
+        .port(proxy.port())
+        .user("postgres")
+        .dbname("postgres")
+        .password(token.expose_secret())
+        .ssl_mode(SslMode::Disable);
+    let result = tokio::time::timeout(Duration::from_secs(10), config.connect(NoTls)).await;
+    proxy.stop().await;
+    result
+        .expect("proxy connection timed out")
+        .err()
+        .expect("the proxy accepted the upstream connection")
+        .as_db_error()
+        .expect("expected a PostgreSQL error from the proxy")
+        .clone()
+}
+
+#[tokio::test]
+#[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
+async fn the_proxy_refuses_a_certificate_for_the_wrong_hostname() {
+    let endpoint = Endpoint::with_tls_options(
+        "localhost".to_owned(),
+        wrong_host_port().parse().unwrap(),
+        "postgres".to_owned(),
+        false,
+        TrustRoot::PemFile(PathBuf::from(ca_cert())),
+        ChannelBinding::Prefer,
+    )
+    .unwrap();
+
+    let err = proxy_refusal(endpoint).await;
+    assert_eq!(err.code(), &SqlState::CONNECTION_FAILURE);
+    assert_eq!(
+        err.message(),
+        "TLS certificate doesn't match the host `localhost`"
+    );
+}
+
+#[tokio::test]
+#[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
+async fn the_proxy_refuses_a_certificate_from_an_untrusted_issuer() {
+    let endpoint = Endpoint::new(
+        "localhost".to_owned(),
+        tls_port().parse().unwrap(),
+        "postgres".to_owned(),
+        false,
+    )
+    .unwrap();
+
+    let err = proxy_refusal(endpoint).await;
+    assert_eq!(err.code(), &SqlState::CONNECTION_FAILURE);
+    assert!(err.message().contains("certificate"), "{err}");
+    assert!(err.message().contains("sslrootcert"), "{err}");
 }
 
 #[test]

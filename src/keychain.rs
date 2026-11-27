@@ -782,6 +782,26 @@ mod tests {
     }
 
     #[test]
+    fn malformed_tls_option_escapes_are_refused_without_printing_the_password() {
+        for url in [
+            "postgresql://admin:pw-unit-7f3a9c@localhost/app?sslmode=verify-full%",
+            "postgresql://admin:pw-unit-7f3a9c@localhost/app?sslrootcert=ca%2.pem",
+            "postgresql://admin:pw-unit-7f3a9c@localhost/app?sslrootcert=ca%zz.pem",
+            "postgresql://admin:pw-unit-7f3a9c@localhost/app?sslrootcert=ca%ff.pem",
+        ] {
+            let err = parse_error(url);
+            assert!(matches!(
+                err,
+                KeychainError::BadConnectionString {
+                    problem: "it isn't a PostgreSQL connection string",
+                    ..
+                }
+            ));
+            assert_hides_password(&err);
+        }
+    }
+
+    #[test]
     fn sslmode_disable_without_allow_plaintext_still_requires_verified_tls() {
         let login = parse(
             &alias(),

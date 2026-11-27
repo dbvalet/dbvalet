@@ -203,7 +203,7 @@ impl CredentialSource for DirectSource {
             .map_err(create_failed)?;
 
         Ok(Lease {
-            login: UpstreamLogin { user, password },
+            login: UpstreamLogin::new(user, password),
             alias: self.alias.clone(),
             admin: Arc::clone(&self.admin),
             member_of: grant.member_of.clone(),
