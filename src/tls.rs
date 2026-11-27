@@ -2,15 +2,16 @@
 //! the admin connection and the proxy's upstream connections.
 
 use std::error::Error as StdError;
+use std::fs::{self, File};
 use std::future::Future;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rustls::{CertificateError, ClientConfig, ClientConnection, RootCertStore};
-use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -40,6 +41,10 @@ pub enum TlsError {
         #[source]
         source: io::Error,
     },
+    #[error("the sslrootcert file `{path}` isn't a regular file")]
+    RootCertNotAFile { path: PathBuf },
+    #[error("the sslrootcert file `{path}` is larger than {limit} bytes")]
+    RootCertTooLarge { path: PathBuf, limit: u64 },
     #[error("the sslrootcert file `{path}` isn't valid PEM")]
     InvalidRootCertPem { path: PathBuf },
     #[error("the sslrootcert file `{path}` contains an invalid CA certificate: {source}")]
@@ -85,11 +90,29 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>, TlsError> {
     })
 }
 
+/// Real CA bundles are a few hundred KB (Debian's `ca-certificates.crt`, the AWS RDS global
+/// bundle), so 1 MiB leaves headroom while keeping a wrong path from exhausting memory.
+const MAX_ROOT_CERT_BYTES: u64 = 1024 * 1024;
+
 fn load_root_certs(path: &Path) -> Result<RootCertStore, TlsError> {
-    let certs = CertificateDer::pem_file_iter(path).map_err(|err| map_pem_error(path, err))?;
+    let read_error = |source| TlsError::ReadRootCert {
+        path: path.to_path_buf(),
+        source,
+    };
+    // Checked on the path before opening, because opening a FIFO blocks until a writer appears.
+    // A swap between this check and the open needs a hostile same-user process (ADR-0003).
+    if !fs::metadata(path).map_err(read_error)?.is_file() {
+        return Err(TlsError::RootCertNotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let pem = read_capped(path, File::open(path).map_err(read_error)?)?;
     let mut roots = RootCertStore::empty();
-    for cert in certs {
-        let cert = cert.map_err(|err| map_pem_error(path, err))?;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        // PEM parse errors can quote raw file contents.
+        let cert = cert.map_err(|_| TlsError::InvalidRootCertPem {
+            path: path.to_path_buf(),
+        })?;
         roots
             .add(cert)
             .map_err(|source| TlsError::InvalidRootCertificate {
@@ -105,17 +128,23 @@ fn load_root_certs(path: &Path) -> Result<RootCertStore, TlsError> {
     Ok(roots)
 }
 
-fn map_pem_error(path: &Path, err: pem::Error) -> TlsError {
-    match err {
-        pem::Error::Io(source) => TlsError::ReadRootCert {
+fn read_capped(path: &Path, source: impl Read) -> Result<Vec<u8>, TlsError> {
+    let mut pem = Vec::new();
+    // One byte past the cap tells an oversized file, or one growing while read, from one at it.
+    source
+        .take(MAX_ROOT_CERT_BYTES + 1)
+        .read_to_end(&mut pem)
+        .map_err(|source| TlsError::ReadRootCert {
             path: path.to_path_buf(),
             source,
-        },
-        // PEM parse errors can quote raw file contents.
-        _ => TlsError::InvalidRootCertPem {
+        })?;
+    if pem.len() as u64 > MAX_ROOT_CERT_BYTES {
+        return Err(TlsError::RootCertTooLarge {
             path: path.to_path_buf(),
-        },
+            limit: MAX_ROOT_CERT_BYTES,
+        });
     }
+    Ok(pem)
 }
 
 pub fn describe_tls_refused(endpoint: &Endpoint) -> String {
@@ -725,6 +754,96 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const TWO_TEST_CAS: &[u8] = include_bytes!("../tests/fixtures/two-test-cas.pem");
+
+    fn temp_rootcert_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tls")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sslrootcert_naming_a_directory_is_refused_as_not_a_regular_file() {
+        let dir = temp_rootcert_dir("directory");
+        let err = load_root_certs(&dir).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the sslrootcert file `{}` isn't a regular file",
+                dir.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sslrootcert_naming_a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = temp_rootcert_dir("fifo");
+        let fifo = dir.join("ca.fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(load_root_certs(&fifo)));
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("loading the FIFO should not block");
+        let err = result.unwrap_err();
+        assert!(matches!(err, TlsError::RootCertNotAFile { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sslrootcert_naming_a_character_device_is_refused_as_not_a_regular_file() {
+        let err = load_root_certs(Path::new("/dev/null")).unwrap_err();
+        assert!(matches!(err, TlsError::RootCertNotAFile { .. }), "{err}");
+    }
+
+    #[test]
+    fn sslrootcert_one_byte_over_the_cap_is_refused_as_too_large() {
+        let dir = temp_rootcert_dir("over-cap");
+        let path = dir.join("ca.pem");
+        let mut bundle = TWO_TEST_CAS.to_vec();
+        bundle.resize(1_048_577, b'\n');
+        std::fs::write(&path, bundle).unwrap();
+        let err = load_root_certs(&path).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the sslrootcert file `{}` is larger than 1048576 bytes",
+                path.display()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reading_a_source_larger_than_the_cap_stops_one_byte_past_it() {
+        let mut source = std::io::Cursor::new(vec![b'\n'; 2 * 1024 * 1024]);
+        let err = read_capped(Path::new("/etc/ssl/ca.pem"), &mut source).unwrap_err();
+        assert!(matches!(err, TlsError::RootCertTooLarge { .. }), "{err}");
+        assert_eq!(source.position(), 1_048_577);
+    }
+
+    #[test]
+    fn sslrootcert_bundle_exactly_at_the_cap_loads_every_certificate() {
+        let dir = temp_rootcert_dir("at-cap");
+        let path = dir.join("ca.pem");
+        let mut bundle = TWO_TEST_CAS.to_vec();
+        bundle.resize(1_048_576, b'\n');
+        std::fs::write(&path, bundle).unwrap();
+        assert_eq!(load_root_certs(&path).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
