@@ -170,6 +170,132 @@ fn run_with_two_databases_and_no_db_flag_is_refused_and_lists_the_aliases() {
     assert!(output.stdout.is_empty());
 }
 
+fn state_home(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn log_with_no_runs_prints_empty_notice_and_exits_zero() {
+    let state = state_home("cli-test-log-empty");
+
+    let output = Command::new(DBVALET)
+        .env("XDG_STATE_HOME", &state)
+        .args(["log"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "No runs logged yet.\n"
+    );
+}
+
+#[test]
+fn log_lists_runs_newest_first() {
+    let state = state_home("cli-test-log-order");
+    let runs = state.join("dbvalet").join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::write(
+        runs.join("20261126T100000.000000000Z-aaaaaaaaaaaaaaaa.log"),
+        "run_id: aaaaaaaaaaaaaaaa\n\
+         started_at: 2026-11-26T10:00:00Z\n\
+         database: app\n\
+         role: reader\n\
+         valid_until: 2026-11-26T10:15:00Z\n\
+         max_ttl: 480m\n\
+         sql_log: enabled\n\
+         command: psql -c 'select 1'\n\
+         \n\
+         2026-11-26T10:00:01Z [Q] select 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        runs.join("20261126T100500.000000000Z-bbbbbbbbbbbbbbbb.log"),
+        "run_id: bbbbbbbbbbbbbbbb\n\
+         started_at: 2026-11-26T10:05:00Z\n\
+         database: app\n\
+         role: reader\n\
+         valid_until: 2026-11-26T10:20:00Z\n\
+         max_ttl: 480m\n\
+         sql_log: enabled\n\
+         command: psql -c 'select 2'\n\
+         \n\
+         2026-11-26T10:05:01Z [Q] select 2\n",
+    )
+    .unwrap();
+
+    let output = Command::new(DBVALET)
+        .env("XDG_STATE_HOME", &state)
+        .args(["log"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "stdout: {stdout}");
+    assert!(lines[0].contains("bbbbbbbbbbbbbbbb"), "stdout: {stdout}");
+    assert!(lines[1].contains("aaaaaaaaaaaaaaaa"), "stdout: {stdout}");
+}
+
+#[test]
+fn log_with_a_run_id_prints_that_run_log_and_fails_when_missing() {
+    let state = state_home("cli-test-log-show");
+    let runs = state.join("dbvalet").join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let body = "run_id: cccccccccccccccc\n\
+                started_at: 2026-11-26T10:05:00Z\n\
+                database: app\n\
+                role: reader\n\
+                valid_until: 2026-11-26T10:20:00Z\n\
+                max_ttl: 480m\n\
+                sql_log: enabled\n\
+                command: psql -c 'select 1'\n\
+                \n\
+                2026-11-26T10:05:01Z [Q] select 1\n";
+    std::fs::write(
+        runs.join("20261126T100500.000000000Z-cccccccccccccccc.log"),
+        body,
+    )
+    .unwrap();
+
+    let found = Command::new(DBVALET)
+        .env("XDG_STATE_HOME", &state)
+        .args(["log", "cccccccccccccccc"])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    assert_eq!(String::from_utf8(found.stdout).unwrap(), body);
+
+    let missing = Command::new(DBVALET)
+        .env("XDG_STATE_HOME", &state)
+        .args(["log", "dddddddddddddddd"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("no run log found for `dddddddddddddddd`")
+    );
+}
+
 #[test]
 fn gc_with_an_empty_ledger_and_no_dbvalet_toml_has_nothing_to_clean_up() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-gc-empty");

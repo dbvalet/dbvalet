@@ -4,13 +4,12 @@
 //! A sweep that can take an entry's lock knows that run has ended.
 
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use crate::{DatabaseAlias, is_login_name};
+use crate::{DatabaseAlias, is_login_name, state_dir};
 
 const READ_ONLY: &str = "read-only\n";
 const WRITABLE: &str = "writable\n";
@@ -195,22 +194,9 @@ fn entries(dir: &Path) -> Result<Vec<Listed>, LedgerError> {
 }
 
 fn ledger_dir() -> Result<PathBuf, LedgerError> {
-    state_dir(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    state_dir()
         .map(|dir| dir.join("ledger"))
         .ok_or(LedgerError::NoStateDirectory)
-}
-
-/// `$XDG_STATE_HOME/dbvalet`, else `~/.local/state/dbvalet`. The XDG spec says to ignore a
-/// relative `XDG_STATE_HOME`.
-fn state_dir(xdg_state_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    let base = match xdg_state_home
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-    {
-        Some(dir) => dir,
-        None => PathBuf::from(home.filter(|home| !home.is_empty())?).join(".local/state"),
-    };
-    Some(base.join("dbvalet"))
 }
 
 fn io_error(action: &'static str, path: &Path, reason: io::Error) -> LedgerError {
@@ -218,36 +204,5 @@ fn io_error(action: &'static str, path: &Path, reason: io::Error) -> LedgerError
         action,
         path: path.to_owned(),
         reason,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_absolute_xdg_state_home_holds_the_state_directory() {
-        assert_eq!(
-            state_dir(Some("/xdg/state".into()), Some("/home/dev".into())),
-            Some(PathBuf::from("/xdg/state/dbvalet"))
-        );
-    }
-
-    #[test]
-    fn a_relative_or_missing_xdg_state_home_falls_back_to_home() {
-        assert_eq!(
-            state_dir(Some("relative/state".into()), Some("/home/dev".into())),
-            Some(PathBuf::from("/home/dev/.local/state/dbvalet"))
-        );
-        assert_eq!(
-            state_dir(None, Some("/home/dev".into())),
-            Some(PathBuf::from("/home/dev/.local/state/dbvalet"))
-        );
-    }
-
-    #[test]
-    fn without_xdg_state_home_or_home_there_is_no_state_directory() {
-        assert_eq!(state_dir(None, None), None);
-        assert_eq!(state_dir(None, Some("".into())), None);
     }
 }

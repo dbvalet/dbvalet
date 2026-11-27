@@ -2,19 +2,31 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::DatabaseAlias;
 use crate::config::RoleGrant;
 use crate::endpoint::Endpoint;
 use crate::proxy::{self, ProxyError};
 use crate::random_base32;
+use crate::runlog::{self, RunHeader, RunLogError, RunSecrets};
 use crate::signals::{self, RunSignals, SIGNAL_WAIT_TIMEOUT, WaitOutcome};
 use crate::source::{CredentialSource, Lease, MintOutcome, SourceError};
 
 const RUN_TOKEN_BYTES: usize = 20;
 const PROXY_HOST: &str = "127.0.0.1";
+
+/// Policy and logging inputs for one run.
+#[derive(Debug)]
+pub struct RunOptions<'a> {
+    pub database: &'a DatabaseAlias,
+    pub role: &'a str,
+    pub grant: &'a RoleGrant,
+    pub max_ttl: Duration,
+    pub sql_log: bool,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -22,6 +34,8 @@ pub enum RunError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Proxy(#[from] ProxyError),
+    #[error(transparent)]
+    RunLog(#[from] RunLogError),
     #[error("couldn't install signal handlers")]
     Signals(#[source] io::Error),
     #[error("couldn't start `{program}`")]
@@ -41,8 +55,7 @@ pub enum RunError {
 /// A failure to drop it is printed, and the command's exit status is still returned.
 pub async fn run<S: CredentialSource>(
     source: &S,
-    grant: &RoleGrant,
-    max_ttl: Duration,
+    options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<WaitOutcome, RunError> {
@@ -56,13 +69,16 @@ pub async fn run<S: CredentialSource>(
     if let Some(signal) = signals.poll_pending().await {
         return Ok(WaitOutcome::SignalledBeforeSpawn(signal));
     }
-    let lease = match source.mint(grant, max_ttl, signals.next_signal()).await? {
+    let lease = match source
+        .mint(options.grant, options.max_ttl, signals.next_signal())
+        .await?
+    {
         MintOutcome::Created(lease) => lease,
         MintOutcome::Interrupted(signal) => return Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
     };
     let finished = match signals.poll_pending().await {
         Some(signal) => Ok(WaitOutcome::SignalledBeforeSpawn(signal)),
-        None => run_child(&mut signals, &lease, upstream, command).await,
+        None => run_child(&mut signals, &lease, options, upstream, command).await,
     };
     if let Err(err) = lease.release().await {
         let _ = writeln!(io::stderr(), "dbvalet: {err}");
@@ -74,16 +90,32 @@ pub async fn run<S: CredentialSource>(
 async fn run_child(
     signals: &mut RunSignals,
     lease: &Lease,
+    options: &RunOptions<'_>,
     upstream: Endpoint,
     command: &[OsString],
 ) -> Result<WaitOutcome, RunError> {
     let login = lease.login();
     let token = random_base32(RUN_TOKEN_BYTES).map_err(RunError::Random)?;
+    let header = RunHeader {
+        run_id: lease.run_id().to_owned(),
+        started_at: SystemTime::now(),
+        database: options.database.clone(),
+        role: options.role.to_owned(),
+        valid_until: lease.valid_until().to_owned(),
+        max_ttl: Some(options.max_ttl),
+        command: command.to_vec(),
+        sql_log: options.sql_log,
+    };
+    let run_log = runlog::open(
+        &header,
+        RunSecrets::new(token.clone(), login.password().clone()),
+    )?;
     let database = upstream.database().to_owned();
     let proxy = proxy::start(
         upstream,
         login.clone(),
         token.clone(),
+        options.sql_log.then_some(run_log),
         lease.access_deadline(),
     )
     .await?;

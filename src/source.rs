@@ -137,6 +137,7 @@ pub struct SweepReport {
 #[derive(Debug)]
 pub struct Lease {
     login: UpstreamLogin,
+    valid_until: String,
     access_deadline: AccessDeadline,
     /// Taken by whichever ends the lease first, so the teardown runs exactly once.
     live: Arc<Mutex<Option<LiveLease>>>,
@@ -371,7 +372,12 @@ fn lease_time(real: Duration) -> Duration {
 
 impl Lease {
     /// Starts the task that keeps the login alive and ends it at max_ttl.
-    fn start(login: UpstreamLogin, live: LiveLease, clock: LeaseClock) -> Self {
+    fn start(
+        login: UpstreamLogin,
+        valid_until: String,
+        live: LiveLease,
+        clock: LeaseClock,
+    ) -> Self {
         let access_deadline = clock.access_deadline.clone();
         // A push uses its own copy of what it needs, so it never holds the teardown's lock.
         let pushes = Pushes {
@@ -385,6 +391,7 @@ impl Lease {
         let keep_alive = tokio::spawn(keep_alive(Arc::clone(&live), pushes));
         Self {
             login,
+            valid_until,
             access_deadline,
             live,
             keep_alive,
@@ -393,6 +400,17 @@ impl Lease {
 
     pub fn login(&self) -> &UpstreamLogin {
         &self.login
+    }
+
+    pub fn valid_until(&self) -> &str {
+        &self.valid_until
+    }
+
+    pub fn run_id(&self) -> &str {
+        self.login
+            .user()
+            .strip_prefix(crate::LOGIN_PREFIX)
+            .unwrap_or(self.login.user())
     }
 
     pub(crate) fn access_deadline(&self) -> AccessDeadline {

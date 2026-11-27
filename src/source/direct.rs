@@ -229,6 +229,7 @@ impl CredentialSource for DirectSource {
         };
         Ok(MintOutcome::Created(Lease::start(
             UpstreamLogin { user, password },
+            valid_until.trim_matches('\'').to_owned(),
             live,
             clock,
         )))
