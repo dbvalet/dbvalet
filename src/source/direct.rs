@@ -14,7 +14,8 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{CancelToken, Client, NoTls};
 
 use super::{
-    CredentialSource, Lease, LeaseClock, LiveLease, SourceError, SweepReport, UpstreamLogin,
+    CredentialSource, Lease, LeaseClock, LiveLease, MintOutcome, SourceError, SweepReport,
+    UpstreamLogin,
 };
 use crate::config::RoleGrant;
 use crate::endpoint::Tls;
@@ -24,6 +25,7 @@ use crate::{DatabaseAlias, LOGIN_PREFIX, RUN_ID_BYTES, is_login_name, random_bas
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMIN_MINT_TIMEOUT: Duration = Duration::from_secs(15);
 /// So a lock someone else holds on what a login owns fails that drop instead of stalling it.
 const ADMIN_LOCK_TIMEOUT: &str = "10s";
 const MINIMUM_SERVER_VERSION_NUM: i32 = 150000;
@@ -121,10 +123,100 @@ impl CredentialSource for DirectSource {
         Ok(report)
     }
 
-    async fn mint(&self, grant: &RoleGrant, max_ttl: Duration) -> Result<Lease, SourceError> {
-        let create_failed = |err: tokio_postgres::Error| SourceError::CreateLogin {
-            reason: describe_sql_error(&err),
+    async fn mint(
+        &self,
+        grant: &RoleGrant,
+        max_ttl: Duration,
+        interrupted: impl Future<Output = i32>,
+    ) -> Result<MintOutcome, SourceError> {
+        let setup_deadline = tokio::time::Instant::now() + ADMIN_MINT_TIMEOUT;
+        let preparing = tokio::time::timeout_at(setup_deadline, self.prepare_mint(max_ttl));
+        tokio::pin!(interrupted);
+        let (mut client, version_num, clock, valid_until) = tokio::select! {
+            biased;
+            signal = &mut interrupted => return Ok(MintOutcome::Interrupted(signal)),
+            prepared = preparing => prepared.map_err(mint_timed_out)??,
         };
+        let user = new_login_name().map_err(SourceError::Random)?;
+        let starting = tokio::time::timeout_at(setup_deadline, lock_creation(&mut client, &user));
+        let transaction = tokio::select! {
+            biased;
+            signal = &mut interrupted => return Ok(MintOutcome::Interrupted(signal)),
+            started = starting => started.map_err(mint_timed_out)??,
+        };
+        let password = random_base32(LOGIN_PASSWORD_BYTES).map_err(SourceError::Random)?;
+        // Only the SCRAM verifier reaches the server, so its logs never hold the password.
+        let verifier =
+            postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
+        // The admin needs the login's privileges to end its sessions and drop what it owns:
+        // PostgreSQL 16 and later give them through createrole_self_grant, older ones through ROLE.
+        let (self_grant, admin_member) = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+            ("SET createrole_self_grant = 'inherit';", String::new())
+        } else {
+            ("", format!("ROLE {}", quote_ident(self.admin.user())))
+        };
+        // Written before the login exists, so a run killed from here on leaves it to the sweep.
+        let ledger_entry = ledger::create(&self.alias, &user, grant.read_only)?;
+        let read_only = if grant.read_only {
+            format!("ALTER ROLE {user} SET default_transaction_read_only = on;")
+        } else {
+            String::new()
+        };
+        let create = format!(
+            "{self_grant}
+             CREATE ROLE {user} LOGIN PASSWORD {verifier} VALID UNTIL {valid_until}
+                 IN ROLE {group} {admin_member};
+             {read_only}",
+            verifier = quote_literal(&verifier),
+            group = quote_ident(&grant.member_of),
+        );
+        // Once creation starts, give it a bounded chance to finish. On an uncertain
+        // outcome the ledger stays, and the database lock protects it from the sweep.
+        tokio::time::timeout(ADMIN_MINT_TIMEOUT, async {
+            transaction.batch_execute(&create).await?;
+            transaction.commit().await
+        })
+        .await
+        .map_err(mint_timed_out)?
+        .map_err(create_failed)?;
+        // Best-effort: kept so end_sessions can still match backends by usesysid if another
+        // actor drops the role. A lookup failure here shouldn't abort a run whose login already
+        // exists, and the ledger entry is already on disk.
+        let role_oid: Option<u32> = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.query_opt("SELECT oid FROM pg_roles WHERE rolname = $1", &[&user]),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .map(|row| row.get(0));
+
+        let active_push = Arc::new(ActivePush::default());
+        let live = LiveLease {
+            alias: self.alias.clone(),
+            admin: Arc::clone(&self.admin),
+            user: user.clone(),
+            role_oid,
+            member_of: grant.member_of.clone(),
+            read_only: grant.read_only,
+            ledger_entry,
+            proxy: None,
+            active_push,
+        };
+        Ok(MintOutcome::Created(Lease::start(
+            UpstreamLogin { user, password },
+            live,
+            clock,
+        )))
+    }
+}
+
+impl DirectSource {
+    async fn prepare_mint(
+        &self,
+        max_ttl: Duration,
+    ) -> Result<(Client, i32, LeaseClock, String), SourceError> {
         let client =
             connect(&self.alias, &self.admin)
                 .await
@@ -168,65 +260,47 @@ impl CredentialSource for DirectSource {
             superuser,
             inherit,
         )?;
-
-        let user = new_login_name().map_err(SourceError::Random)?;
-        let password = random_base32(LOGIN_PASSWORD_BYTES).map_err(SourceError::Random)?;
-        // Only the SCRAM verifier reaches the server, so its logs never hold the password.
-        let verifier =
-            postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
-        // The admin needs the login's privileges to end its sessions and drop what it owns:
-        // PostgreSQL 16 and later give them through createrole_self_grant, older ones through ROLE.
-        let (self_grant, admin_member) = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-            ("SET createrole_self_grant = 'inherit';", String::new())
-        } else {
-            ("", format!("ROLE {}", quote_ident(self.admin.user())))
-        };
         let clock = LeaseClock::new(started, started_at, started_with_suspend, max_ttl);
         let valid_until = timestamp_literal(&client, clock.next_expiry(started))
             .await
             .map_err(create_failed)?;
-        // Written before the login exists, so a run killed from here on leaves it to the sweep.
-        let ledger_entry = ledger::create(&self.alias, &user, grant.read_only)?;
-        let read_only = if grant.read_only {
-            format!("ALTER ROLE {user} SET default_transaction_read_only = on;")
-        } else {
-            String::new()
-        };
-        // One simple query runs as one transaction, so a read login never exists without read_only.
-        client
-            .batch_execute(&format!(
-                "{self_grant}
-                 CREATE ROLE {user} LOGIN PASSWORD {verifier} VALID UNTIL {valid_until}
-                     IN ROLE {group} {admin_member};
-                 {read_only}",
-                verifier = quote_literal(&verifier),
-                group = quote_ident(&grant.member_of),
-            ))
-            .await
-            .map_err(create_failed)?;
-        // Best-effort: kept so end_sessions can still match backends by usesysid if another
-        // actor drops the role. A lookup failure here shouldn't abort a run whose login already
-        // exists, and the ledger entry is already on disk.
-        let role_oid: Option<u32> = client
-            .query_opt("SELECT oid FROM pg_roles WHERE rolname = $1", &[&user])
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.get(0));
+        Ok((client, version_num, clock, valid_until))
+    }
+}
 
-        let active_push = Arc::new(ActivePush::default());
-        let live = LiveLease {
-            alias: self.alias.clone(),
-            admin: Arc::clone(&self.admin),
-            user: user.clone(),
-            role_oid,
-            member_of: grant.member_of.clone(),
-            read_only: grant.read_only,
-            ledger_entry,
-            proxy: None,
-            active_push,
-        };
-        Ok(Lease::start(UpstreamLogin { user, password }, live, clock))
+async fn lock_creation<'a>(
+    client: &'a mut Client,
+    user: &str,
+) -> Result<tokio_postgres::Transaction<'a>, SourceError> {
+    let transaction = client.transaction().await.map_err(create_failed)?;
+    transaction
+        .batch_execute(&format!(
+            "SET LOCAL statement_timeout = '{}ms'",
+            ADMIN_MINT_TIMEOUT.as_millis()
+        ))
+        .await
+        .map_err(create_failed)?;
+    // Acquire the lock before publishing the ledger entry. A later sweep can
+    // then distinguish a missing role from an unsettled creation transaction.
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&user],
+        )
+        .await
+        .map_err(create_failed)?;
+    Ok(transaction)
+}
+
+fn create_failed(err: tokio_postgres::Error) -> SourceError {
+    SourceError::CreateLogin {
+        reason: describe_sql_error(&err),
+    }
+}
+
+fn mint_timed_out(_: tokio::time::error::Elapsed) -> SourceError {
+    SourceError::CreateLogin {
+        reason: format!("no answer within {} s", ADMIN_MINT_TIMEOUT.as_secs()),
     }
 }
 
@@ -518,8 +592,9 @@ pub(super) async fn drop_login(
 /// Drops the login of an entry whose run has ended, then removes the entry.
 async fn sweep_orphan(client: &Client, entry: ledger::Entry, report: &mut SweepReport) {
     let login = entry.login().to_owned();
-    match drop_leftover_login(client, &login, entry.read_only()).await {
-        Ok(existed) => match entry.remove() {
+    match sweep_login(client, &login, entry.read_only()).await {
+        Ok(None) => {}
+        Ok(Some(existed)) => match entry.remove() {
             Ok(()) if existed => report.dropped.push(login),
             Ok(()) => report.already_gone.push(login),
             Err(err) => report.failures.push(err.into()),
@@ -528,6 +603,29 @@ async fn sweep_orphan(client: &Client, entry: ledger::Entry, report: &mut SweepR
             .failures
             .push(SourceError::DropLeftoverLogin { login, reason }),
     }
+}
+
+async fn sweep_login(
+    client: &Client,
+    login: &str,
+    read_only: Option<bool>,
+) -> Result<Option<bool>, String> {
+    // The creating connection may still hold its lock after dbvalet has gone away.
+    // The existence check needs a fresh snapshot taken after that lock is gone.
+    let ready: bool = client
+        .query_one(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&login],
+        )
+        .await
+        .map_err(|err| describe_sql_error(&err))?
+        .get(0);
+    if !ready {
+        return Ok(None);
+    }
+    drop_leftover_login(client, login, read_only)
+        .await
+        .map(Some)
 }
 
 /// Drops a login an ended run left behind, reading from the database what its lease knew.
