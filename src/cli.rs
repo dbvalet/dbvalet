@@ -1,5 +1,6 @@
 //! The command line, mapped onto library calls.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
@@ -98,7 +99,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             alias,
             allow_plaintext,
         } => {
-            let checks = direct::doctor(&alias, allow_plaintext).await;
+            let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let roles = match config::find_and_load(&cwd) {
+                Ok(config) => config
+                    .databases
+                    .get(&alias)
+                    .map(|policy| policy.roles.clone())
+                    .unwrap_or_default(),
+                Err(ConfigError::NotFound { .. }) => BTreeMap::new(),
+                Err(err) => return Err(err.into()),
+            };
+            let checks = direct::doctor(&alias, allow_plaintext, &roles).await;
             for check in &checks {
                 println!("{check}");
             }
