@@ -1,12 +1,14 @@
 //! The local endpoint the child connects to. Each client connection must present the run
-//! token; it then gets its own upstream connection as the temporary login. When SQL logging
-//! is enabled, the proxy passively copies `Q` (simple query) and `P` (parse) statement text
-//! to the run log without ever blocking or modifying the wire stream (ADR-0002).
+//! token; it then gets its own upstream connection as the temporary login. A cancel request
+//! needs no token, as in PostgreSQL: it goes only to the server of the session whose secret
+//! key it carries. When SQL logging is enabled, the proxy passively copies `Q` (simple
+//! query) and `P` (parse) statement text to the run log without ever blocking or modifying
+//! the wire stream (ADR-0002).
 
 use std::io;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use rustls_pki_types::ServerName;
@@ -25,9 +27,9 @@ use crate::tls::{self, TlsError};
 mod client;
 mod sql_log;
 mod upstream;
-use client::{read_password, read_startup, refuse, token_matches};
+use client::{Startup, read_password, read_startup, refuse, token_matches};
 use sql_log::relay_with_log;
-use upstream::{UpstreamRefusal, connect_upstream};
+use upstream::{CancelTargets, UpstreamRefusal, connect_upstream, forward_cancel};
 
 /// SSL and GSS encryption requests are a length and a code, nothing more.
 const ENCRYPTION_REQUEST_LEN: usize = 8;
@@ -66,6 +68,7 @@ struct Access {
     login: UpstreamLogin,
     sql_log: Option<RunLog>,
     deadline: AccessDeadline,
+    cancel_targets: CancelTargets,
 }
 
 /// Listens on a random port of 127.0.0.1 until [`Proxy::stop`].
@@ -98,6 +101,7 @@ pub async fn start(
         login,
         sql_log,
         deadline,
+        cancel_targets: Mutex::default(),
     });
     let (stop, stopped) = oneshot::channel();
     let accept_loop = tokio::spawn(accept(listener, access, stopped));
@@ -146,8 +150,13 @@ async fn serve(mut client: TcpStream, access: Arc<Access>) {
 }
 
 async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
-    let Some(parameters) = read_startup(client).await? else {
-        return Ok(());
+    let parameters = match read_startup(client).await? {
+        Startup::Session(parameters) => parameters,
+        Startup::Cancel(key) => {
+            // PostgreSQL never answers a cancel request either, so a failed one ends quietly.
+            let _ = forward_cancel(access, &key).await;
+            return Ok(());
+        }
     };
     client.write_all(&AUTHENTICATION_CLEARTEXT_PASSWORD).await?;
     let password = read_password(client).await?;
@@ -167,7 +176,7 @@ async fn relay(client: &mut TcpStream, access: &Access) -> io::Result<()> {
         )
         .await;
     }
-    let (mut server, unread) = match connect_upstream(access, &parameters).await {
+    let (mut server, unread, _cancellable) = match connect_upstream(access, &parameters).await {
         Ok(connected) => connected,
         Err(UpstreamRefusal::ErrorResponse(error)) => return client.write_all(&error).await,
         Err(UpstreamRefusal::Failed(reason)) => {
