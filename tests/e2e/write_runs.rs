@@ -146,7 +146,9 @@ fn a_write_run_that_creates_a_table_leaves_it_owned_by_the_group_role_and_no_log
     let stdout = text(&output.stdout);
     let stderr = text(&output.stderr);
     assert!(output.status.success(), "stderr: {stderr}");
-    assert!(stderr.is_empty(), "stderr: {stderr}");
+    // PostgreSQL 19 warns on stderr about the temporary login's short VALID UNTIL expiry;
+    // a teardown failure from dbvalet itself is prefixed with `dbvalet:`.
+    assert!(!stderr.contains("dbvalet:"), "stderr: {stderr}");
     assert_eq!(
         superuser_count(
             "SELECT count(*) FROM pg_roles WHERE rolname = $1",
