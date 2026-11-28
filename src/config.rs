@@ -56,12 +56,6 @@ pub enum ConfigError {
     },
     #[error("{} isn't valid: {message}", path.display())]
     Invalid { path: PathBuf, message: String },
-    #[error("couldn't create {}", path.display())]
-    Create {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
 }
 
 /// Loads the nearest `dbvalet.toml`, looking in `start` and then each directory above it.
@@ -95,18 +89,34 @@ pub fn reader_entry(alias: &DatabaseAlias) -> String {
     )
 }
 
-/// Creates `dbvalet.toml` in `dir` holding `text`, failing with `AlreadyExists` rather than
-/// replacing one. The file appears whole: a draft is written first, then hard-linked into place.
-pub fn create(dir: &Path, text: &str) -> Result<PathBuf, ConfigError> {
-    let path = dir.join(FILE_NAME);
-    let draft = dir.join(format!(".{FILE_NAME}.{}.draft", std::process::id()));
-    let created = std::fs::write(&draft, text).and_then(|()| std::fs::hard_link(&draft, &path));
+/// The most drafts `create` tries when leftovers of interrupted runs hold the first names.
+const DRAFT_ATTEMPTS: u32 = 16;
+
+/// Creates the file `path` holding `text`, failing with `AlreadyExists` rather than replacing
+/// anything there. The file appears whole: a draft of our own is written, then hard-linked.
+pub fn create(path: &Path, text: &str) -> io::Result<()> {
+    let mut attempt = 0;
+    let (draft, mut file) = loop {
+        let draft = path.with_extension(format!("toml.{}.{attempt}.draft", std::process::id()));
+        // create_new never opens an existing file, so a leftover draft, or a symlink, is skipped.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&draft)
+        {
+            Ok(file) => break (draft, file),
+            Err(err)
+                if err.kind() == io::ErrorKind::AlreadyExists && attempt + 1 < DRAFT_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let created = io::Write::write_all(&mut file, text.as_bytes())
+        .and_then(|()| std::fs::hard_link(&draft, path));
     let _ = std::fs::remove_file(&draft);
-    created.map_err(|source| ConfigError::Create {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(path)
+    created
 }
 
 fn parse(text: &str) -> Result<Config, String> {
@@ -217,20 +227,32 @@ mod tests {
     fn creating_the_file_where_one_exists_fails_and_leaves_it_unchanged() {
         let dir = std::env::temp_dir().join(format!("dbvalet-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(FILE_NAME), "# hand-written\n").unwrap();
+        let path = dir.join(FILE_NAME);
+        std::fs::write(&path, "# hand-written\n").unwrap();
 
-        let err = create(&dir, "[databases.app]\n").unwrap_err();
+        let err = create(&path, "[databases.app]\n").unwrap_err();
 
-        let kind = match err {
-            ConfigError::Create { source, .. } => source.kind(),
-            other => panic!("{other}"),
-        };
-        assert_eq!(kind, io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(),
-            "# hand-written\n"
-        );
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# hand-written\n");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn creating_the_file_skips_a_leftover_draft_without_changing_it() {
+        let dir = std::env::temp_dir().join(format!("dbvalet-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let leftover = dir.join(format!("dbvalet.toml.{}.0.draft", std::process::id()));
+        std::fs::write(&leftover, "# a backup the leftover draft still links to\n").unwrap();
+
+        create(&path, "[databases.app]\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[databases.app]\n");
+        assert_eq!(
+            std::fs::read_to_string(&leftover).unwrap(),
+            "# a backup the leftover draft still links to\n"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

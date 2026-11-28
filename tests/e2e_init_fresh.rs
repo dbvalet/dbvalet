@@ -94,6 +94,7 @@ fn a_createrole_admin_creates_dbvalet_reader_with_init_and_runs_a_read() {
         .args(["init", "--allow-plaintext", "e2e_init_fresh"])
         .output()
         .unwrap();
+    assert!(init.status.success(), "init: {}", text(&init.stderr));
     let output = Command::new(DBVALET)
         .current_dir(&dir)
         .env("XDG_STATE_HOME", dir.join("state"))
@@ -111,8 +112,15 @@ fn a_createrole_admin_creates_dbvalet_reader_with_init_and_runs_a_read() {
                   ELSE pg_has_role('e2e_init_fresh', 'dbvalet_reader', 'MEMBER') END::text)",
     );
 
-    assert!(init.status.success(), "init: {}", text(&init.stderr));
+    let reader_can_log_in =
+        superuser_text("SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'dbvalet_reader'");
+    let leftover_logins = superuser_text(
+        "SELECT count(*)::text FROM pg_roles WHERE rolname ~ '^dbvalet_[a-z2-7]{16}$'",
+    );
+
     assert!(output.status.success(), "run: {}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "read after a fresh init\n");
     assert_eq!(rights, "true true true");
+    assert_eq!(reader_can_log_in, "false");
+    assert_eq!(leftover_logins, "0");
 }

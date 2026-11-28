@@ -2,6 +2,7 @@
 
 use tokio_postgres::Transaction;
 
+use super::doctor::{create_role_check, read_rights};
 use super::{
     CREATEROLE_SELF_GRANT_VERSION_NUM, GroupRoleStatus, SourceError, check_mint_prerequisites,
     connect, describe_sql_error, inspect_group_role, quote_ident,
@@ -18,6 +19,19 @@ const CREATE_READER_IF_MISSING: &str = "
         END IF;
     EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
     END $$";
+/// Before 16 CREATEROLE may grant any non-superuser role, including to itself. An init on
+/// another database can grant the same cluster-wide membership first.
+const GRANT_READER_WITH_ADMIN_TO_ME: &str = "
+    DO $$ BEGIN
+        GRANT dbvalet_reader TO CURRENT_USER WITH ADMIN OPTION;
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END $$";
+/// PostgreSQL refuses ADMIN OPTION granted back to its own grantor, so on 16+ only the rest.
+const GRANT_READER_INHERIT_AND_SET_TO_ME: &str = "
+    DO $$ BEGIN
+        GRANT dbvalet_reader TO CURRENT_USER WITH INHERIT TRUE, SET TRUE;
+    EXCEPTION WHEN unique_violation THEN NULL;
+    END $$";
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -29,20 +43,26 @@ pub enum InitError {
     /// The admin or the server is one `run` would refuse too.
     #[error(transparent)]
     Refused(#[from] SourceError),
+    #[error("{0}")]
+    CantCreateLogins(String),
     #[error(
         "the existing role dbvalet_reader can log in, so dbvalet grants it nothing: \
          run ALTER ROLE dbvalet_reader NOLOGIN if it should be a group role"
     )]
     ReaderCanLogin,
     #[error(
-        "`{user}` doesn't hold ADMIN OPTION on the existing role dbvalet_reader: ask a superuser, \
-         or a role holding ADMIN OPTION on it, to run GRANT dbvalet_reader TO {quoted} \
-         WITH ADMIN OPTION, INHERIT TRUE, SET TRUE"
+        "`{user}` lacks {missing} on dbvalet_reader: ask a superuser, or a role holding \
+         ADMIN OPTION on it, to run {fix}"
     )]
-    NoAdminOption { user: String, quoted: String },
+    AdminLacksRights {
+        user: String,
+        missing: String,
+        fix: String,
+    },
     #[error(
-        "the grant of CONNECT on database `{database}` had no effect: its owner, or a superuser, \
-         must run GRANT CONNECT ON DATABASE {quoted} TO dbvalet_reader"
+        "the grant of CONNECT on database `{database}` had no effect: its owner, a superuser, \
+         or a role holding CONNECT WITH GRANT OPTION must run \
+         GRANT CONNECT ON DATABASE {quoted} TO dbvalet_reader"
     )]
     DatabaseNotGranted { database: String, quoted: String },
     #[error(
@@ -75,47 +95,21 @@ pub async fn init(
             alias: alias.clone(),
             reason,
         })?;
-    let server = client
-        .query_one(
-            "SELECT current_setting('server_version'),
-                    current_setting('server_version_num')::int,
-                    current_database()::text,
-                    rolsuper,
-                    rolinherit,
-                    (SELECT rolcanlogin FROM pg_roles WHERE rolname = 'dbvalet_reader')
-             FROM pg_roles
-             WHERE rolname = current_user",
-            &[],
-        )
-        .await
-        .map_err(sql_failed)?;
-    let (version, version_num, database, superuser, inherit, reader_can_login): (
-        String,
-        i32,
-        String,
-        bool,
-        bool,
-        Option<bool>,
-    ) = (
-        server.get(0),
-        server.get(1),
-        server.get(2),
-        server.get(3),
-        server.get(4),
-        server.get(5),
-    );
+    let user = admin.user();
+    let rights = read_rights(&client).await.map_err(sql_failed)?;
     check_mint_prerequisites(
         alias,
-        admin.user(),
-        &version,
-        version_num,
-        superuser,
-        inherit,
+        user,
+        &rights.server_version,
+        rights.server_version_num,
+        rights.superuser,
+        rights.inherit,
     )?;
-    let reader_status = inspect_group_role(&client, "dbvalet_reader")
-        .await
-        .map_err(sql_failed)?;
-    refuse_existing_reader(reader_can_login, reader_status)?;
+    let create_role = create_role_check(user, &rights);
+    if !create_role.passed {
+        return Err(InitError::CantCreateLogins(create_role.message));
+    }
+    let version_num = rights.server_version_num;
 
     // One transaction, so a failure leaves the database as it was.
     let transaction = client.transaction().await.map_err(sql_failed)?;
@@ -137,7 +131,13 @@ pub async fn init(
         .batch_execute(CREATE_READER_IF_MISSING)
         .await
         .map_err(sql_failed)?;
-    grant_reader_to_admin(&transaction, admin.user(), version_num).await?;
+    check_reader(&transaction).await?;
+    grant_reader_to_admin(&transaction, user, version_num).await?;
+    let database: String = transaction
+        .query_one("SELECT current_database()::text", &[])
+        .await
+        .map_err(sql_failed)?
+        .get(0);
     transaction
         .batch_execute(&grants_sql(&database, schemas))
         .await
@@ -150,15 +150,26 @@ pub async fn init(
     })
 }
 
-/// The role is cluster-wide, so someone else may have made it: grant nothing to a role that can
-/// log in, or that `run` would refuse to join.
-fn refuse_existing_reader(
-    can_login: Option<bool>,
-    status: GroupRoleStatus,
-) -> Result<(), InitError> {
-    if can_login == Some(true) {
-        return Err(InitError::ReaderCanLogin);
-    }
+/// Checks the role this transaction created or found, so a change made while init waited for
+/// its lock still counts.
+async fn check_reader(transaction: &Transaction<'_>) -> Result<(), InitError> {
+    let status = inspect_group_role(transaction, "dbvalet_reader")
+        .await
+        .map_err(sql_failed)?;
+    let can_login: bool = transaction
+        .query_one(
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'dbvalet_reader'",
+            &[],
+        )
+        .await
+        .map_err(sql_failed)?
+        .get(0);
+    refuse_existing_reader(can_login, status)
+}
+
+/// The role is cluster-wide, so someone else may have made it: grant nothing to a role that
+/// `run` would refuse to join, or that can log in.
+fn refuse_existing_reader(can_login: bool, status: GroupRoleStatus) -> Result<(), InitError> {
     if let GroupRoleStatus::Dangerous(reason) = status {
         return Err(SourceError::DangerousRole {
             member_of: "dbvalet_reader".to_owned(),
@@ -166,63 +177,92 @@ fn refuse_existing_reader(
         }
         .into());
     }
+    if can_login {
+        return Err(InitError::ReaderCanLogin);
+    }
     Ok(())
 }
 
-/// The admin needs ADMIN to add logins to the role, INHERIT to drop what they own, and, on 16+,
-/// SET to reassign it. Grants only what's missing, so a second run adds no membership.
+/// What the admin can do with dbvalet_reader. It needs ADMIN to add logins to the role, INHERIT
+/// to drop what they own, and SET to reassign it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReaderRights {
+    admin: bool,
+    inherit: bool,
+    set: bool,
+}
+
+impl ReaderRights {
+    fn missing(self) -> Vec<&'static str> {
+        [
+            (self.admin, "ADMIN OPTION"),
+            (self.inherit, "INHERIT"),
+            (self.set, "SET"),
+        ]
+        .into_iter()
+        .filter_map(|(held, right)| (!held).then_some(right))
+        .collect()
+    }
+}
+
+/// Grants only what's missing, so a second run adds no membership, then checks the rights the
+/// admin actually holds: a concurrent weaker GRANT, or one through a NOINHERIT role, falls short.
 async fn grant_reader_to_admin(
     transaction: &Transaction<'_>,
     user: &str,
     version_num: i32,
 ) -> Result<(), InitError> {
-    let (has_admin, has_inherit_and_set): (bool, bool) = if version_num
-        >= CREATEROLE_SELF_GRANT_VERSION_NUM
-    {
-        let row = transaction
-            .query_one(
-                "SELECT pg_has_role('dbvalet_reader', 'MEMBER WITH ADMIN OPTION'),
-                        pg_has_role('dbvalet_reader', 'USAGE') AND pg_has_role('dbvalet_reader', 'SET')",
-                &[],
-            )
-            .await
-            .map_err(sql_failed)?;
-        (row.get(0), row.get(1))
+    let self_grant = version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM;
+    let before = reader_rights(transaction, self_grant).await?;
+    let grant = if !self_grant {
+        GRANT_READER_WITH_ADMIN_TO_ME
+    } else if before.admin {
+        GRANT_READER_INHERIT_AND_SET_TO_ME
     } else {
-        // Before 16 INHERIT is the admin's own attribute, which mint checks, and SET has no
-        // separate grant.
-        let row = transaction
-            .query_one(
-                "SELECT pg_has_role('dbvalet_reader', 'MEMBER WITH ADMIN OPTION')",
-                &[],
-            )
-            .await
-            .map_err(sql_failed)?;
-        (row.get(0), true)
+        ""
     };
-    let quoted = quote_ident(user);
-    let grant = match (has_admin, has_inherit_and_set) {
-        (true, true) => return Ok(()),
-        // Before 16 CREATEROLE may grant any non-superuser role, including to itself.
-        (false, _) if version_num < CREATEROLE_SELF_GRANT_VERSION_NUM => {
-            format!("GRANT dbvalet_reader TO {quoted} WITH ADMIN OPTION")
-        }
-        (false, _) => {
-            return Err(InitError::NoAdminOption {
-                user: user.to_owned(),
-                quoted,
-            });
-        }
-        // PostgreSQL refuses ADMIN OPTION granted back to its own grantor, so ask for the rest.
-        (true, false) => format!("GRANT dbvalet_reader TO {quoted} WITH INHERIT TRUE, SET TRUE"),
+    let after = if before.missing().is_empty() || grant.is_empty() {
+        before
+    } else {
+        transaction.batch_execute(grant).await.map_err(sql_failed)?;
+        reader_rights(transaction, self_grant).await?
     };
-    // An init on another database can grant the same cluster-wide membership first.
-    transaction
-        .batch_execute(&format!(
-            "DO $dbvalet$ BEGIN {grant}; EXCEPTION WHEN unique_violation THEN NULL; END $dbvalet$"
-        ))
-        .await
-        .map_err(sql_failed)
+    let missing = after.missing();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let options = if self_grant {
+        "WITH ADMIN OPTION, INHERIT TRUE, SET TRUE"
+    } else {
+        "WITH ADMIN OPTION"
+    };
+    Err(InitError::AdminLacksRights {
+        user: user.to_owned(),
+        missing: missing.join(", "),
+        fix: format!("GRANT dbvalet_reader TO {} {options}", quote_ident(user)),
+    })
+}
+
+async fn reader_rights(
+    transaction: &Transaction<'_>,
+    self_grant: bool,
+) -> Result<ReaderRights, InitError> {
+    // Before 16 every member may SET ROLE, so SET has no grant of its own.
+    let sql = if self_grant {
+        "SELECT pg_has_role('dbvalet_reader', 'MEMBER WITH ADMIN OPTION'),
+                pg_has_role('dbvalet_reader', 'USAGE'),
+                pg_has_role('dbvalet_reader', 'SET')"
+    } else {
+        "SELECT pg_has_role('dbvalet_reader', 'MEMBER WITH ADMIN OPTION'),
+                pg_has_role('dbvalet_reader', 'USAGE'),
+                pg_has_role('dbvalet_reader', 'MEMBER')"
+    };
+    let row = transaction.query_one(sql, &[]).await.map_err(sql_failed)?;
+    Ok(ReaderRights {
+        admin: row.get(0),
+        inherit: row.get(1),
+        set: row.get(2),
+    })
 }
 
 fn grants_sql(database: &str, schemas: &[String]) -> String {
@@ -303,14 +343,14 @@ mod tests {
 
     #[test]
     fn an_existing_dbvalet_reader_that_can_log_in_is_refused() {
-        let err = refuse_existing_reader(Some(true), GroupRoleStatus::Safe).unwrap_err();
+        let err = refuse_existing_reader(true, GroupRoleStatus::Safe).unwrap_err();
         assert!(matches!(err, InitError::ReaderCanLogin));
     }
 
     #[test]
-    fn an_existing_dbvalet_reader_that_run_would_refuse_is_refused() {
+    fn a_dangerous_dbvalet_reader_is_refused_as_dangerous_even_when_it_can_log_in() {
         let status = GroupRoleStatus::Dangerous("it has BYPASSRLS".to_owned());
-        let err = refuse_existing_reader(Some(false), status).unwrap_err();
+        let err = refuse_existing_reader(true, status).unwrap_err();
         assert_eq!(
             err.to_string(),
             "refusing group role `dbvalet_reader`: it has BYPASSRLS"
@@ -318,9 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_safe_nologin_dbvalet_reader_is_accepted() {
-        assert!(refuse_existing_reader(None, GroupRoleStatus::Missing).is_ok());
-        assert!(refuse_existing_reader(Some(false), GroupRoleStatus::Safe).is_ok());
+    fn a_safe_nologin_dbvalet_reader_is_accepted() {
+        assert!(refuse_existing_reader(false, GroupRoleStatus::Safe).is_ok());
+    }
+
+    #[test]
+    fn the_rights_an_admin_lacks_are_named_in_order() {
+        let rights = ReaderRights {
+            admin: false,
+            inherit: true,
+            set: false,
+        };
+        assert_eq!(rights.missing(), vec!["ADMIN OPTION", "SET"]);
+    }
+
+    #[test]
+    fn an_admin_holding_every_right_lacks_none() {
+        let rights = ReaderRights {
+            admin: true,
+            inherit: true,
+            set: true,
+        };
+        assert!(rights.missing().is_empty());
     }
 
     #[test]

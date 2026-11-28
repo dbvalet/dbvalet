@@ -184,19 +184,31 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let entry = config::reader_entry(&alias);
             let existing = match config::find(&cwd) {
                 Some(path) => path,
-                None => match config::create(&cwd, &entry) {
-                    Ok(path) => {
-                        println!("\nCreated {} with a `reader` role.", path.display());
-                        return Ok(ExitCode::SUCCESS);
+                None => {
+                    let path = cwd.join(config::FILE_NAME);
+                    match config::create(&path, &entry) {
+                        Ok(()) => {
+                            println!("\nCreated {} with a `reader` role.", path.display());
+                            return Ok(ExitCode::SUCCESS);
+                        }
+                        // Another init in this directory created it first.
+                        Err(err)
+                            if err.kind() == io::ErrorKind::AlreadyExists && path.is_file() =>
+                        {
+                            path
+                        }
+                        // The grants are in place, so the entry is still worth having.
+                        Err(err) => {
+                            let _ = writeln!(
+                                io::stderr(),
+                                "dbvalet: couldn't create {}: {err}",
+                                path.display()
+                            );
+                            println!("\nAdd this entry to a {}:\n\n{entry}", config::FILE_NAME);
+                            return Ok(ExitCode::FAILURE);
+                        }
                     }
-                    // Another init in this directory created it first.
-                    Err(ConfigError::Create { path, source })
-                        if source.kind() == io::ErrorKind::AlreadyExists =>
-                    {
-                        path
-                    }
-                    Err(err) => return Err(err.into()),
-                },
+                }
             };
             println!(
                 "\n{} already exists, so dbvalet left it unchanged. \

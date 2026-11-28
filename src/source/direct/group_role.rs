@@ -1,6 +1,6 @@
 //! Decides whether a dbvalet.toml group role is safe to join.
 
-use tokio_postgres::Client;
+use tokio_postgres::GenericClient;
 
 /// Walks a group role and every ancestor it belongs to; `UNION` deduplicates diamond grants and
 /// prevents cycles. Includes the starting role so a missing role returns zero rows.
@@ -73,7 +73,7 @@ pub(super) enum GroupRoleStatus {
 }
 
 pub(super) async fn inspect_group_role(
-    client: &Client,
+    client: &impl GenericClient,
     member_of: &str,
 ) -> Result<GroupRoleStatus, tokio_postgres::Error> {
     let rows = client.query(GROUP_ROLE_GRAPH, &[&member_of]).await?;

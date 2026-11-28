@@ -32,8 +32,8 @@ fn admin_with_own_database(name: &str, attributes: &str) -> PathBuf {
 }
 
 /// Like [`admin_with_own_database`] for a CREATEROLE admin. Another test's superuser may already
-/// have created dbvalet_reader, and on 16+ only a superuser can then give this admin ADMIN on
-/// it, so it gets that alone here and init must add INHERIT and SET.
+/// have created dbvalet_reader, and on 16+ only a superuser or a holder of ADMIN OPTION can then
+/// give this admin ADMIN on it, so it gets that alone here and init must add INHERIT and SET.
 fn createrole_admin_with_own_database(name: &str) -> PathBuf {
     let dir = admin_with_own_database(name, "CREATEROLE");
     create_reader_group();
@@ -186,7 +186,7 @@ fn init_says_that_default_privileges_cover_only_tables_the_admin_creates_later()
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn running_init_twice_succeeds_and_the_second_run_changes_nothing() {
-    let dir = admin_with_own_database("e2e_init_twice", "SUPERUSER");
+    let dir = createrole_admin_with_own_database("e2e_init_twice");
     admin_sql(
         "e2e_init_twice",
         "CREATE SCHEMA billing;
@@ -207,7 +207,7 @@ fn running_init_twice_succeeds_and_the_second_run_changes_nothing() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn two_inits_at_once_on_one_database_both_succeed() {
+fn two_inits_at_once_on_one_database_both_succeed_and_one_creates_dbvalet_toml() {
     let dir = admin_with_own_database("e2e_init_at_once", "SUPERUSER");
     admin_sql("e2e_init_at_once", "CREATE TABLE notes (note text);");
     let start = |dir: &Path| {
@@ -225,8 +225,15 @@ fn two_inits_at_once_on_one_database_both_succeed() {
     let first = first.wait_with_output().unwrap();
     let second = second.wait_with_output().unwrap();
 
+    let both_stdouts = format!("{}{}", text(&first.stdout), text(&second.stdout));
+
     assert!(first.status.success(), "first: {}", text(&first.stderr));
     assert!(second.status.success(), "second: {}", text(&second.stderr));
+    assert!(both_stdouts.contains("Created "), "{both_stdouts}");
+    assert!(
+        both_stdouts.contains("already exists, so dbvalet left it unchanged"),
+        "{both_stdouts}"
+    );
 }
 
 #[test]

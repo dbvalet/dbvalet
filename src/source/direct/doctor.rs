@@ -114,17 +114,17 @@ fn group_role_check(role_name: &str, member_of: &str, status: GroupRoleStatus) -
     }
 }
 
-struct Rights {
-    server_version: String,
-    server_version_num: i32,
-    superuser: bool,
+pub(super) struct Rights {
+    pub(super) server_version: String,
+    pub(super) server_version_num: i32,
+    pub(super) superuser: bool,
     create_role: bool,
-    inherit: bool,
+    pub(super) inherit: bool,
     signal_backend: bool,
     signal_backend_member: bool,
 }
 
-async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
+pub(super) async fn read_rights(client: &Client) -> Result<Rights, tokio_postgres::Error> {
     let row = client
         .query_one(
             "SELECT current_setting('server_version'),
@@ -174,7 +174,7 @@ fn version_check(rights: &Rights) -> Check {
     }
 }
 
-fn create_role_check(user: &str, rights: &Rights) -> Check {
+pub(super) fn create_role_check(user: &str, rights: &Rights) -> Check {
     if rights.superuser {
         Check::passed(format!("`{user}` is a superuser"))
     } else if rights.create_role {
