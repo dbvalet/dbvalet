@@ -239,3 +239,21 @@ pub(crate) fn start_run_until_ready(
     }
     (run, seen)
 }
+
+/// Runs `command` to the end, failing the test if it takes longer than `limit`.
+pub(crate) fn output_within(mut command: Command, limit: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}

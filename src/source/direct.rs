@@ -155,10 +155,12 @@ impl CredentialSource for DirectSource {
             postgres_protocol::password::scram_sha_256(password.expose_secret().as_bytes());
         // The admin needs the login's privileges to end its sessions and drop what it owns:
         // PostgreSQL 16 and later give them through createrole_self_grant, older ones through ROLE.
+        // Both make current_user the member, because teardown runs as current_user, and a role
+        // default (ALTER ROLE ... SET role) can make it differ from the connection string's user.
         let (self_grant, admin_member) = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
-            ("SET createrole_self_grant = 'inherit';", String::new())
+            ("SET createrole_self_grant = 'inherit';", "")
         } else {
-            ("", format!("ROLE {}", quote_ident(self.admin.user())))
+            ("", "ROLE CURRENT_USER")
         };
         // Written before the login exists, so a run killed from here on leaves it to the sweep.
         let ledger_entry = ledger::create(&self.alias, &user, grant.read_only)?;
