@@ -8,6 +8,7 @@ mod expiry;
 mod init;
 mod login_doctor;
 mod protocol;
+mod role_default;
 mod run_log;
 mod run_proxy;
 mod signals;

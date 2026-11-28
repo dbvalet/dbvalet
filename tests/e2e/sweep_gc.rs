@@ -2,32 +2,15 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use crate::support::{
-    DBVALET, SUPERUSER_URL, gc_command, gc_in, ledger_entry, login, printed, project_with_reader,
-    project_with_reader_and_admin, run_command, run_in, runtime, start_run_until_ready,
-    superuser_count, superuser_sql, sweeping, sweeping_alone, text, wait_for_active_query,
+    DBVALET, SUPERUSER_URL, gc_command, gc_in, ledger_entry, login, output_within, printed,
+    project_with_reader, project_with_reader_and_admin, run_command, run_in, runtime,
+    start_run_until_ready, superuser_count, superuser_sql, sweeping, sweeping_alone, text,
+    wait_for_active_query,
 };
-
-/// Runs `command` to the end, failing the test if it takes longer than `limit`.
-fn output_within(mut command: Command, limit: Duration) -> Output {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + limit;
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            panic!("still running after {limit:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    child.wait_with_output().unwrap()
-}
 
 /// A NOLOGIN group for a writable `writer` role, owning a schema of the same name, so tests
 /// running in parallel never change the same schema's privileges at once.
