@@ -27,7 +27,7 @@ mod group_role;
 mod init;
 use connect::{connect, connect_with_cancel_tls};
 pub use doctor::{Check, doctor};
-use group_role::{GroupRoleStatus, inspect_group_role};
+use group_role::{AdminGrants, GroupRoleStatus, inspect_group_role, read_admin_grants};
 pub use init::{InitError, InitReport, init};
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
@@ -135,8 +135,7 @@ impl CredentialSource for DirectSource {
         interrupted: impl Future<Output = i32>,
     ) -> Result<MintOutcome, SourceError> {
         let setup_deadline = tokio::time::Instant::now() + ADMIN_MINT_TIMEOUT;
-        let preparing =
-            tokio::time::timeout_at(setup_deadline, self.prepare_mint(&grant.member_of, max_ttl));
+        let preparing = tokio::time::timeout_at(setup_deadline, self.prepare_mint(grant, max_ttl));
         tokio::pin!(interrupted);
         let (mut client, version_num, clock, valid_until) = tokio::select! {
             biased;
@@ -222,9 +221,10 @@ impl CredentialSource for DirectSource {
 impl DirectSource {
     async fn prepare_mint(
         &self,
-        member_of: &str,
+        grant: &RoleGrant,
         max_ttl: Duration,
     ) -> Result<(Client, i32, LeaseClock, String), SourceError> {
+        let member_of = grant.member_of.as_str();
         let client =
             connect(&self.alias, &self.admin)
                 .await
@@ -283,6 +283,30 @@ impl DirectSource {
                     member_of: member_of.to_owned(),
                     reason,
                 });
+            }
+        }
+        // A write login's teardown runs REASSIGN OWNED, so a login it couldn't run would stay
+        // behind for good. Refused here, before the ledger entry or the login exists.
+        if !grant.read_only {
+            match read_admin_grants(&client, member_of, version_num)
+                .await
+                .map_err(create_failed)?
+            {
+                None => {
+                    return Err(SourceError::CreateLogin {
+                        reason: format!("group role `{member_of}` doesn't exist"),
+                    });
+                }
+                Some(AdminGrants {
+                    set: Some(false), ..
+                }) => {
+                    return Err(SourceError::AdminCannotReassign {
+                        alias: self.alias.clone(),
+                        user: self.admin.user().to_owned(),
+                        member_of: member_of.to_owned(),
+                    });
+                }
+                Some(_) => {}
             }
         }
         let clock = LeaseClock::new(started, started_at, started_with_suspend, max_ttl);
@@ -674,7 +698,6 @@ async fn drop_leftover_login(
     let Some(role) = client
         .query_opt(
             "SELECT r.oid,
-                    COALESCE('default_transaction_read_only=on' = ANY (r.rolconfig), false),
                     ARRAY(SELECT DISTINCT g.rolname::text
                           FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                           WHERE m.member = r.oid)
@@ -688,9 +711,16 @@ async fn drop_leftover_login(
         return Ok(false);
     };
     let role_oid: u32 = role.get(0);
-    // The login can change its own settings in either direction, but not the ledger.
-    let read_only = ledger_read_only.unwrap_or_else(|| role.get(1));
-    let groups: Vec<String> = role.get(2);
+    let groups: Vec<String> = role.get(1);
+    // Ended first, so nothing the login does afterwards changes what it owns.
+    end_sessions(client, user, Some(role_oid)).await?;
+    // The login can change its own settings, so only the ledger can say it was read-only.
+    // Without it, what it owns here goes to its group; with nothing owned, DROP OWNED loses
+    // nothing and needs no SET on the group.
+    let read_only = match ledger_read_only {
+        Some(read_only) => read_only,
+        None => !owns_objects_here(client, role_oid).await?,
+    };
     let reassign_to = match (read_only, groups.as_slice()) {
         (true, _) => None,
         (false, [group]) => Some(group.as_str()),
@@ -705,8 +735,24 @@ async fn drop_leftover_login(
             ));
         }
     };
-    end_sessions(client, user, Some(role_oid)).await?;
     execute_drop(client, user, reassign_to).await
+}
+
+/// Whether the login owns anything in the database this client is connected to.
+async fn owns_objects_here(client: &Client, role_oid: u32) -> Result<bool, String> {
+    client
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT FROM pg_shdepend
+                 WHERE refclassid = 'pg_authid'::regclass
+                   AND refobjid = $1
+                   AND deptype = 'o'
+                   AND dbid = (SELECT oid FROM pg_database WHERE datname = current_database()))",
+            &[&role_oid],
+        )
+        .await
+        .map(|row| row.get(0))
+        .map_err(|err| describe_sql_error(&err))
 }
 
 /// Runs [`drop_login_sql`]. Returns false when the login was already gone, as when a sweep

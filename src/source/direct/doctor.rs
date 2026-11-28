@@ -7,7 +7,7 @@ use tokio_postgres::Client;
 
 use super::{
     CREATEROLE_SELF_GRANT_VERSION_NUM, GroupRoleStatus, MINIMUM_SERVER_VERSION_NUM, connect,
-    inspect_group_role, quote_ident,
+    inspect_group_role, quote_ident, read_admin_grants,
 };
 use crate::DatabaseAlias;
 use crate::config::RoleGrant;
@@ -81,15 +81,43 @@ pub async fn doctor(
             checks.push(create_role_check(user, &rights));
             checks.push(end_sessions_check(user, &rights));
             for (role_name, grant) in roles {
-                let check = match inspect_group_role(&client, &grant.member_of).await {
-                    Ok(status) => group_role_check(role_name, &grant.member_of, status),
-                    Err(err) => Check::failed(format!(
+                let check_failed = |err: tokio_postgres::Error| {
+                    Check::failed(format!(
                         "can't check role `{role_name}` (`{}`): {}",
                         grant.member_of,
                         describe_query_error(&err)
-                    )),
+                    ))
                 };
-                checks.push(check);
+                let status = match inspect_group_role(&client, &grant.member_of).await {
+                    Ok(status) => status,
+                    Err(err) => {
+                        checks.push(check_failed(err));
+                        continue;
+                    }
+                };
+                let safe = status == GroupRoleStatus::Safe;
+                checks.push(group_role_check(role_name, &grant.member_of, status));
+                // A missing or refused role gets no grant advice: the fix is a different role.
+                if !safe {
+                    continue;
+                }
+                match read_admin_grants(&client, &grant.member_of, rights.server_version_num).await
+                {
+                    Ok(Some(grants)) => checks.extend(group_grant_checks(
+                        user,
+                        role_name,
+                        &grant.member_of,
+                        grants.admin,
+                        // A read-only role's teardown reassigns nothing.
+                        grants.set.filter(|_| !grant.read_only),
+                    )),
+                    Ok(None) => checks.push(group_role_check(
+                        role_name,
+                        &grant.member_of,
+                        GroupRoleStatus::Missing,
+                    )),
+                    Err(err) => checks.push(check_failed(err)),
+                }
             }
         }
         Err(err) => checks.push(Check::failed(format!(
@@ -112,6 +140,40 @@ fn group_role_check(role_name: &str, member_of: &str, status: GroupRoleStatus) -
             "role `{role_name}` (`{member_of}`) is refused: {reason}"
         )),
     }
+}
+
+/// `set` is `None` where teardown doesn't need it: for a read-only role, or before PostgreSQL 16.
+fn group_grant_checks(
+    user: &str,
+    role_name: &str,
+    member_of: &str,
+    admin: bool,
+    set: Option<bool>,
+) -> Vec<Check> {
+    let group = quote_ident(member_of);
+    let quoted_user = quote_ident(user);
+    let mut checks = vec![if admin {
+        Check::passed(format!(
+            "`{user}` holds ADMIN on role `{role_name}` (`{member_of}`)"
+        ))
+    } else {
+        Check::failed(format!(
+            "`{user}` doesn't hold ADMIN on role `{role_name}` (`{member_of}`): \
+             as a superuser, run GRANT {group} TO {quoted_user} WITH ADMIN OPTION"
+        ))
+    }];
+    match set {
+        None => {}
+        Some(true) => checks.push(Check::passed(format!(
+            "`{user}` can hand what role `{role_name}`'s logins create to `{member_of}`"
+        ))),
+        Some(false) => checks.push(Check::failed(format!(
+            "`{user}` lacks SET on `{member_of}`, which PostgreSQL 16.16, 17.12, 18.7 and later \
+             need to hand what role `{role_name}`'s logins create to it: \
+             as a superuser, run GRANT {group} TO {quoted_user} WITH SET TRUE"
+        ))),
+    }
+    checks
 }
 
 pub(super) struct Rights {
@@ -531,6 +593,52 @@ mod tests {
         assert_eq!(
             plaintext_check.message,
             "plaintext on localhost (--allow-plaintext)"
+        );
+    }
+
+    #[test]
+    fn a_read_only_group_the_admin_holds_without_admin_fails_with_a_quoted_grant_and_no_set_check()
+    {
+        let checks = group_grant_checks("Db\"Admin", "reader", "app reader", false, None);
+        assert_eq!(
+            checks,
+            vec![Check::failed(
+                "`Db\"Admin` doesn't hold ADMIN on role `reader` (`app reader`): \
+                 as a superuser, run GRANT \"app reader\" TO \"Db\"\"Admin\" WITH ADMIN OPTION"
+                    .to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_write_group_the_admin_holds_without_set_fails_with_a_quoted_grant() {
+        let checks = group_grant_checks("admin", "writer", "app_writer", true, Some(false));
+        assert_eq!(
+            checks,
+            vec![
+                Check::passed("`admin` holds ADMIN on role `writer` (`app_writer`)".to_owned()),
+                Check::failed(
+                    "`admin` lacks SET on `app_writer`, which PostgreSQL 16.16, 17.12, 18.7 \
+                     and later need to hand what role `writer`'s logins create to it: \
+                     as a superuser, run GRANT \"app_writer\" TO \"admin\" WITH SET TRUE"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_write_group_the_admin_holds_with_admin_and_set_passes_both_checks() {
+        let checks = group_grant_checks("admin", "writer", "app_writer", true, Some(true));
+        assert_eq!(
+            checks,
+            vec![
+                Check::passed("`admin` holds ADMIN on role `writer` (`app_writer`)".to_owned()),
+                Check::passed(
+                    "`admin` can hand what role `writer`'s logins create to `app_writer`"
+                        .to_owned()
+                ),
+            ]
         );
     }
 

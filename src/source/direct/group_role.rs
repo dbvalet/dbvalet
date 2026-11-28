@@ -1,6 +1,53 @@
-//! Decides whether a dbvalet.toml group role is safe to join.
+//! Decides whether a dbvalet.toml group role is safe to join, and whether the admin can use it.
 
 use tokio_postgres::GenericClient;
+
+use super::CREATEROLE_SELF_GRANT_VERSION_NUM;
+
+/// ADMIN counts only where `CREATE ROLE ... IN ROLE` can use it: held by the admin or by a role
+/// whose privileges it has. A role reached only through `SET ROLE` can't be the grantor.
+const ADMIN_GRANTS: &str = "
+    SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+           OR EXISTS (SELECT FROM pg_auth_members m
+                      WHERE m.roleid = g.oid
+                        AND m.admin_option
+                        AND pg_has_role(current_user, m.member, 'USAGE')),
+           {set}
+    FROM pg_roles g
+    WHERE g.rolname = $1";
+
+/// What the admin holds on one group role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AdminGrants {
+    /// Needed to add each temporary login to the group.
+    pub(super) admin: bool,
+    /// Needed from PostgreSQL 16.16, 17.12, 18.7 and 19 by `REASSIGN OWNED ... TO <group>`, as by
+    /// `ALTER ... OWNER`. It is asked for on every 16 and later minor, so a minor update can't
+    /// break teardown. `None` before 16, which has no SET privilege. The USAGE that earlier
+    /// versions ask for comes through the login itself, which the admin inherits and which
+    /// inherits the group, but SET doesn't: `createrole_self_grant` gives only INHERIT.
+    pub(super) set: Option<bool>,
+}
+
+/// `None` when the group role doesn't exist.
+pub(super) async fn read_admin_grants(
+    client: &impl GenericClient,
+    member_of: &str,
+    version_num: i32,
+) -> Result<Option<AdminGrants>, tokio_postgres::Error> {
+    let set = if version_num >= CREATEROLE_SELF_GRANT_VERSION_NUM {
+        "pg_has_role(current_user, g.oid, 'SET')"
+    } else {
+        "NULL::bool"
+    };
+    let row = client
+        .query_opt(&ADMIN_GRANTS.replace("{set}", set), &[&member_of])
+        .await?;
+    Ok(row.map(|row| AdminGrants {
+        admin: row.get(0),
+        set: row.get(1),
+    }))
+}
 
 /// Walks a group role and every ancestor it belongs to; `UNION` deduplicates diamond grants and
 /// prevents cycles. Includes the starting role so a missing role returns zero rows.

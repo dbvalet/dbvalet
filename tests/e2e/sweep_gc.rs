@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::support::{
     DBVALET, SUPERUSER_URL, gc_command, gc_in, ledger_entry, login, printed, project_with_reader,
-    project_with_reader_and_admin, run_command, run_in, runtime, superuser_count, superuser_sql,
-    sweeping, sweeping_alone, text, wait_for_active_query,
+    project_with_reader_and_admin, run_command, run_in, runtime, start_run_until_ready,
+    superuser_count, superuser_sql, sweeping, sweeping_alone, text, wait_for_active_query,
 };
 
 /// Runs `command` to the end, failing the test if it takes longer than `limit`.
@@ -27,30 +27,6 @@ fn output_within(mut command: Command, limit: Duration) -> Output {
         std::thread::sleep(Duration::from_millis(50));
     }
     child.wait_with_output().unwrap()
-}
-
-/// Starts `dbvalet run <run_args>` in `dir` with a child that runs `script`, prints READY if it
-/// succeeded and then waits on stdin. Returns the run and what the child printed before READY.
-fn start_run_until_ready(dir: &Path, run_args: &[&str], script: &str) -> (Child, String) {
-    let _sweeping = sweeping();
-    let mut run = Command::new(DBVALET)
-        .current_dir(dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .arg("run")
-        .args(run_args)
-        .args(["--allow-plaintext", "--", "sh", "-c"])
-        .arg(format!("{script} && echo READY && read line"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout = BufReader::new(run.stdout.take().unwrap());
-    let mut seen = String::new();
-    while !seen.ends_with("READY\n") {
-        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
-    }
-    (run, seen)
 }
 
 /// A NOLOGIN group for a writable `writer` role, owning a schema of the same name, so tests
@@ -287,9 +263,10 @@ fn a_sweep_keeps_the_ledger_until_the_creation_transaction_finishes() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
+fn gc_without_a_ledger_entry_gives_an_expired_read_only_logins_table_to_its_group() {
     let dir = project_with_reader("e2e-gc-expired-read-only");
     let _alone = sweeping_alone();
+    // The read-only setting is the login's own word, which a sweep can't trust without the ledger.
     superuser_sql(
         "DROP TABLE IF EXISTS e2e_gc_read_only_table;
          DROP ROLE IF EXISTS dbvalet_readonlyexpired2;
@@ -300,6 +277,12 @@ fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
     );
 
     let swept = gc_command(&dir).output().unwrap();
+    let owned_by_group = superuser_count(
+        "SELECT count(*) FROM pg_tables
+         WHERE tablename = 'e2e_gc_read_only_table' AND tableowner = $1",
+        "dbvalet_reader",
+    );
+    superuser_sql("DROP TABLE IF EXISTS e2e_gc_read_only_table;");
 
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
     assert_eq!(
@@ -309,13 +292,7 @@ fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
         ),
         0
     );
-    assert_eq!(
-        superuser_count(
-            "SELECT count(*) FROM pg_tables WHERE tablename = $1",
-            "e2e_gc_read_only_table"
-        ),
-        0
-    );
+    assert_eq!(owned_by_group, 1);
 }
 
 #[test]
