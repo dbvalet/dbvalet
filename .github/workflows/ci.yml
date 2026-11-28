@@ -60,7 +60,7 @@ jobs:
       postgres:
         image: postgres:${{ matrix.postgres }}
         env:
-          # Throwaway superuser password for this job's database; tests/e2e.rs uses it too.
+          # Throwaway superuser password for this job's database; tests/e2e/ uses it too.
           POSTGRES_PASSWORD: e2e-throwaway
         ports:
           - 5432:5432
