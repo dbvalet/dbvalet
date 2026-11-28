@@ -327,6 +327,108 @@ fn a_sweep_without_the_ledger_drops_a_reader_login_whose_admin_lacks_set_on_the_
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_without_the_ledger_keeps_a_write_logins_table_even_when_dbvalet_toml_calls_its_group_read_only()
+ {
+    let dir = project_with_writer(
+        "e2e-write-ledgerless-toml",
+        "e2e_write_ledgerless_toml_group",
+        "WITH ADMIN OPTION",
+    );
+    let (mut run, seen) = start_run_until_ready(
+        &dir,
+        &["--role", "writer"],
+        "echo \"login=$PGUSER\"; psql -v ON_ERROR_STOP=1 -qc \
+         'CREATE TABLE e2e_write_ledgerless_toml_group.kept (id int)'",
+    );
+    let login_name = printed(&seen, "login").to_owned();
+    run.kill().unwrap();
+    run.wait().unwrap();
+    // The policy changed after the crash: the group is now listed only as read-only.
+    std::fs::write(
+        dir.join("dbvalet.toml"),
+        "[databases.e2e-write-ledgerless-toml.roles]\n\
+         reader = { member_of = \"e2e_write_ledgerless_toml_group\", read_only = true }\n",
+    )
+    .unwrap();
+
+    let alone = sweeping_alone();
+    superuser_sql(&format!(
+        "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
+    ));
+    let swept = gc_command(&dir)
+        .env("XDG_STATE_HOME", dir.join("other-machine-state"))
+        .output()
+        .unwrap();
+    drop(alone);
+    drop(run.stdin.take());
+
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_tables
+             WHERE schemaname = 'e2e_write_ledgerless_toml_group' AND tablename = 'kept'
+               AND tableowner = $1",
+            "e2e_write_ledgerless_toml_group"
+        ),
+        1
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_without_the_ledger_that_cant_reassign_a_reader_logins_table_fails_and_keeps_both() {
+    if server_version_num() < 160000 {
+        return;
+    }
+    let dir = project_with_writer(
+        "e2e-write-ledgerless-stuck",
+        "e2e_write_ledgerless_stuck_group",
+        "WITH ADMIN OPTION",
+    );
+    let _alone = sweeping_alone();
+    superuser_sql(
+        "GRANT dbvalet_reader TO e2e_write_ledgerless_stuck WITH SET FALSE;
+         DROP TABLE IF EXISTS e2e_write_ledgerless_stuck_table;
+         DROP ROLE IF EXISTS dbvalet_ledgerlessstuck2;
+         CREATE ROLE dbvalet_ledgerlessstuck2 LOGIN VALID UNTIL '2000-01-01' IN ROLE dbvalet_reader;
+         GRANT dbvalet_ledgerlessstuck2 TO e2e_write_ledgerless_stuck;
+         CREATE TABLE e2e_write_ledgerless_stuck_table ();
+         ALTER TABLE e2e_write_ledgerless_stuck_table OWNER TO dbvalet_ledgerlessstuck2;",
+    );
+
+    let swept = gc_command(&dir).output().unwrap();
+    let login_left = superuser_count(
+        "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+        "dbvalet_ledgerlessstuck2",
+    );
+    let table_left = superuser_count(
+        "SELECT count(*) FROM pg_tables WHERE tablename = $1",
+        "e2e_write_ledgerless_stuck_table",
+    );
+    superuser_sql(
+        "DROP TABLE IF EXISTS e2e_write_ledgerless_stuck_table;
+         DROP ROLE IF EXISTS dbvalet_ledgerlessstuck2;",
+    );
+
+    let stderr = text(&swept.stderr);
+    assert_eq!(swept.status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("dbvalet_ledgerlessstuck2"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(login_left, 1);
+    assert_eq!(table_left, 1);
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn a_write_run_whose_admin_lacks_set_on_postgresql_16_or_later_is_refused_before_any_login() {
     if server_version_num() < 160000 {
         return;

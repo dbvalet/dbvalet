@@ -263,9 +263,10 @@ fn a_sweep_keeps_the_ledger_until_the_creation_transaction_finishes() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
+fn gc_without_a_ledger_entry_gives_an_expired_read_only_logins_table_to_its_group() {
     let dir = project_with_reader("e2e-gc-expired-read-only");
     let _alone = sweeping_alone();
+    // The read-only setting is the login's own word, which a sweep can't trust without the ledger.
     superuser_sql(
         "DROP TABLE IF EXISTS e2e_gc_read_only_table;
          DROP ROLE IF EXISTS dbvalet_readonlyexpired2;
@@ -276,6 +277,12 @@ fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
     );
 
     let swept = gc_command(&dir).output().unwrap();
+    let owned_by_group = superuser_count(
+        "SELECT count(*) FROM pg_tables
+         WHERE tablename = 'e2e_gc_read_only_table' AND tableowner = $1",
+        "dbvalet_reader",
+    );
+    superuser_sql("DROP TABLE IF EXISTS e2e_gc_read_only_table;");
 
     assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
     assert_eq!(
@@ -285,13 +292,7 @@ fn gc_drops_an_expired_read_only_login_and_the_table_it_owns() {
         ),
         0
     );
-    assert_eq!(
-        superuser_count(
-            "SELECT count(*) FROM pg_tables WHERE tablename = $1",
-            "e2e_gc_read_only_table"
-        ),
-        0
-    );
+    assert_eq!(owned_by_group, 1);
 }
 
 #[test]
