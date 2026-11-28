@@ -1,10 +1,10 @@
 //! `dbvalet`, PostgreSQL and project helpers every group uses.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, mpsc};
 use std::time::{Duration, Instant};
 
 pub(crate) const DBVALET: &str = env!("CARGO_BIN_EXE_dbvalet");
@@ -240,7 +240,8 @@ pub(crate) fn start_run_until_ready(
     (run, seen)
 }
 
-/// Runs `command` to the end, failing the test if it takes longer than `limit`.
+/// Runs `command` to the end, failing the test if it, or anything it started that keeps its
+/// output open, takes longer than `limit`.
 pub(crate) fn output_within(mut command: Command, limit: Duration) -> Output {
     let mut child = command
         .stdout(Stdio::piped())
@@ -248,12 +249,37 @@ pub(crate) fn output_within(mut command: Command, limit: Duration) -> Output {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + limit;
-    while child.try_wait().unwrap().is_none() {
+    // Read while it runs, so a full pipe can't stall it and a lingering reader can't stall us.
+    let stdout = read_to_end_in_background(child.stdout.take().unwrap());
+    let stderr = read_to_end_in_background(child.stderr.take().unwrap());
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() > deadline {
             child.kill().unwrap();
+            child.wait().unwrap();
             panic!("still running after {limit:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
+    };
+    let collect = |pipe: mpsc::Receiver<Vec<u8>>, name: &str| {
+        pipe.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|_| panic!("its {name} was still open after {limit:?}"))
+    };
+    Output {
+        status,
+        stdout: collect(stdout, "stdout"),
+        stderr: collect(stderr, "stderr"),
     }
-    child.wait_with_output().unwrap()
+}
+
+fn read_to_end_in_background(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).unwrap();
+        let _ = sender.send(bytes);
+    });
+    receiver
 }

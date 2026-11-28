@@ -68,13 +68,21 @@ fn logins_named(login: &str) -> i64 {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn a_read_only_run_by_an_admin_with_a_role_default_drops_its_login() {
+fn a_read_only_run_by_an_admin_with_a_role_default_drops_its_login_and_its_large_object() {
     let dir = project_with_role_default("e2e-rd-reader");
 
     let out = {
         let _sweeping = sweeping();
+        // PostgreSQL 16 and later refuse lo_from_bytea in a read-only transaction; 15 lets
+        // the login own a large object, which its teardown must drop rather than hand over.
         output_within(
-            run_command_as(&dir, "reader", "echo login=$PGUSER; psql -qAtXc 'SELECT 1'"),
+            run_command_as(
+                &dir,
+                "reader",
+                "echo login=$PGUSER; \
+                 psql -qAtXc \"SELECT lo_from_bytea(0, 'written by e2e-rd-reader')\" \
+                 || echo refused",
+            ),
             RUN_LIMIT,
         )
     };
@@ -84,6 +92,13 @@ fn a_read_only_run_by_an_admin_with_a_role_default_drops_its_login() {
     let login_name = printed(&stdout, "login");
     assert_eq!(logins_named(login_name), 0);
     assert!(!ledger_entry(&dir, "e2e-rd-reader", login_name).exists());
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_largeobject WHERE data = convert_to($1, 'UTF8')",
+            "written by e2e-rd-reader"
+        ),
+        0
+    );
 }
 
 #[test]
