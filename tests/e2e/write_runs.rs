@@ -267,32 +267,45 @@ fn a_write_run_whose_admin_lacks_set_on_postgresql_16_or_later_is_refused_before
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn a_write_run_whose_createrole_admin_isnt_in_the_group_on_postgresql_15_is_refused_before_any_login()
- {
+fn a_write_run_by_a_createrole_admin_outside_the_group_on_postgresql_15_still_hands_over_its_table()
+{
     if server_version_num() >= 160000 {
         return;
     }
     let dir = project_with_writer(
-        "e2e-write-refused-15",
-        "e2e_write_refused_15_group",
+        "e2e-write-outside-15",
+        "e2e_write_outside_15_group",
         "WITH ADMIN OPTION",
     );
-    superuser_sql("REVOKE e2e_write_refused_15_group FROM e2e_write_refused_15;");
+    superuser_sql("REVOKE e2e_write_outside_15_group FROM e2e_write_outside_15;");
 
-    let output = run_as(&dir, "writer", "echo CHILD_RAN");
-
-    let stderr = text(&output.stderr);
-    assert!(!output.status.success(), "stderr: {stderr}");
-    assert!(text(&output.stdout).is_empty(), "the child must not run");
-    assert!(
-        stderr.contains(
-            "the admin login `e2e_write_refused_15` lacks USAGE on group role \
-             `e2e_write_refused_15_group`"
-        ),
-        "stderr: {stderr}"
+    let output = run_as(
+        &dir,
+        "writer",
+        "echo \"login=$PGUSER\"; \
+         psql -v ON_ERROR_STOP=1 -qc 'CREATE TABLE e2e_write_outside_15_group.created (id int)'",
     );
-    assert_eq!(logins_in_group("e2e_write_refused_15_group"), 0);
-    assert!(ledger_entries_in(&dir).is_empty());
+
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(!stderr.contains("dbvalet:"), "stderr: {stderr}");
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            printed(&stdout, "login")
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_tables
+             WHERE schemaname = 'e2e_write_outside_15_group' AND tablename = 'created'
+               AND tableowner = $1",
+            "e2e_write_outside_15_group"
+        ),
+        1
+    );
 }
 
 #[test]
@@ -317,13 +330,6 @@ fn doctor_passes_a_createrole_admin_holding_everything_both_configured_groups_ne
     assert!(
         stdout.contains(
             "ok   `e2e_write_doctor_ok` holds ADMIN on role `writer` (`e2e_write_doctor_ok_group`)\n"
-        ),
-        "doctor: {stdout}"
-    );
-    assert!(
-        stdout.contains(
-            "ok   `e2e_write_doctor_ok` can hand what role `writer`'s logins create \
-             to `e2e_write_doctor_ok_group`\n"
         ),
         "doctor: {stdout}"
     );

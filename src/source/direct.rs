@@ -26,7 +26,7 @@ mod doctor;
 mod group_role;
 use connect::{connect, connect_with_cancel_tls};
 pub use doctor::{Check, doctor};
-use group_role::{GroupRoleStatus, inspect_group_role, read_admin_grants};
+use group_role::{AdminGrants, GroupRoleStatus, inspect_group_role, read_admin_grants};
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -286,18 +286,25 @@ impl DirectSource {
         // A write login's teardown runs REASSIGN OWNED, so a login it couldn't run would stay
         // behind for good. Refused here, before the ledger entry or the login exists.
         if !grant.read_only {
-            let missing = read_admin_grants(&client, member_of, version_num)
+            match read_admin_grants(&client, member_of, version_num)
                 .await
                 .map_err(create_failed)?
-                .map(|grants| grants.missing_for_reassign(version_num))
-                .unwrap_or_default();
-            if !missing.is_empty() {
-                return Err(SourceError::AdminCannotReassign {
-                    alias: self.alias.clone(),
-                    user: self.admin.user().to_owned(),
-                    member_of: member_of.to_owned(),
-                    missing: missing.join(" and "),
-                });
+            {
+                None => {
+                    return Err(SourceError::CreateLogin {
+                        reason: format!("group role `{member_of}` doesn't exist"),
+                    });
+                }
+                Some(AdminGrants {
+                    set: Some(false), ..
+                }) => {
+                    return Err(SourceError::AdminCannotReassign {
+                        alias: self.alias.clone(),
+                        user: self.admin.user().to_owned(),
+                        member_of: member_of.to_owned(),
+                    });
+                }
+                Some(_) => {}
             }
         }
         let clock = LeaseClock::new(started, started_at, started_with_suspend, max_ttl);

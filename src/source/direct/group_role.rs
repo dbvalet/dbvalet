@@ -4,10 +4,6 @@ use tokio_postgres::Client;
 
 use super::CREATEROLE_SELF_GRANT_VERSION_NUM;
 
-/// The first minor of each major whose `REASSIGN OWNED ... TO <group>` asks for SET on the group,
-/// as `ALTER ... OWNER` does, instead of USAGE. 19 and later always ask for SET.
-const REASSIGN_ASKS_SET_FROM: [(i32, i32); 3] = [(16, 160016), (17, 170012), (18, 180007)];
-
 /// ADMIN counts only where `CREATE ROLE ... IN ROLE` can use it: held by the admin or by a role
 /// whose privileges it has. A role reached only through `SET ROLE` can't be the grantor.
 const ADMIN_GRANTS: &str = "
@@ -16,7 +12,6 @@ const ADMIN_GRANTS: &str = "
                       WHERE m.roleid = g.oid
                         AND m.admin_option
                         AND pg_has_role(current_user, m.member, 'USAGE')),
-           pg_has_role(current_user, g.oid, 'USAGE'),
            {set}
     FROM pg_roles g
     WHERE g.rolname = $1";
@@ -26,35 +21,12 @@ const ADMIN_GRANTS: &str = "
 pub(super) struct AdminGrants {
     /// Needed to add each temporary login to the group.
     pub(super) admin: bool,
-    usage: bool,
-    /// `None` before PostgreSQL 16, which has no SET privilege.
-    set: Option<bool>,
-}
-
-impl AdminGrants {
-    /// What `REASSIGN OWNED ... TO <group>` needs on this server and the admin lacks. SET is asked
-    /// for from 16 on, even on a minor that doesn't check it yet, so a minor update can't break
-    /// teardown.
-    pub(super) fn missing_for_reassign(&self, version_num: i32) -> Vec<&'static str> {
-        let mut missing = Vec::new();
-        if asks_usage_for_reassign(version_num) && !self.usage {
-            missing.push("USAGE");
-        }
-        if self.set == Some(false) {
-            missing.push("SET");
-        }
-        missing
-    }
-}
-
-fn asks_usage_for_reassign(version_num: i32) -> bool {
-    match REASSIGN_ASKS_SET_FROM
-        .iter()
-        .find(|(major, _)| *major == version_num / 10000)
-    {
-        Some((_, first_set_minor)) => version_num < *first_set_minor,
-        None => version_num < CREATEROLE_SELF_GRANT_VERSION_NUM,
-    }
+    /// Needed from PostgreSQL 16.16, 17.12, 18.7 and 19 by `REASSIGN OWNED ... TO <group>`, as by
+    /// `ALTER ... OWNER`. It is asked for on every 16 and later minor, so a minor update can't
+    /// break teardown. `None` before 16, which has no SET privilege. The USAGE that earlier
+    /// versions ask for comes through the login itself, which the admin inherits and which
+    /// inherits the group, but SET doesn't: `createrole_self_grant` gives only INHERIT.
+    pub(super) set: Option<bool>,
 }
 
 /// `None` when the group role doesn't exist.
@@ -73,8 +45,7 @@ pub(super) async fn read_admin_grants(
         .await?;
     Ok(row.map(|row| AdminGrants {
         admin: row.get(0),
-        usage: row.get(1),
-        set: row.get(2),
+        set: row.get(1),
     }))
 }
 
@@ -221,67 +192,6 @@ mod tests {
             bypass_rls: false,
             replication: false,
         }
-    }
-
-    fn grants(usage: bool, set: Option<bool>) -> AdminGrants {
-        AdminGrants {
-            admin: true,
-            usage,
-            set,
-        }
-    }
-
-    #[test]
-    fn reassign_on_postgresql_15_needs_usage_only() {
-        assert_eq!(
-            grants(false, None).missing_for_reassign(150020),
-            vec!["USAGE"]
-        );
-        assert!(grants(true, None).missing_for_reassign(150020).is_empty());
-    }
-
-    #[test]
-    fn reassign_on_minors_before_the_set_rule_needs_usage_and_set() {
-        assert_eq!(
-            grants(false, Some(false)).missing_for_reassign(160015),
-            vec!["USAGE", "SET"]
-        );
-        assert_eq!(
-            grants(false, Some(true)).missing_for_reassign(170011),
-            vec!["USAGE"]
-        );
-        assert_eq!(
-            grants(true, Some(false)).missing_for_reassign(180006),
-            vec!["SET"]
-        );
-    }
-
-    #[test]
-    fn reassign_on_minors_with_the_set_rule_needs_set_only() {
-        assert!(
-            grants(false, Some(true))
-                .missing_for_reassign(160016)
-                .is_empty()
-        );
-        assert!(
-            grants(false, Some(true))
-                .missing_for_reassign(170012)
-                .is_empty()
-        );
-        assert!(
-            grants(false, Some(true))
-                .missing_for_reassign(180007)
-                .is_empty()
-        );
-        assert!(
-            grants(false, Some(true))
-                .missing_for_reassign(190000)
-                .is_empty()
-        );
-        assert_eq!(
-            grants(true, Some(false)).missing_for_reassign(190000),
-            vec!["SET"]
-        );
     }
 
     #[test]
