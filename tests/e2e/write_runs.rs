@@ -375,8 +375,9 @@ fn doctor_on_postgresql_16_or_later_names_the_write_group_held_without_set_and_n
     assert!(!checked.status.success(), "doctor: {stdout}");
     assert!(
         stdout.contains(
-            "FAIL `e2e_write_doctor_no_set` can't hand what role `writer`'s logins create \
-             to `e2e_write_no_set_group` without SET on it: as a superuser, run \
+            "FAIL `e2e_write_doctor_no_set` lacks SET on `e2e_write_no_set_group`, \
+             which PostgreSQL 16.16, 17.12, 18.7 and later need to hand what role `writer`'s \
+             logins create to it: as a superuser, run \
              GRANT \"e2e_write_no_set_group\" TO \"e2e_write_doctor_no_set\" WITH SET TRUE\n"
         ),
         "doctor: {stdout}"

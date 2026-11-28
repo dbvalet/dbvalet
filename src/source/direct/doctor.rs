@@ -168,8 +168,9 @@ fn group_grant_checks(
             "`{user}` can hand what role `{role_name}`'s logins create to `{member_of}`"
         ))),
         Some(false) => checks.push(Check::failed(format!(
-            "`{user}` can't hand what role `{role_name}`'s logins create to `{member_of}` \
-             without SET on it: as a superuser, run GRANT {group} TO {quoted_user} WITH SET TRUE"
+            "`{user}` lacks SET on `{member_of}`, which PostgreSQL 16.16, 17.12, 18.7 and later \
+             need to hand what role `{role_name}`'s logins create to it: \
+             as a superuser, run GRANT {group} TO {quoted_user} WITH SET TRUE"
         ))),
     }
     checks
@@ -617,9 +618,9 @@ mod tests {
             vec![
                 Check::passed("`admin` holds ADMIN on role `writer` (`app_writer`)".to_owned()),
                 Check::failed(
-                    "`admin` can't hand what role `writer`'s logins create to `app_writer` \
-                     without SET on it: as a superuser, run \
-                     GRANT \"app_writer\" TO \"admin\" WITH SET TRUE"
+                    "`admin` lacks SET on `app_writer`, which PostgreSQL 16.16, 17.12, 18.7 \
+                     and later need to hand what role `writer`'s logins create to it: \
+                     as a superuser, run GRANT \"app_writer\" TO \"admin\" WITH SET TRUE"
                         .to_owned()
                 ),
             ]

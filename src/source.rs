@@ -84,9 +84,9 @@ pub enum SourceError {
     #[error("refusing group role `{member_of}`: {reason}")]
     DangerousRole { member_of: String, reason: String },
     #[error(
-        "the admin login `{user}` lacks SET on group role `{member_of}`, so it couldn't \
-         hand what a write run creates to that role and drop the login: \
-         run `dbvalet doctor {alias}`"
+        "the admin login `{user}` lacks SET on group role `{member_of}`, which PostgreSQL \
+         16.16, 17.12, 18.7 and later need to hand what a write run creates to that role \
+         before dropping the login: run `dbvalet doctor {alias}`"
     )]
     AdminCannotReassign {
         alias: DatabaseAlias,
