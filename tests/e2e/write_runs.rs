@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::support::{
-    DBVALET, gc_in, printed, project_with_reader_and_admin, server_version_num,
-    start_run_until_ready, superuser_count, superuser_sql, sweeping, text,
+    DBVALET, gc_command, gc_in, printed, project_with_reader_and_admin, server_version_num,
+    start_run_until_ready, superuser_count, superuser_sql, sweeping, sweeping_alone, text,
 };
 
 /// A CREATEROLE admin for `alias` holding `GRANT <group> TO <admin> <grant_options>`, and a
@@ -234,6 +234,94 @@ fn a_killed_write_run_that_created_a_table_is_swept_without_error() {
             "e2e_write_killed_group"
         ),
         1
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_without_the_ledger_keeps_the_table_of_a_write_login_that_set_itself_read_only() {
+    let dir = project_with_writer(
+        "e2e-write-ledgerless",
+        "e2e_write_ledgerless_group",
+        "WITH ADMIN OPTION",
+    );
+    let (mut run, seen) = start_run_until_ready(
+        &dir,
+        &["--role", "writer"],
+        "echo \"login=$PGUSER\"; psql -v ON_ERROR_STOP=1 -qc \
+         'CREATE TABLE e2e_write_ledgerless_group.kept (id int)' \
+         -c 'ALTER ROLE CURRENT_USER SET default_transaction_read_only = on'",
+    );
+    let login_name = printed(&seen, "login").to_owned();
+    run.kill().unwrap();
+    run.wait().unwrap();
+
+    let alone = sweeping_alone();
+    superuser_sql(&format!(
+        "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
+    ));
+    // Another machine's sweep, with no ledger entry for the login.
+    let swept = gc_command(&dir)
+        .env("XDG_STATE_HOME", dir.join("other-machine-state"))
+        .output()
+        .unwrap();
+    drop(alone);
+    drop(run.stdin.take());
+
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
+    );
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_tables
+             WHERE schemaname = 'e2e_write_ledgerless_group' AND tablename = 'kept'
+               AND tableowner = $1",
+            "e2e_write_ledgerless_group"
+        ),
+        1
+    );
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_sweep_without_the_ledger_drops_a_reader_login_whose_admin_lacks_set_on_the_reader_group() {
+    if server_version_num() < 160000 {
+        return;
+    }
+    let dir = project_with_writer(
+        "e2e-write-ledgerless-reader",
+        "e2e_write_ledgerless_reader_group",
+        "WITH ADMIN OPTION",
+    );
+    superuser_sql("GRANT dbvalet_reader TO e2e_write_ledgerless_reader WITH SET FALSE;");
+    let (mut run, seen) = start_run_until_ready(&dir, &[], "echo \"login=$PGUSER\"");
+    let login_name = printed(&seen, "login").to_owned();
+    run.kill().unwrap();
+    run.wait().unwrap();
+
+    let alone = sweeping_alone();
+    superuser_sql(&format!(
+        "ALTER ROLE {login_name} VALID UNTIL '2000-01-01';"
+    ));
+    let swept = gc_command(&dir)
+        .env("XDG_STATE_HOME", dir.join("other-machine-state"))
+        .output()
+        .unwrap();
+    drop(alone);
+    drop(run.stdin.take());
+
+    assert!(swept.status.success(), "stderr: {}", text(&swept.stderr));
+    assert_eq!(
+        superuser_count(
+            "SELECT count(*) FROM pg_roles WHERE rolname = $1",
+            &login_name
+        ),
+        0
     );
 }
 

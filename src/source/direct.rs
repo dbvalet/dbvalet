@@ -1,6 +1,6 @@
 //! Temporary logins created with the admin login, over admin SQL.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -57,15 +57,37 @@ const EXPIRED_LOGINS: &str = "
 pub struct DirectSource {
     alias: DatabaseAlias,
     admin: Arc<AdminLogin>,
+    /// Group roles dbvalet.toml lists for this database only as read-only. A sweep that finds a
+    /// login without a ledger entry drops what it owns only when its group is one of these.
+    read_only_groups: BTreeSet<String>,
 }
 
 impl DirectSource {
-    pub fn new(alias: DatabaseAlias, admin: AdminLogin) -> Self {
+    pub fn new(
+        alias: DatabaseAlias,
+        admin: AdminLogin,
+        roles: &BTreeMap<String, RoleGrant>,
+    ) -> Self {
         Self {
             alias,
             admin: Arc::new(admin),
+            read_only_groups: read_only_groups(roles),
         }
     }
+}
+
+/// A group listed both ways is left out, so its logins' objects are reassigned, not dropped.
+fn read_only_groups(roles: &BTreeMap<String, RoleGrant>) -> BTreeSet<String> {
+    let writable: BTreeSet<&str> = roles
+        .values()
+        .filter(|grant| !grant.read_only)
+        .map(|grant| grant.member_of.as_str())
+        .collect();
+    roles
+        .values()
+        .filter(|grant| grant.read_only && !writable.contains(grant.member_of.as_str()))
+        .map(|grant| grant.member_of.clone())
+        .collect()
 }
 
 impl CredentialSource for DirectSource {
@@ -97,7 +119,9 @@ impl CredentialSource for DirectSource {
                 continue;
             }
             match listed.lock() {
-                Some(State::Orphan(entry)) => sweep_orphan(&client, entry, &mut report).await,
+                Some(State::Orphan(entry)) => {
+                    sweep_orphan(&client, entry, &self.read_only_groups, &mut report).await;
+                }
                 Some(State::Held) | None => {}
                 Some(State::Unreadable(err)) => report.failures.push(err.into()),
             }
@@ -117,7 +141,7 @@ impl CredentialSource for DirectSource {
             if !is_login_name(&login) || has_entry.contains(&login) {
                 continue;
             }
-            match drop_leftover_login(&client, &login, None).await {
+            match drop_leftover_login(&client, &login, None, &self.read_only_groups).await {
                 Ok(true) => report.dropped.push(login),
                 Ok(false) => {}
                 Err(reason) => report
@@ -649,9 +673,14 @@ pub(super) async fn drop_login(
 }
 
 /// Drops the login of an entry whose run has ended, then removes the entry.
-async fn sweep_orphan(client: &Client, entry: ledger::Entry, report: &mut SweepReport) {
+async fn sweep_orphan(
+    client: &Client,
+    entry: ledger::Entry,
+    read_only_groups: &BTreeSet<String>,
+    report: &mut SweepReport,
+) {
     let login = entry.login().to_owned();
-    match sweep_login(client, &login, entry.read_only()).await {
+    match sweep_login(client, &login, entry.read_only(), read_only_groups).await {
         Ok(None) => {}
         Ok(Some(existed)) => match entry.remove() {
             Ok(()) if existed => report.dropped.push(login),
@@ -668,6 +697,7 @@ async fn sweep_login(
     client: &Client,
     login: &str,
     read_only: Option<bool>,
+    read_only_groups: &BTreeSet<String>,
 ) -> Result<Option<bool>, String> {
     // The creating connection may still hold its lock after dbvalet has gone away.
     // The existence check needs a fresh snapshot taken after that lock is gone.
@@ -682,7 +712,7 @@ async fn sweep_login(
     if !ready {
         return Ok(None);
     }
-    drop_leftover_login(client, login, read_only)
+    drop_leftover_login(client, login, read_only, read_only_groups)
         .await
         .map(Some)
 }
@@ -694,11 +724,11 @@ async fn drop_leftover_login(
     client: &Client,
     user: &str,
     ledger_read_only: Option<bool>,
+    read_only_groups: &BTreeSet<String>,
 ) -> Result<bool, String> {
     let Some(role) = client
         .query_opt(
             "SELECT r.oid,
-                    COALESCE('default_transaction_read_only=on' = ANY (r.rolconfig), false),
                     ARRAY(SELECT DISTINCT g.rolname::text
                           FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid
                           WHERE m.member = r.oid)
@@ -712,9 +742,12 @@ async fn drop_leftover_login(
         return Ok(false);
     };
     let role_oid: u32 = role.get(0);
-    // The login can change its own settings in either direction, but not the ledger.
-    let read_only = ledger_read_only.unwrap_or_else(|| role.get(1));
-    let groups: Vec<String> = role.get(2);
+    let groups: Vec<String> = role.get(1);
+    // The login can change its own settings, so without the ledger only dbvalet.toml can say
+    // it was read-only. Anything else keeps what it created, given to its group.
+    let read_only = ledger_read_only.unwrap_or_else(
+        || matches!(groups.as_slice(), [group] if read_only_groups.contains(group)),
+    );
     let reassign_to = match (read_only, groups.as_slice()) {
         (true, _) => None,
         (false, [group]) => Some(group.as_str()),
@@ -835,6 +868,23 @@ mod tests {
 
     fn alias() -> DatabaseAlias {
         "app".parse().unwrap()
+    }
+
+    #[test]
+    fn only_groups_listed_solely_as_read_only_count_as_read_only() {
+        let config: crate::config::Config = toml::from_str(
+            "[databases.app.roles]
+             reader = { member_of = \"dbvalet_reader\", read_only = true }
+             writer = { member_of = \"app_writer\", read_only = false }
+             both_ro = { member_of = \"app_shared\", read_only = true }
+             both_rw = { member_of = \"app_shared\", read_only = false }",
+        )
+        .unwrap();
+        let roles = &config.databases[&alias()].roles;
+        assert_eq!(
+            read_only_groups(roles),
+            BTreeSet::from(["dbvalet_reader".to_owned()])
+        );
     }
 
     #[test]

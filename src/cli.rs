@@ -231,7 +231,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let max_ttl = policy::max_ttl(database);
             let admin = keychain::load(alias, allow_plaintext)?;
             let upstream = admin.endpoint().clone();
-            let source = DirectSource::new(alias.clone(), admin);
+            let source = DirectSource::new(alias.clone(), admin, &database.roles);
             let options = RunOptions {
                 database: alias,
                 role: &role,
@@ -276,8 +276,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     return Ok(ExitCode::FAILURE);
                 }
             };
+            let mut roles = BTreeMap::new();
             match config::find_and_load(&cwd) {
-                Ok(config) => aliases.extend(config.databases.into_keys()),
+                Ok(config) => {
+                    for (alias, database) in config.databases {
+                        aliases.insert(alias.clone());
+                        roles.insert(alias, database.roles);
+                    }
+                }
                 Err(ConfigError::NotFound { .. }) => {}
                 Err(err) => return Err(err.into()),
             }
@@ -289,7 +295,9 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             let mut all_swept = true;
             for alias in &aliases {
-                all_swept &= gc(alias, allow_plaintext).await;
+                let no_roles = BTreeMap::new();
+                let roles = roles.get(alias).unwrap_or(&no_roles);
+                all_swept &= gc(alias, roles, allow_plaintext).await;
             }
             Ok(if all_swept {
                 ExitCode::SUCCESS
@@ -310,7 +318,11 @@ fn write_stdout(stdout: &mut impl Write, bytes: &[u8]) -> Result<(), CliError> {
 }
 
 /// Sweeps one database and prints what it dropped. Returns whether nothing failed.
-async fn gc(alias: &DatabaseAlias, allow_plaintext: bool) -> bool {
+async fn gc(
+    alias: &DatabaseAlias,
+    roles: &BTreeMap<String, config::RoleGrant>,
+    allow_plaintext: bool,
+) -> bool {
     let admin = match keychain::load(alias, allow_plaintext) {
         Ok(admin) => admin,
         Err(err) => {
@@ -318,7 +330,7 @@ async fn gc(alias: &DatabaseAlias, allow_plaintext: bool) -> bool {
             return false;
         }
     };
-    let report = match DirectSource::new(alias.clone(), admin).sweep().await {
+    let report = match DirectSource::new(alias.clone(), admin, roles).sweep().await {
         Ok(report) => report,
         Err(err) => {
             let _ = writeln!(io::stderr(), "dbvalet: `{alias}`: {err}");
