@@ -24,9 +24,11 @@ use crate::{DatabaseAlias, LOGIN_PREFIX, RUN_ID_BYTES, is_login_name, random_bas
 mod connect;
 mod doctor;
 mod group_role;
+mod init;
 use connect::{connect, connect_with_cancel_tls};
 pub use doctor::{Check, doctor};
 use group_role::{AdminGrants, GroupRoleStatus, inspect_group_role, read_admin_grants};
+pub use init::{InitError, InitReport, init};
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

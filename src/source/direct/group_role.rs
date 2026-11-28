@@ -1,6 +1,6 @@
 //! Decides whether a dbvalet.toml group role is safe to join, and whether the admin can use it.
 
-use tokio_postgres::Client;
+use tokio_postgres::GenericClient;
 
 use super::CREATEROLE_SELF_GRANT_VERSION_NUM;
 
@@ -31,7 +31,7 @@ pub(super) struct AdminGrants {
 
 /// `None` when the group role doesn't exist.
 pub(super) async fn read_admin_grants(
-    client: &Client,
+    client: &impl GenericClient,
     member_of: &str,
     version_num: i32,
 ) -> Result<Option<AdminGrants>, tokio_postgres::Error> {
@@ -120,7 +120,7 @@ pub(super) enum GroupRoleStatus {
 }
 
 pub(super) async fn inspect_group_role(
-    client: &Client,
+    client: &impl GenericClient,
     member_of: &str,
 ) -> Result<GroupRoleStatus, tokio_postgres::Error> {
     let rows = client.query(GROUP_ROLE_GRAPH, &[&member_of]).await?;
