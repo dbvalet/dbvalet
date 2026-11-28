@@ -26,7 +26,7 @@ mod doctor;
 mod group_role;
 use connect::{connect, connect_with_cancel_tls};
 pub use doctor::{Check, doctor};
-use group_role::{GroupRoleStatus, inspect_group_role};
+use group_role::{GroupRoleStatus, inspect_group_role, read_admin_grants};
 
 /// For the whole admin connection: TCP, startup, authentication and its first setting.
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -133,8 +133,7 @@ impl CredentialSource for DirectSource {
         interrupted: impl Future<Output = i32>,
     ) -> Result<MintOutcome, SourceError> {
         let setup_deadline = tokio::time::Instant::now() + ADMIN_MINT_TIMEOUT;
-        let preparing =
-            tokio::time::timeout_at(setup_deadline, self.prepare_mint(&grant.member_of, max_ttl));
+        let preparing = tokio::time::timeout_at(setup_deadline, self.prepare_mint(grant, max_ttl));
         tokio::pin!(interrupted);
         let (mut client, version_num, clock, valid_until) = tokio::select! {
             biased;
@@ -220,9 +219,10 @@ impl CredentialSource for DirectSource {
 impl DirectSource {
     async fn prepare_mint(
         &self,
-        member_of: &str,
+        grant: &RoleGrant,
         max_ttl: Duration,
     ) -> Result<(Client, i32, LeaseClock, String), SourceError> {
+        let member_of = grant.member_of.as_str();
         let client =
             connect(&self.alias, &self.admin)
                 .await
@@ -280,6 +280,23 @@ impl DirectSource {
                 return Err(SourceError::DangerousRole {
                     member_of: member_of.to_owned(),
                     reason,
+                });
+            }
+        }
+        // A write login's teardown runs REASSIGN OWNED, so a login it couldn't run would stay
+        // behind for good. Refused here, before the ledger entry or the login exists.
+        if !grant.read_only {
+            let missing = read_admin_grants(&client, member_of, version_num)
+                .await
+                .map_err(create_failed)?
+                .map(|grants| grants.missing_for_reassign(version_num))
+                .unwrap_or_default();
+            if !missing.is_empty() {
+                return Err(SourceError::AdminCannotReassign {
+                    alias: self.alias.clone(),
+                    user: self.admin.user().to_owned(),
+                    member_of: member_of.to_owned(),
+                    missing: missing.join(" and "),
                 });
             }
         }

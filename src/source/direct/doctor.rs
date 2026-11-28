@@ -7,16 +7,12 @@ use tokio_postgres::Client;
 
 use super::{
     CREATEROLE_SELF_GRANT_VERSION_NUM, GroupRoleStatus, MINIMUM_SERVER_VERSION_NUM, connect,
-    inspect_group_role, quote_ident,
+    inspect_group_role, quote_ident, read_admin_grants,
 };
 use crate::DatabaseAlias;
 use crate::config::RoleGrant;
 use crate::endpoint::{Endpoint, Tls, TrustRoot};
 use crate::keychain;
-
-/// Since 16.16, 17.12, 18.7 and 19, `REASSIGN OWNED ... TO <group>` needs SET on the group, as
-/// `ALTER ... OWNER` does. Earlier 16 minors are checked too, so a minor update can't break teardown.
-const REASSIGN_NEEDS_SET_VERSION_NUM: i32 = 160000;
 
 /// One line of `dbvalet doctor`'s report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,19 +95,30 @@ pub async fn doctor(
                         continue;
                     }
                 };
-                let exists = status != GroupRoleStatus::Missing;
+                let safe = status == GroupRoleStatus::Safe;
                 checks.push(group_role_check(role_name, &grant.member_of, status));
-                if !exists {
+                // A missing or refused role gets no grant advice: the fix is a different role.
+                if !safe {
                     continue;
                 }
-                let needs_set =
-                    !grant.read_only && rights.server_version_num >= REASSIGN_NEEDS_SET_VERSION_NUM;
-                match read_group_grants(&client, &grant.member_of, needs_set).await {
-                    Ok(grants) => checks.extend(group_grant_checks(
-                        user,
+                let version_num = rights.server_version_num;
+                match read_admin_grants(&client, &grant.member_of, version_num).await {
+                    Ok(Some(grants)) => {
+                        let reassign_missing =
+                            (!grant.read_only).then(|| grants.missing_for_reassign(version_num));
+                        checks.extend(group_grant_checks(
+                            user,
+                            role_name,
+                            &grant.member_of,
+                            version_num,
+                            grants.admin,
+                            reassign_missing.as_deref(),
+                        ));
+                    }
+                    Ok(None) => checks.push(group_role_check(
                         role_name,
                         &grant.member_of,
-                        grants,
+                        GroupRoleStatus::Missing,
                     )),
                     Err(err) => checks.push(check_failed(err)),
                 }
@@ -139,65 +146,53 @@ fn group_role_check(role_name: &str, member_of: &str, status: GroupRoleStatus) -
     }
 }
 
-/// What the admin holds on one configured group role.
-struct GroupGrants {
-    /// Needed to add each temporary login to the group.
-    admin: bool,
-    /// Needed to hand a write run's objects to the group; `None` where it isn't checked.
-    set: Option<bool>,
-}
-
-async fn read_group_grants(
-    client: &Client,
-    member_of: &str,
-    needs_set: bool,
-) -> Result<GroupGrants, tokio_postgres::Error> {
-    let admin = client
-        .query_one(
-            "SELECT pg_has_role(current_user, $1, 'MEMBER WITH ADMIN OPTION')",
-            &[&member_of],
-        )
-        .await?
-        .get(0);
-    // PostgreSQL 15 has no SET privilege, so the query is only sent where it is checked.
-    let set = if needs_set {
-        let row = client
-            .query_one("SELECT pg_has_role(current_user, $1, 'SET')", &[&member_of])
-            .await?;
-        Some(row.get(0))
-    } else {
-        None
-    };
-    Ok(GroupGrants { admin, set })
-}
-
+/// `reassign_missing` is what a write role's teardown needs and the admin lacks, and `None` for
+/// a read-only role, whose teardown reassigns nothing.
 fn group_grant_checks(
     user: &str,
     role_name: &str,
     member_of: &str,
-    grants: GroupGrants,
+    version_num: i32,
+    admin: bool,
+    reassign_missing: Option<&[&str]>,
 ) -> Vec<Check> {
     let group = quote_ident(member_of);
     let quoted_user = quote_ident(user);
-    let mut checks = vec![if grants.admin {
+    let mut checks = vec![if admin {
         Check::passed(format!(
-            "`{user}` can grant role `{role_name}` (`{member_of}`)"
+            "`{user}` holds ADMIN on role `{role_name}` (`{member_of}`)"
         ))
     } else {
         Check::failed(format!(
-            "`{user}` can't grant role `{role_name}` (`{member_of}`): \
+            "`{user}` doesn't hold ADMIN on role `{role_name}` (`{member_of}`): \
              as a superuser, run GRANT {group} TO {quoted_user} WITH ADMIN OPTION"
         ))
     }];
-    match grants.set {
+    match reassign_missing {
         None => {}
-        Some(true) => checks.push(Check::passed(format!(
+        Some([]) => checks.push(Check::passed(format!(
             "`{user}` can hand what role `{role_name}`'s logins create to `{member_of}`"
         ))),
-        Some(false) => checks.push(Check::failed(format!(
-            "`{user}` can't hand what role `{role_name}`'s logins create to `{member_of}` \
-             without SET on it: as a superuser, run GRANT {group} TO {quoted_user} WITH SET TRUE"
-        ))),
+        Some(missing) => {
+            // PostgreSQL 15 grants have no options: membership of an INHERIT admin gives USAGE.
+            let fix = if version_num < CREATEROLE_SELF_GRANT_VERSION_NUM {
+                format!("GRANT {group} TO {quoted_user}")
+            } else {
+                let options: Vec<&str> = missing
+                    .iter()
+                    .map(|privilege| match *privilege {
+                        "USAGE" => "INHERIT TRUE",
+                        _ => "SET TRUE",
+                    })
+                    .collect();
+                format!("GRANT {group} TO {quoted_user} WITH {}", options.join(", "))
+            };
+            checks.push(Check::failed(format!(
+                "`{user}` can't hand what role `{role_name}`'s logins create to `{member_of}` \
+                 without {} on it: as a superuser, run {fix}",
+                missing.join(" and ")
+            )));
+        }
     }
     checks
 }
@@ -623,21 +618,13 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_group_the_admin_holds_without_admin_fails_with_a_quoted_grant_and_no_set_check()
-    {
-        let checks = group_grant_checks(
-            "Db\"Admin",
-            "reader",
-            "app reader",
-            GroupGrants {
-                admin: false,
-                set: None,
-            },
-        );
+    fn a_read_only_group_the_admin_holds_without_admin_fails_with_a_quoted_grant_and_no_reassign_check()
+     {
+        let checks = group_grant_checks("Db\"Admin", "reader", "app reader", 170012, false, None);
         assert_eq!(
             checks,
             vec![Check::failed(
-                "`Db\"Admin` can't grant role `reader` (`app reader`): \
+                "`Db\"Admin` doesn't hold ADMIN on role `reader` (`app reader`): \
                  as a superuser, run GRANT \"app reader\" TO \"Db\"\"Admin\" WITH ADMIN OPTION"
                     .to_owned()
             )]
@@ -650,15 +637,14 @@ mod tests {
             "admin",
             "writer",
             "app_writer",
-            GroupGrants {
-                admin: true,
-                set: Some(false),
-            },
+            170012,
+            true,
+            Some(&["SET"]),
         );
         assert_eq!(
             checks,
             vec![
-                Check::passed("`admin` can grant role `writer` (`app_writer`)".to_owned()),
+                Check::passed("`admin` holds ADMIN on role `writer` (`app_writer`)".to_owned()),
                 Check::failed(
                     "`admin` can't hand what role `writer`'s logins create to `app_writer` \
                      without SET on it: as a superuser, run \
@@ -670,20 +656,53 @@ mod tests {
     }
 
     #[test]
-    fn a_write_group_the_admin_holds_with_admin_and_set_passes_both_checks() {
+    fn a_write_group_on_an_unpatched_16_minor_lacking_usage_and_set_names_both_options() {
         let checks = group_grant_checks(
             "admin",
             "writer",
             "app_writer",
-            GroupGrants {
-                admin: true,
-                set: Some(true),
-            },
+            160015,
+            true,
+            Some(&["USAGE", "SET"]),
         );
+        assert_eq!(
+            checks[1],
+            Check::failed(
+                "`admin` can't hand what role `writer`'s logins create to `app_writer` \
+                 without USAGE and SET on it: as a superuser, run \
+                 GRANT \"app_writer\" TO \"admin\" WITH INHERIT TRUE, SET TRUE"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_write_group_on_postgresql_15_lacking_usage_is_told_to_grant_membership() {
+        let checks = group_grant_checks(
+            "admin",
+            "writer",
+            "app_writer",
+            150020,
+            true,
+            Some(&["USAGE"]),
+        );
+        assert_eq!(
+            checks[1],
+            Check::failed(
+                "`admin` can't hand what role `writer`'s logins create to `app_writer` \
+                 without USAGE on it: as a superuser, run GRANT \"app_writer\" TO \"admin\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_write_group_the_admin_holds_with_everything_teardown_needs_passes_both_checks() {
+        let checks = group_grant_checks("admin", "writer", "app_writer", 190000, true, Some(&[]));
         assert_eq!(
             checks,
             vec![
-                Check::passed("`admin` can grant role `writer` (`app_writer`)".to_owned()),
+                Check::passed("`admin` holds ADMIN on role `writer` (`app_writer`)".to_owned()),
                 Check::passed(
                     "`admin` can hand what role `writer`'s logins create to `app_writer`"
                         .to_owned()

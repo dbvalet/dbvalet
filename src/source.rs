@@ -83,6 +83,17 @@ pub enum SourceError {
     },
     #[error("refusing group role `{member_of}`: {reason}")]
     DangerousRole { member_of: String, reason: String },
+    #[error(
+        "the admin login `{user}` lacks {missing} on group role `{member_of}`, so it couldn't \
+         hand what a write run creates to that role and drop the login: \
+         run `dbvalet doctor {alias}`"
+    )]
+    AdminCannotReassign {
+        alias: DatabaseAlias,
+        user: String,
+        member_of: String,
+        missing: String,
+    },
     #[error("couldn't create a temporary login: {reason}")]
     CreateLogin { reason: String },
     #[error(

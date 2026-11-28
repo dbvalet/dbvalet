@@ -53,13 +53,34 @@ fn run_as(dir: &Path, role: &str, script: &str) -> Output {
         .unwrap()
 }
 
-fn doctor_in(dir: &Path, alias: &str) -> String {
-    let checked = Command::new(DBVALET)
+fn doctor_in(dir: &Path, alias: &str) -> Output {
+    Command::new(DBVALET)
         .current_dir(dir)
         .args(["doctor", "--allow-plaintext", alias])
         .output()
-        .unwrap();
-    text(&checked.stdout)
+        .unwrap()
+}
+
+fn ledger_entries_in(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir.join("state/dbvalet/ledger"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn logins_in_group(group: &str) -> i64 {
+    superuser_count(
+        "SELECT count(*)
+         FROM pg_roles r
+         JOIN pg_auth_members m ON m.member = r.oid
+         JOIN pg_roles g ON g.oid = m.roleid
+         WHERE g.rolname = $1
+           AND r.rolcanlogin
+           AND starts_with(r.rolname::text, 'dbvalet_')",
+        group,
+    )
 }
 
 #[test]
@@ -218,22 +239,91 @@ fn a_killed_write_run_that_created_a_table_is_swept_without_error() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn doctor_passes_a_createrole_admin_holding_admin_on_both_configured_groups() {
+fn a_write_run_whose_admin_lacks_set_on_postgresql_16_or_later_is_refused_before_any_login() {
+    if server_version_num() < 160000 {
+        return;
+    }
+    let dir = project_with_writer(
+        "e2e-write-refused-no-set",
+        "e2e_write_refused_no_set_group",
+        "WITH ADMIN TRUE, SET FALSE",
+    );
+
+    let output = run_as(&dir, "writer", "echo CHILD_RAN");
+
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(text(&output.stdout).is_empty(), "the child must not run");
+    assert!(
+        stderr.contains(
+            "the admin login `e2e_write_refused_no_set` lacks SET on group role \
+             `e2e_write_refused_no_set_group`"
+        ),
+        "stderr: {stderr}"
+    );
+    assert_eq!(logins_in_group("e2e_write_refused_no_set_group"), 0);
+    assert!(ledger_entries_in(&dir).is_empty());
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn a_write_run_whose_createrole_admin_isnt_in_the_group_on_postgresql_15_is_refused_before_any_login()
+ {
+    if server_version_num() >= 160000 {
+        return;
+    }
+    let dir = project_with_writer(
+        "e2e-write-refused-15",
+        "e2e_write_refused_15_group",
+        "WITH ADMIN OPTION",
+    );
+    superuser_sql("REVOKE e2e_write_refused_15_group FROM e2e_write_refused_15;");
+
+    let output = run_as(&dir, "writer", "echo CHILD_RAN");
+
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(text(&output.stdout).is_empty(), "the child must not run");
+    assert!(
+        stderr.contains(
+            "the admin login `e2e_write_refused_15` lacks USAGE on group role \
+             `e2e_write_refused_15_group`"
+        ),
+        "stderr: {stderr}"
+    );
+    assert_eq!(logins_in_group("e2e_write_refused_15_group"), 0);
+    assert!(ledger_entries_in(&dir).is_empty());
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn doctor_passes_a_createrole_admin_holding_everything_both_configured_groups_need() {
     let dir = project_with_writer(
         "e2e-write-doctor-ok",
         "e2e_write_doctor_ok_group",
         "WITH ADMIN OPTION",
     );
 
-    let stdout = doctor_in(&dir, "e2e-write-doctor-ok");
+    let checked = doctor_in(&dir, "e2e-write-doctor-ok");
 
+    let stdout = text(&checked.stdout);
+    assert!(checked.status.success(), "doctor: {stdout}");
     assert!(
-        stdout.contains("ok   `e2e_write_doctor_ok` can grant role `reader` (`dbvalet_reader`)\n"),
+        stdout.contains(
+            "ok   `e2e_write_doctor_ok` holds ADMIN on role `reader` (`dbvalet_reader`)\n"
+        ),
         "doctor: {stdout}"
     );
     assert!(
         stdout.contains(
-            "ok   `e2e_write_doctor_ok` can grant role `writer` (`e2e_write_doctor_ok_group`)\n"
+            "ok   `e2e_write_doctor_ok` holds ADMIN on role `writer` (`e2e_write_doctor_ok_group`)\n"
+        ),
+        "doctor: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "ok   `e2e_write_doctor_ok` can hand what role `writer`'s logins create \
+             to `e2e_write_doctor_ok_group`\n"
         ),
         "doctor: {stdout}"
     );
@@ -245,11 +335,13 @@ fn doctor_passes_a_createrole_admin_holding_admin_on_both_configured_groups() {
 fn doctor_names_a_configured_group_role_the_admin_holds_without_admin() {
     let dir = project_with_writer("e2e-write-doctor-no-admin", "e2e_write_no_admin_group", "");
 
-    let stdout = doctor_in(&dir, "e2e-write-doctor-no-admin");
+    let checked = doctor_in(&dir, "e2e-write-doctor-no-admin");
 
+    let stdout = text(&checked.stdout);
+    assert!(!checked.status.success(), "doctor: {stdout}");
     assert!(
         stdout.contains(
-            "FAIL `e2e_write_doctor_no_admin` can't grant role `writer` \
+            "FAIL `e2e_write_doctor_no_admin` doesn't hold ADMIN on role `writer` \
              (`e2e_write_no_admin_group`): as a superuser, run \
              GRANT \"e2e_write_no_admin_group\" TO \"e2e_write_doctor_no_admin\" \
              WITH ADMIN OPTION\n"
@@ -260,7 +352,7 @@ fn doctor_names_a_configured_group_role_the_admin_holds_without_admin() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
-fn doctor_on_postgresql_16_or_later_names_a_write_group_role_the_admin_holds_without_set() {
+fn doctor_on_postgresql_16_or_later_names_the_write_group_held_without_set_and_not_the_reader() {
     if server_version_num() < 160000 {
         return;
     }
@@ -269,15 +361,12 @@ fn doctor_on_postgresql_16_or_later_names_a_write_group_role_the_admin_holds_wit
         "e2e_write_no_set_group",
         "WITH ADMIN TRUE, SET FALSE",
     );
+    superuser_sql("GRANT dbvalet_reader TO e2e_write_doctor_no_set WITH SET FALSE;");
 
-    let stdout = doctor_in(&dir, "e2e-write-doctor-no-set");
+    let checked = doctor_in(&dir, "e2e-write-doctor-no-set");
 
-    assert!(
-        stdout.contains(
-            "ok   `e2e_write_doctor_no_set` can grant role `writer` (`e2e_write_no_set_group`)\n"
-        ),
-        "doctor: {stdout}"
-    );
+    let stdout = text(&checked.stdout);
+    assert!(!checked.status.success(), "doctor: {stdout}");
     assert!(
         stdout.contains(
             "FAIL `e2e_write_doctor_no_set` can't hand what role `writer`'s logins create \
@@ -286,4 +375,5 @@ fn doctor_on_postgresql_16_or_later_names_a_write_group_role_the_admin_holds_wit
         ),
         "doctor: {stdout}"
     );
+    assert_eq!(stdout.matches("FAIL").count(), 1, "doctor: {stdout}");
 }
