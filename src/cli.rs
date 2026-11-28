@@ -43,6 +43,19 @@ enum Command {
         #[arg(long)]
         allow_plaintext: bool,
     },
+    /// Prepare a database for read-only runs: create dbvalet_reader and let it read the tables.
+    ///
+    /// Safe to run again, for example with another schema. Creates dbvalet.toml when there's
+    /// none, and otherwise prints the entry to add to it.
+    Init {
+        alias: DatabaseAlias,
+        /// A schema whose tables dbvalet_reader may read. Repeat it for more than one.
+        #[arg(long = "schema", value_name = "NAME", default_value = "public")]
+        schemas: Vec<String>,
+        /// Connect without TLS. Allowed only for a database on localhost.
+        #[arg(long)]
+        allow_plaintext: bool,
+    },
     /// Run a command with a temporary login behind a local proxy, dropped when it exits.
     Run {
         /// The database from dbvalet.toml. Needed when the file lists more than one.
@@ -96,6 +109,8 @@ pub enum CliError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
+    Init(#[from] direct::InitError),
+    #[error(transparent)]
     Policy(#[from] PolicyError),
     #[error(transparent)]
     Run(#[from] RunError),
@@ -137,6 +152,48 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             } else {
                 ExitCode::FAILURE
             })
+        }
+        Command::Init {
+            alias,
+            schemas,
+            allow_plaintext,
+        } => {
+            let cwd = std::env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let admin = keychain::load(&alias, allow_plaintext)?;
+            let report = direct::init(&alias, &admin, &schemas).await?;
+            let schema_list = schemas
+                .iter()
+                .map(|schema| format!("`{schema}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "dbvalet_reader can read the tables in {schema_list} of database `{}`.",
+                report.database
+            );
+            for (schema, count) in &report.unreadable_tables {
+                println!(
+                    "{count} existing tables in `{schema}` stay unreadable because another role \
+                     owns them: their owner must GRANT SELECT on them TO dbvalet_reader."
+                );
+            }
+            println!(
+                "Tables that `{}` creates later in {schema_list} will be readable too. \
+                 Tables another role creates need their own GRANT SELECT ... TO dbvalet_reader.",
+                admin.user()
+            );
+            let entry = config::reader_entry(&alias);
+            match config::find(&cwd) {
+                Some(path) => println!(
+                    "\n{} already exists, so dbvalet left it unchanged. \
+                     Add this entry to it if it's missing:\n\n{entry}",
+                    path.display()
+                ),
+                None => {
+                    let path = config::create(&cwd, &entry)?;
+                    println!("\nCreated {} with a `reader` role.", path.display());
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Command::Run {
             db,

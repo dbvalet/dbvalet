@@ -12,6 +12,8 @@ use crate::DatabaseAlias;
 
 pub const FILE_NAME: &str = "dbvalet.toml";
 const SECONDS_PER_MINUTE: u64 = 60;
+/// Eight hours: a working day, after which a run loses database access.
+const INIT_MAX_TTL_MINUTES: u64 = 480;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,22 +56,58 @@ pub enum ConfigError {
     },
     #[error("{} isn't valid: {message}", path.display())]
     Invalid { path: PathBuf, message: String },
+    #[error("couldn't create {}", path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Loads the nearest `dbvalet.toml`, looking in `start` and then each directory above it.
 pub fn find_and_load(start: &Path) -> Result<Config, ConfigError> {
-    let path = start
-        .ancestors()
-        .map(|dir| dir.join(FILE_NAME))
-        .find(|path| path.is_file())
-        .ok_or_else(|| ConfigError::NotFound {
-            start: start.to_owned(),
-        })?;
+    let path = find(start).ok_or_else(|| ConfigError::NotFound {
+        start: start.to_owned(),
+    })?;
     let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
     })?;
     parse(&text).map_err(|message| ConfigError::Invalid { path, message })
+}
+
+/// The nearest `dbvalet.toml`, in `start` or a directory above it.
+pub fn find(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .map(|dir| dir.join(FILE_NAME))
+        .find(|path| path.is_file())
+}
+
+/// The entry `dbvalet init` writes: a read-only `reader` role joining `dbvalet_reader`.
+pub fn reader_entry(alias: &DatabaseAlias) -> String {
+    format!(
+        "[databases.{alias}]\n\
+         max_ttl_minutes = {INIT_MAX_TTL_MINUTES}\n\
+         \n\
+         [databases.{alias}.roles]\n\
+         reader = {{ member_of = \"dbvalet_reader\", read_only = true }}\n"
+    )
+}
+
+/// Creates `dbvalet.toml` in `dir` holding `text`, failing rather than replacing one.
+pub fn create(dir: &Path, text: &str) -> Result<PathBuf, ConfigError> {
+    let path = dir.join(FILE_NAME);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| io::Write::write_all(&mut file, text.as_bytes()))
+        .map_err(|source| ConfigError::Create {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(path)
 }
 
 fn parse(text: &str) -> Result<Config, String> {
@@ -156,6 +194,23 @@ mod tests {
         assert_eq!(
             config.databases[&app].max_ttl(),
             Some(std::time::Duration::from_secs(480 * 60))
+        );
+    }
+
+    #[test]
+    fn the_entry_init_writes_parses_as_a_read_only_reader_for_eight_hours() {
+        let app: DatabaseAlias = "app".parse().unwrap();
+        let config = parse(&reader_entry(&app)).unwrap();
+        assert_eq!(
+            config.databases[&app].max_ttl(),
+            Some(std::time::Duration::from_secs(480 * 60))
+        );
+        assert_eq!(
+            config.databases[&app].roles["reader"],
+            RoleGrant {
+                member_of: "dbvalet_reader".to_owned(),
+                read_only: true,
+            }
         );
     }
 
