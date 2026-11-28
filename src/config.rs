@@ -95,18 +95,17 @@ pub fn reader_entry(alias: &DatabaseAlias) -> String {
     )
 }
 
-/// Creates `dbvalet.toml` in `dir` holding `text`, failing rather than replacing one.
+/// Creates `dbvalet.toml` in `dir` holding `text`, failing with `AlreadyExists` rather than
+/// replacing one. The file appears whole: a draft is written first, then hard-linked into place.
 pub fn create(dir: &Path, text: &str) -> Result<PathBuf, ConfigError> {
     let path = dir.join(FILE_NAME);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .and_then(|mut file| io::Write::write_all(&mut file, text.as_bytes()))
-        .map_err(|source| ConfigError::Create {
-            path: path.clone(),
-            source,
-        })?;
+    let draft = dir.join(format!(".{FILE_NAME}.{}.draft", std::process::id()));
+    let created = std::fs::write(&draft, text).and_then(|()| std::fs::hard_link(&draft, &path));
+    let _ = std::fs::remove_file(&draft);
+    created.map_err(|source| ConfigError::Create {
+        path: path.clone(),
+        source,
+    })?;
     Ok(path)
 }
 
@@ -212,6 +211,27 @@ mod tests {
                 read_only: true,
             }
         );
+    }
+
+    #[test]
+    fn creating_the_file_where_one_exists_fails_and_leaves_it_unchanged() {
+        let dir = std::env::temp_dir().join(format!("dbvalet-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), "# hand-written\n").unwrap();
+
+        let err = create(&dir, "[databases.app]\n").unwrap_err();
+
+        let kind = match err {
+            ConfigError::Create { source, .. } => source.kind(),
+            other => panic!("{other}"),
+        };
+        assert_eq!(kind, io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FILE_NAME)).unwrap(),
+            "# hand-written\n"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

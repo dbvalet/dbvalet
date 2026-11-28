@@ -3,14 +3,15 @@
 //! Each test has its own database, owned by its own admin, so their grants don't mix.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use crate::support::{
     DBVALET, create_reader_group, login, run_in, runtime, server_version_num, superuser_sql, text,
 };
 
-/// Creates the login `name` with `attributes`, a database `name` it owns, and a project
-/// directory without `dbvalet.toml`, and stores the login under the alias `name`.
+/// Creates the login `name` with `attributes`, a database `name` it owns that PUBLIC can't
+/// connect to, and a project directory without `dbvalet.toml`, and stores the login under the
+/// alias `name`.
 fn admin_with_own_database(name: &str, attributes: &str) -> PathBuf {
     superuser_sql(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
     superuser_sql(&format!(
@@ -18,6 +19,7 @@ fn admin_with_own_database(name: &str, attributes: &str) -> PathBuf {
          CREATE ROLE {name} LOGIN {attributes} PASSWORD 'pw-{name}';"
     ));
     superuser_sql(&format!("CREATE DATABASE {name} OWNER {name}"));
+    superuser_sql(&format!("REVOKE CONNECT ON DATABASE {name} FROM PUBLIC"));
     let stored = login(
         name,
         &format!("postgresql://{name}:pw-{name}@localhost:5432/{name}"),
@@ -26,6 +28,20 @@ fn admin_with_own_database(name: &str, attributes: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Like [`admin_with_own_database`] for a CREATEROLE admin. Another test's superuser may already
+/// have created dbvalet_reader, and on 16+ only a superuser can then give this admin ADMIN on
+/// it, so it gets that alone here and init must add INHERIT and SET.
+fn createrole_admin_with_own_database(name: &str) -> PathBuf {
+    let dir = admin_with_own_database(name, "CREATEROLE");
+    create_reader_group();
+    if server_version_num() >= 160000 {
+        superuser_sql(&format!(
+            "GRANT dbvalet_reader TO {name} WITH ADMIN OPTION, INHERIT FALSE, SET FALSE"
+        ));
+    }
     dir
 }
 
@@ -70,8 +86,7 @@ fn init_in(dir: &Path, alias: &str, schemas: &[&str]) -> Output {
 const GRANTS_SNAPSHOT: &str = "
     SELECT concat_ws(E'\\n',
         (SELECT count(*) FROM pg_roles WHERE rolname = 'dbvalet_reader'),
-        (SELECT string_agg(m.member::regrole::text || ' ' || m.grantor::regrole::text
-                           || ' ' || m.admin_option::text, ',' ORDER BY m.grantor::regrole::text)
+        (SELECT string_agg(to_jsonb(m)::text, ',' ORDER BY m.grantor::regrole::text)
          FROM pg_auth_members m
          WHERE m.roleid = 'dbvalet_reader'::regrole AND m.member = current_database()::text::regrole),
         (SELECT datacl::text FROM pg_database WHERE datname = current_database()),
@@ -192,6 +207,30 @@ fn running_init_twice_succeeds_and_the_second_run_changes_nothing() {
 
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
+fn two_inits_at_once_on_one_database_both_succeed() {
+    let dir = admin_with_own_database("e2e_init_at_once", "SUPERUSER");
+    admin_sql("e2e_init_at_once", "CREATE TABLE notes (note text);");
+    let start = |dir: &Path| {
+        Command::new(DBVALET)
+            .current_dir(dir)
+            .args(["init", "--allow-plaintext", "e2e_init_at_once"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+
+    let first = start(&dir);
+    let second = start(&dir);
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+
+    assert!(first.status.success(), "first: {}", text(&first.stderr));
+    assert!(second.status.success(), "second: {}", text(&second.stderr));
+}
+
+#[test]
+#[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn a_second_init_with_another_schema_makes_that_schema_readable_too() {
     let dir = admin_with_own_database("e2e_init_adds_schema", "SUPERUSER");
     admin_sql(
@@ -204,6 +243,7 @@ fn a_second_init_with_another_schema_makes_that_schema_readable_too() {
     );
 
     let first = init_in(&dir, "e2e_init_adds_schema", &["public"]);
+    let before_second = run_in(&dir, &["psql", "-Atc", "SELECT note FROM billing.invoices"]);
     let second = init_in(&dir, "e2e_init_adds_schema", &["billing"]);
     let output = run_in(
         &dir,
@@ -215,6 +255,11 @@ fn a_second_init_with_another_schema_makes_that_schema_readable_too() {
     );
 
     assert!(first.status.success(), "first: {}", text(&first.stderr));
+    assert!(
+        text(&before_second.stderr).contains("permission denied for schema billing"),
+        "before the second init: {}",
+        text(&before_second.stderr)
+    );
     assert!(second.status.success(), "second: {}", text(&second.stderr));
     assert!(output.status.success(), "run: {}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "from public\nfrom billing\n");
@@ -251,16 +296,7 @@ fn with_an_existing_dbvalet_toml_init_prints_the_block_and_leaves_the_file_uncha
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn after_init_a_createrole_admin_runs_a_read_end_to_end() {
-    let dir = admin_with_own_database("e2e_init_createrole", "CREATEROLE");
-    create_reader_group();
-    // Another test's superuser created dbvalet_reader, so on 16+ only a superuser can give
-    // this admin ADMIN on it. INHERIT and SET are left for init to add.
-    if server_version_num() >= 160000 {
-        superuser_sql(
-            "GRANT dbvalet_reader TO e2e_init_createrole
-                 WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
-        );
-    }
+    let dir = createrole_admin_with_own_database("e2e_init_createrole");
     admin_sql(
         "e2e_init_createrole",
         "CREATE TABLE notes (note text);
@@ -278,14 +314,7 @@ fn after_init_a_createrole_admin_runs_a_read_end_to_end() {
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn after_init_a_createrole_admin_holds_admin_inherit_and_set_on_dbvalet_reader() {
-    let dir = admin_with_own_database("e2e_init_createrole_rights", "CREATEROLE");
-    create_reader_group();
-    if server_version_num() >= 160000 {
-        superuser_sql(
-            "GRANT dbvalet_reader TO e2e_init_createrole_rights
-                 WITH ADMIN OPTION, INHERIT FALSE, SET FALSE",
-        );
-    }
+    let dir = createrole_admin_with_own_database("e2e_init_createrole_rights");
 
     let init = init_in(&dir, "e2e_init_createrole_rights", &[]);
     // SET is a privilege of its own from 16; before that, every member may SET ROLE.

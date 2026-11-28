@@ -182,17 +182,27 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 admin.user()
             );
             let entry = config::reader_entry(&alias);
-            match config::find(&cwd) {
-                Some(path) => println!(
-                    "\n{} already exists, so dbvalet left it unchanged. \
-                     Add this entry to it if it's missing:\n\n{entry}",
-                    path.display()
-                ),
-                None => {
-                    let path = config::create(&cwd, &entry)?;
-                    println!("\nCreated {} with a `reader` role.", path.display());
-                }
-            }
+            let existing = match config::find(&cwd) {
+                Some(path) => path,
+                None => match config::create(&cwd, &entry) {
+                    Ok(path) => {
+                        println!("\nCreated {} with a `reader` role.", path.display());
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    // Another init in this directory created it first.
+                    Err(ConfigError::Create { path, source })
+                        if source.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        path
+                    }
+                    Err(err) => return Err(err.into()),
+                },
+            };
+            println!(
+                "\n{} already exists, so dbvalet left it unchanged. \
+                 Add this entry to it if it's missing:\n\n{entry}",
+                existing.display()
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Run {
