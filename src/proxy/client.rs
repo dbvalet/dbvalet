@@ -7,21 +7,27 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::{ENCRYPTION_REQUEST_LEN, ERROR_RESPONSE_TAG};
+use super::{ENCRYPTION_REQUEST_LEN, ERROR_RESPONSE_TAG, NEGOTIATE_PROTOCOL_VERSION_TAG};
 
 /// PostgreSQL refuses longer startup packets too.
 const MAX_STARTUP_PACKET_LEN: usize = 10_000;
 const MAX_PASSWORD_MESSAGE_LEN: usize = 1_000;
 
-const PROTOCOL_VERSION_3_0: u32 = 3 << 16;
+const PROTOCOL_MAJOR_3: u32 = 3;
+const PROTOCOL_VERSION_3_0: u32 = PROTOCOL_MAJOR_3 << 16;
 const CANCEL_REQUEST_CODE: u32 = 80_877_102;
 const SSL_REQUEST_CODE: u32 = 80_877_103;
 const GSSENC_REQUEST_CODE: u32 = 80_877_104;
+/// Startup parameters with this prefix are protocol options, which only the hop that
+/// receives them may act on.
+const PROTOCOL_OPTION_PREFIX: &str = "_pq_.";
 
 const PASSWORD_MESSAGE_TAG: u8 = b'p';
 
 /// Answers each SSL or GSS encryption request with `N` until the startup message comes,
-/// and returns its parameters. Returns `None` for a cancel request, which isn't relayed.
+/// and returns its parameters. A protocol 3 client asking for a newer minor version or for
+/// protocol options is told, as PostgreSQL would, that only 3.0 without options is spoken.
+/// Returns `None` for a cancel request, which isn't relayed.
 pub(super) async fn read_startup(
     client: &mut TcpStream,
 ) -> io::Result<Option<Vec<(String, String)>>> {
@@ -38,10 +44,37 @@ pub(super) async fn read_startup(
                 client.write_all(b"N").await?;
             }
             CANCEL_REQUEST_CODE => return Ok(None),
-            PROTOCOL_VERSION_3_0 => return parse_parameters(rest).map(Some),
+            version if version >> 16 == PROTOCOL_MAJOR_3 => {
+                let (options, parameters): (Vec<_>, Vec<_>) = parse_parameters(rest)?
+                    .into_iter()
+                    .partition(|(name, _)| name.starts_with(PROTOCOL_OPTION_PREFIX));
+                if version != PROTOCOL_VERSION_3_0 || !options.is_empty() {
+                    client
+                        .write_all(&negotiate_protocol_version_3_0(&options))
+                        .await?;
+                }
+                return Ok(Some(parameters));
+            }
             _ => return Err(invalid_data("the client asked for an unsupported protocol")),
         }
     }
+}
+
+/// A `NegotiateProtocolVersion` naming 3.0 and every option as unrecognized. PostgreSQL
+/// puts the whole version number in the field the docs call the newest minor version.
+fn negotiate_protocol_version_3_0(options: &[(String, String)]) -> Vec<u8> {
+    let mut body = PROTOCOL_VERSION_3_0.to_be_bytes().to_vec();
+    let count = u32::try_from(options.len()).expect("a startup packet is far below 4 GiB");
+    body.extend_from_slice(&count.to_be_bytes());
+    for (name, _) in options {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+    }
+    let len = u32::try_from(body.len() + 4).expect("a startup packet is far below 4 GiB");
+    let mut frame = vec![NEGOTIATE_PROTOCOL_VERSION_TAG];
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    frame
 }
 
 /// Parses the startup message's `name\0value\0…\0` list.
@@ -126,7 +159,88 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    /// The proxy's end of a loopback connection, and the client's.
+    async fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (proxy_end, _) = listener.accept().await.unwrap();
+        (proxy_end, client)
+    }
+
+    #[tokio::test]
+    async fn a_protocol_3_2_startup_is_told_to_use_3_0_and_its_parameters_are_returned() {
+        let (mut proxy_end, mut client) = loopback_pair().await;
+        client
+            .write_all(b"\0\0\0\x14\0\x03\0\x02user\0agent\0\0")
+            .await
+            .unwrap();
+
+        let parameters = read_startup(&mut proxy_end).await.unwrap();
+
+        assert_eq!(
+            parameters,
+            Some(vec![("user".to_owned(), "agent".to_owned())])
+        );
+        let mut reply = [0; 13];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"v\0\0\0\x0c\0\x03\0\0\0\0\0\0");
+    }
+
+    #[tokio::test]
+    async fn protocol_options_are_named_as_unrecognized_and_left_out_of_the_parameters() {
+        let (mut proxy_end, mut client) = loopback_pair().await;
+        client
+            .write_all(b"\0\0\0\x21\0\x03\0\0user\0agent\0_pq_.foo\0bar\0\0")
+            .await
+            .unwrap();
+
+        let parameters = read_startup(&mut proxy_end).await.unwrap();
+
+        assert_eq!(
+            parameters,
+            Some(vec![("user".to_owned(), "agent".to_owned())])
+        );
+        let mut reply = [0; 22];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"v\0\0\0\x15\0\x03\0\0\0\0\0\x01_pq_.foo\0");
+    }
+
+    #[tokio::test]
+    async fn a_plain_protocol_3_0_startup_gets_no_negotiation_reply() {
+        let (mut proxy_end, mut client) = loopback_pair().await;
+        client
+            .write_all(b"\0\0\0\x14\0\x03\0\0user\0agent\0\0")
+            .await
+            .unwrap();
+
+        read_startup(&mut proxy_end).await.unwrap();
+
+        assert_eq!(
+            client.try_read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn a_protocol_4_startup_is_refused() {
+        let (mut proxy_end, mut client) = loopback_pair().await;
+        client
+            .write_all(b"\0\0\0\x14\0\x04\0\0user\0agent\0\0")
+            .await
+            .unwrap();
+
+        let error = read_startup(&mut proxy_end).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn startup_parameters_are_parsed_in_order_including_empty_values() {

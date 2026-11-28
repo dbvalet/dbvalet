@@ -7,6 +7,7 @@ mod dangerous_roles;
 mod expiry;
 mod init;
 mod login_doctor;
+mod protocol;
 mod run_log;
 mod run_proxy;
 mod signals;

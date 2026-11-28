@@ -2,7 +2,7 @@
 
 use std::io;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::authentication::sasl::{self, ChannelBinding, ScramSha256};
 use postgres_protocol::message::{backend, frontend};
@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_util::either::Either;
 
-use super::{Access, ENCRYPTION_REQUEST_LEN, ERROR_RESPONSE_TAG};
+use super::{Access, ENCRYPTION_REQUEST_LEN, ERROR_RESPONSE_TAG, NEGOTIATE_PROTOCOL_VERSION_TAG};
 use crate::endpoint::ChannelBinding as ChannelBindingMode;
 use crate::tls;
 
@@ -206,18 +206,7 @@ async fn read_backend_message(
     unread: &mut BytesMut,
 ) -> Result<backend::Message, UpstreamRefusal> {
     loop {
-        if let Some(header) = backend::Header::parse(unread).map_err(failed)? {
-            let frame_len = 1 + header.len() as usize;
-            if frame_len > MAX_UPSTREAM_LOGIN_MESSAGE_LEN {
-                return Err(UpstreamRefusal::Failed(
-                    "the database sent an oversized message during login".to_owned(),
-                ));
-            }
-            if header.tag() == ERROR_RESPONSE_TAG && unread.len() >= frame_len {
-                return Err(UpstreamRefusal::ErrorResponse(unread.split_to(frame_len)));
-            }
-        }
-        if let Some(message) = backend::Message::parse(unread).map_err(failed)? {
+        if let Some(message) = take_login_message(unread)? {
             return Ok(message);
         }
         if server.read_buf(unread).await.map_err(failed)? == 0 {
@@ -226,6 +215,31 @@ async fn read_backend_message(
             ));
         }
     }
+}
+
+/// Takes the next whole login message off `unread`, or `None` until more bytes arrive.
+/// Drops any `NegotiateProtocolVersion`: the upstream startup is already 3.0 without
+/// protocol options, so it can only confirm that, and `Message::parse` can't read it.
+fn take_login_message(unread: &mut BytesMut) -> Result<Option<backend::Message>, UpstreamRefusal> {
+    while let Some(header) = backend::Header::parse(unread).map_err(failed)? {
+        let frame_len = 1 + header.len() as usize;
+        if frame_len > MAX_UPSTREAM_LOGIN_MESSAGE_LEN {
+            return Err(UpstreamRefusal::Failed(
+                "the database sent an oversized message during login".to_owned(),
+            ));
+        }
+        if unread.len() < frame_len {
+            return Ok(None);
+        }
+        match header.tag() {
+            ERROR_RESPONSE_TAG => {
+                return Err(UpstreamRefusal::ErrorResponse(unread.split_to(frame_len)));
+            }
+            NEGOTIATE_PROTOCOL_VERSION_TAG => unread.advance(frame_len),
+            _ => break,
+        }
+    }
+    backend::Message::parse(unread).map_err(failed)
 }
 
 fn failed(err: io::Error) -> UpstreamRefusal {
@@ -319,5 +333,26 @@ mod tests {
             .is_err()
         );
         assert!(select_sasl_mechanism(&["GSSAPI"], ChannelBindingMode::Prefer, None).is_err());
+    }
+
+    #[test]
+    fn a_negotiate_protocol_version_before_authentication_ok_is_skipped() {
+        let mut unread =
+            BytesMut::from(&b"v\0\0\0\x15\0\x03\0\0\0\0\0\x01_pq_.foo\0R\0\0\0\x08\0\0\0\0"[..]);
+
+        let message = take_login_message(&mut unread).ok().unwrap();
+
+        assert!(matches!(message, Some(backend::Message::AuthenticationOk)));
+        assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn a_partly_read_negotiate_protocol_version_waits_for_the_rest() {
+        let mut unread = BytesMut::from(&b"v\0\0\0\x15\0\x03\0\0\0\0"[..]);
+
+        let message = take_login_message(&mut unread).ok().unwrap();
+
+        assert!(message.is_none());
+        assert_eq!(unread.len(), 11);
     }
 }

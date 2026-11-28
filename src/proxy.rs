@@ -34,6 +34,7 @@ const ENCRYPTION_REQUEST_LEN: usize = 8;
 const AUTHENTICATION_OK: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
 const AUTHENTICATION_CLEARTEXT_PASSWORD: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 const ERROR_RESPONSE_TAG: u8 = b'E';
+const NEGOTIATE_PROTOCOL_VERSION_TAG: u8 = b'v';
 const INVALID_PASSWORD_SQLSTATE: &str = "28P01";
 const CONNECTION_FAILURE_SQLSTATE: &str = "08006";
 
