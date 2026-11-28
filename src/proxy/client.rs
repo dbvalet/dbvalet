@@ -160,10 +160,15 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::time::Duration;
 
     use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     use super::*;
+
+    /// Far longer than a loopback exchange takes, so only a proxy that never answers fails.
+    const LOOPBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// The proxy's end of a loopback connection, and the client's.
     async fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -183,14 +188,20 @@ mod tests {
             .await
             .unwrap();
 
-        let parameters = read_startup(&mut proxy_end).await.unwrap();
+        let parameters = timeout(LOOPBACK_TIMEOUT, read_startup(&mut proxy_end))
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             parameters,
             Some(vec![("user".to_owned(), "agent".to_owned())])
         );
         let mut reply = [0; 13];
-        client.read_exact(&mut reply).await.unwrap();
+        timeout(LOOPBACK_TIMEOUT, client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&reply, b"v\0\0\0\x0c\0\x03\0\0\0\0\0\0");
     }
 
@@ -202,14 +213,20 @@ mod tests {
             .await
             .unwrap();
 
-        let parameters = read_startup(&mut proxy_end).await.unwrap();
+        let parameters = timeout(LOOPBACK_TIMEOUT, read_startup(&mut proxy_end))
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             parameters,
             Some(vec![("user".to_owned(), "agent".to_owned())])
         );
         let mut reply = [0; 22];
-        client.read_exact(&mut reply).await.unwrap();
+        timeout(LOOPBACK_TIMEOUT, client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&reply, b"v\0\0\0\x15\0\x03\0\0\0\0\0\x01_pq_.foo\0");
     }
 
@@ -221,12 +238,18 @@ mod tests {
             .await
             .unwrap();
 
-        read_startup(&mut proxy_end).await.unwrap();
+        timeout(LOOPBACK_TIMEOUT, read_startup(&mut proxy_end))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(proxy_end);
 
-        assert_eq!(
-            client.try_read(&mut [0; 1]).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        let mut reply = Vec::new();
+        timeout(LOOPBACK_TIMEOUT, client.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, b"");
     }
 
     #[tokio::test]
@@ -237,7 +260,10 @@ mod tests {
             .await
             .unwrap();
 
-        let error = read_startup(&mut proxy_end).await.unwrap_err();
+        let error = timeout(LOOPBACK_TIMEOUT, read_startup(&mut proxy_end))
+            .await
+            .unwrap()
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }

@@ -36,7 +36,8 @@ fn frames_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
 fn psql_asking_for_protocol_3_2_reads_through_the_proxy() {
     let dir = project_with_reader("e2e-protocol-psql");
 
-    // libpq 18 and later negotiate down from 3.2; older libpq ignores the variable.
+    // libpq 18 and later negotiate down from 3.2. Older libpq ignores the variable, so for
+    // those clients the raw startup test below is what proves the 3.2 path.
     let output = run_in(
         &dir,
         &["sh", "-c", "PGMAXPROTOCOLVERSION=3.2 psql -Atc 'SELECT 42'"],
