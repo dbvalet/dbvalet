@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::support::{
     DBVALET, SUPERUSER_URL, gc_command, gc_in, ledger_entry, login, printed, project_with_reader,
-    project_with_reader_and_admin, run_command, run_in, runtime, superuser_count, superuser_sql,
-    sweeping, sweeping_alone, text, wait_for_active_query,
+    project_with_reader_and_admin, run_command, run_in, runtime, start_run_until_ready,
+    superuser_count, superuser_sql, sweeping, sweeping_alone, text, wait_for_active_query,
 };
 
 /// Runs `command` to the end, failing the test if it takes longer than `limit`.
@@ -27,30 +27,6 @@ fn output_within(mut command: Command, limit: Duration) -> Output {
         std::thread::sleep(Duration::from_millis(50));
     }
     child.wait_with_output().unwrap()
-}
-
-/// Starts `dbvalet run <run_args>` in `dir` with a child that runs `script`, prints READY if it
-/// succeeded and then waits on stdin. Returns the run and what the child printed before READY.
-fn start_run_until_ready(dir: &Path, run_args: &[&str], script: &str) -> (Child, String) {
-    let _sweeping = sweeping();
-    let mut run = Command::new(DBVALET)
-        .current_dir(dir)
-        .env("XDG_STATE_HOME", dir.join("state"))
-        .arg("run")
-        .args(run_args)
-        .args(["--allow-plaintext", "--", "sh", "-c"])
-        .arg(format!("{script} && echo READY && read line"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdout = BufReader::new(run.stdout.take().unwrap());
-    let mut seen = String::new();
-    while !seen.ends_with("READY\n") {
-        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
-    }
-    (run, seen)
 }
 
 /// A NOLOGIN group for a writable `writer` role, owning a schema of the same name, so tests

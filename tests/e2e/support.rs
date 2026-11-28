@@ -1,9 +1,9 @@
 //! `dbvalet`, PostgreSQL and project helpers every group uses.
 
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -210,4 +210,32 @@ pub(crate) fn wait_for_active_query(login: &str) {
         assert!(Instant::now() < deadline, "no active query for {login}");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Starts `dbvalet run <run_args>` in `dir` with a child that runs `script`, prints READY if it
+/// succeeded and then waits on stdin. Returns the run and what the child printed before READY.
+pub(crate) fn start_run_until_ready(
+    dir: &Path,
+    run_args: &[&str],
+    script: &str,
+) -> (Child, String) {
+    let _sweeping = sweeping();
+    let mut run = Command::new(DBVALET)
+        .current_dir(dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .arg("run")
+        .args(run_args)
+        .args(["--allow-plaintext", "--", "sh", "-c"])
+        .arg(format!("{script} && echo READY && read line"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut seen = String::new();
+    while !seen.ends_with("READY\n") {
+        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
+    }
+    (run, seen)
 }
