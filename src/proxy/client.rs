@@ -39,10 +39,30 @@ pub(super) enum Startup {
 
 /// The process id and secret key of an upstream session, as its `BackendKeyData` handed
 /// them out. Anyone holding them can cancel that session's queries.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub(super) struct CancelKey {
     process_id: i32,
-    secret_key: Vec<u8>,
+    secret_key: SecretSlice<u8>,
+}
+
+impl PartialEq for CancelKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.process_id == other.process_id
+            && bool::from(
+                self.secret_key
+                    .expose_secret()
+                    .ct_eq(other.secret_key.expose_secret()),
+            )
+    }
+}
+
+impl Eq for CancelKey {}
+
+// Hashes the process id alone, so a lookup's time doesn't depend on the secret key.
+impl std::hash::Hash for CancelKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.process_id.hash(state);
+    }
 }
 
 impl CancelKey {
@@ -57,28 +77,20 @@ impl CancelKey {
         }
         Ok(Self {
             process_id: i32::from_be_bytes(*process_id),
-            secret_key: secret_key.to_vec(),
+            secret_key: secret_key.to_vec().into(),
         })
     }
 
     /// The whole `CancelRequest` packet for this key.
-    pub(super) fn cancel_request(&self) -> Vec<u8> {
-        let len = u32::try_from(4 + 4 + PROCESS_ID_LEN + self.secret_key.len())
+    pub(super) fn cancel_request(&self) -> SecretSlice<u8> {
+        let secret_key = self.secret_key.expose_secret();
+        let len = u32::try_from(4 + 4 + PROCESS_ID_LEN + secret_key.len())
             .expect("a cancel key is at most 256 bytes");
         let mut packet = len.to_be_bytes().to_vec();
         packet.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
         packet.extend_from_slice(&self.process_id.to_be_bytes());
-        packet.extend_from_slice(&self.secret_key);
-        packet
-    }
-}
-
-impl std::fmt::Debug for CancelKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CancelKey")
-            .field("process_id", &self.process_id)
-            .field("secret_key", &"[redacted]")
-            .finish()
+        packet.extend_from_slice(secret_key);
+        packet.into()
     }
 }
 
@@ -340,7 +352,7 @@ mod tests {
             startup,
             Startup::Cancel(CancelKey {
                 process_id: 12345,
-                secret_key: vec![0xde, 0xad, 0xbe, 0xef],
+                secret_key: vec![0xde, 0xad, 0xbe, 0xef].into(),
             })
         );
     }
@@ -370,7 +382,7 @@ mod tests {
             i32::from_be_bytes([0xde, 0xad, 0xbe, 0xef]),
             &mut expected,
         );
-        assert_eq!(key.cancel_request(), expected.to_vec());
+        assert_eq!(key.cancel_request().expose_secret(), &expected[..]);
     }
 
     #[test]
@@ -382,7 +394,7 @@ mod tests {
 
         let mut expected = b"\0\0\x01\x0c\x04\xd2\x16\x2e\0\0\x30\x39".to_vec();
         expected.extend_from_slice(&[7; 256]);
-        assert_eq!(key.cancel_request(), expected);
+        assert_eq!(key.cancel_request().expose_secret(), &expected[..]);
     }
 
     #[test]
@@ -401,7 +413,7 @@ mod tests {
 
         assert_eq!(
             format!("{key:?}"),
-            "CancelKey { process_id: 12345, secret_key: \"[redacted]\" }"
+            "CancelKey { process_id: 12345, secret_key: SecretBox<[u8]>([REDACTED]) }"
         );
     }
 

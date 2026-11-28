@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::CommandExt;
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,12 +17,26 @@ const RUN_DEADLINE: Duration = Duration::from_secs(60);
 /// Well before the 30 s the query would sleep without the cancel.
 const CANCEL_WITHIN: Duration = Duration::from_secs(10);
 
+/// The run, SIGKILLed with its whole process group (psql included) and reaped when dropped
+/// before it exits, so a failing assertion or a timeout never leaves it running.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let group = Pid::from_raw(i32::try_from(self.0.id()).unwrap());
+            let _ = signal::killpg(group, Signal::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[test]
 #[ignore = "e2e: needs PostgreSQL on localhost:5432 and a keychain"]
 fn sigint_to_psql_cancels_a_running_query_through_the_proxy() {
     let dir = project_with_reader("e2e-cancel-psql");
     let _sweeping = sweeping();
-    let mut run = run_command(
+    let run = run_command(
         &dir,
         &[
             "sh",
@@ -38,6 +52,7 @@ fn sigint_to_psql_cancels_a_running_query_through_the_proxy() {
     .spawn()
     .unwrap();
     let run_group = Pid::from_raw(i32::try_from(run.id()).unwrap());
+    let mut run = KillOnDrop(run);
     // Kills the whole run, psql included, if it outlives RUN_DEADLINE, so the reads and
     // the wait below return and the test fails instead of hanging.
     let (finished, finish) = mpsc::channel::<()>();
@@ -48,7 +63,7 @@ fn sigint_to_psql_cancels_a_running_query_through_the_proxy() {
         }
         expired
     });
-    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut stdout = BufReader::new(run.0.stdout.take().unwrap());
     let mut seen = String::new();
     while !seen.ends_with("READY\n") {
         assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
@@ -59,12 +74,13 @@ fn sigint_to_psql_cancels_a_running_query_through_the_proxy() {
     signal::kill(psql, Signal::SIGINT).unwrap();
     let cancelled_at = Instant::now();
     let mut stderr = String::new();
-    run.stderr
+    run.0
+        .stderr
         .take()
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    let status = run.wait().unwrap();
+    let status = run.0.wait().unwrap();
     let cancelled_after = cancelled_at.elapsed();
     finished.send(()).unwrap();
 
