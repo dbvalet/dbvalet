@@ -3,6 +3,7 @@
 //!
 //! Every test uses its own alias and admin role, so they can run in parallel.
 
+mod cancel;
 mod dangerous_roles;
 mod expiry;
 mod init;

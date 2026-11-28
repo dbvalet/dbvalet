@@ -7,14 +7,19 @@
 //! - `DBVALET_E2E_WRONG_HOST_PORT` (default `5433`): SSL PostgreSQL signed by the same CA whose
 //!   leaf cert is for `wrong-host.example.test` (not `localhost`).
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use dbvalet::endpoint::{ChannelBinding, Endpoint, TrustRoot};
 use dbvalet::proxy;
 use dbvalet::source::{AccessDeadline, UpstreamLogin};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use secrecy::{ExposeSecret, SecretString};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::SslMode;
@@ -490,4 +495,98 @@ fn login_refuses_a_ca_bundle_with_an_invalid_certificate() {
     assert!(!stored.status.success(), "login: {stderr}");
     assert!(stderr.contains("invalid-ca.pem"), "login: {stderr}");
     assert!(stderr.contains("invalid CA certificate"), "login: {stderr}");
+}
+
+#[test]
+#[ignore = "e2e_tls: needs SSL PostgreSQL and DBVALET_E2E_CA_CERT"]
+fn sigint_to_psql_cancels_a_running_query_through_the_proxy_over_tls() {
+    // Far longer than mint, the cancelled query and teardown take together.
+    const RUN_DEADLINE: Duration = Duration::from_secs(60);
+    // Well before the 30 s the query would sleep without the cancel.
+    const CANCEL_WITHIN: Duration = Duration::from_secs(10);
+    let port = tls_port();
+    let ca = ca_cert();
+    create_reader_group(&port);
+    superuser_psql(
+        &port,
+        "DROP ROLE IF EXISTS e2e_tls_cancel_admin;
+         CREATE ROLE e2e_tls_cancel_admin LOGIN SUPERUSER PASSWORD 'pw-e2e-tls-cancel-5e6f';",
+    );
+    let stored = login(
+        "e2e-tls-cancel",
+        &format!(
+            "postgresql://e2e_tls_cancel_admin:pw-e2e-tls-cancel-5e6f@localhost:{port}/postgres\
+             ?sslmode=verify-full&sslrootcert={ca}"
+        ),
+    );
+    assert!(stored.status.success(), "login: {}", text(&stored.stderr));
+    let dir = write_project("e2e-tls-cancel");
+    let mut run = Command::new(DBVALET)
+        .current_dir(&dir)
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .args(["run", "--", "sh", "-c"])
+        .arg(
+            "echo \"login=$PGUSER\"; echo \"psql=$$\"; echo READY; \
+             exec psql -Atc 'SELECT pg_sleep(30)'",
+        )
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let run_group = Pid::from_raw(i32::try_from(run.id()).unwrap());
+    // Kills the whole run, psql included, if it outlives RUN_DEADLINE, so the reads and
+    // the wait below return and the test fails instead of hanging.
+    let (finished, finish) = mpsc::channel::<()>();
+    let watchdog = thread::spawn(move || {
+        let expired = finish.recv_timeout(RUN_DEADLINE) == Err(RecvTimeoutError::Timeout);
+        if expired {
+            let _ = signal::killpg(run_group, Signal::SIGKILL);
+        }
+        expired
+    });
+    let mut stdout = BufReader::new(run.stdout.take().unwrap());
+    let mut seen = String::new();
+    while !seen.ends_with("READY\n") {
+        assert_ne!(stdout.read_line(&mut seen).unwrap(), 0, "stdout: {seen}");
+    }
+    let value = |key: &str| {
+        seen.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .unwrap()
+            .to_owned()
+    };
+    let active_query = format!(
+        "SELECT count(*) FROM pg_stat_activity WHERE usename = '{}' AND state = 'active'",
+        value("login")
+    );
+    let waiting_until = Instant::now() + Duration::from_secs(10);
+    while superuser_psql(&port, &active_query).trim() == "0" {
+        assert!(Instant::now() < waiting_until, "the query never started");
+    }
+
+    let psql = Pid::from_raw(value("psql").parse().unwrap());
+    signal::kill(psql, Signal::SIGINT).unwrap();
+    let cancelled_at = Instant::now();
+    let mut stderr = String::new();
+    run.stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = run.wait().unwrap();
+    let cancelled_after = cancelled_at.elapsed();
+    finished.send(()).unwrap();
+
+    assert!(
+        !watchdog.join().unwrap(),
+        "the run was killed after {RUN_DEADLINE:?}"
+    );
+    assert!(
+        stderr.contains("canceling statement due to user request"),
+        "stderr: {stderr}"
+    );
+    assert!(cancelled_after < CANCEL_WITHIN, "took {cancelled_after:?}");
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
 }

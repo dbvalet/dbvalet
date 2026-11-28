@@ -1,6 +1,9 @@
 //! TLS, startup and SCRAM login upstream as the temporary login.
 
+use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
+use std::sync::{Mutex, PoisonError};
 
 use bytes::{Buf, BytesMut};
 use fallible_iterator::FallibleIterator;
@@ -12,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_util::either::Either;
 
+use super::client::CancelKey;
 use super::{Access, ENCRYPTION_REQUEST_LEN, ERROR_RESPONSE_TAG, NEGOTIATE_PROTOCOL_VERSION_TAG};
 use crate::endpoint::ChannelBinding as ChannelBindingMode;
 use crate::tls;
@@ -19,6 +23,28 @@ use crate::tls;
 /// Far above any authentication message, so a non-PostgreSQL peer can't make dbvalet
 /// reserve gigabytes.
 const MAX_UPSTREAM_LOGIN_MESSAGE_LEN: usize = 64 * 1024;
+const BACKEND_KEY_DATA_TAG: u8 = b'K';
+const READY_FOR_QUERY_TAG: u8 = b'Z';
+const BACKEND_HEADER_LEN: usize = 5;
+
+/// The address each live session's upstream connection reached, by its cancel key.
+pub(super) type CancelTargets = Mutex<HashMap<CancelKey, SocketAddr>>;
+
+/// Lets a cancel request with this key reach its session's server, until it's dropped.
+pub(super) struct Cancellable<'a> {
+    targets: &'a CancelTargets,
+    key: CancelKey,
+}
+
+impl Drop for Cancellable<'_> {
+    fn drop(&mut self) {
+        // No code panics while holding the lock, so a poisoned map is still whole.
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
 
 pub(super) enum UpstreamRefusal {
     /// The server's own `ErrorResponse`, passed to the client unchanged.
@@ -29,11 +55,12 @@ pub(super) enum UpstreamRefusal {
 type UpstreamStream = Either<TcpStream, Box<TlsStream<TcpStream>>>;
 
 /// Starts an upstream session as the temporary login with the client's parameters, except
-/// `user` and `database`. Returns it after `AuthenticationOk`, with the bytes read past it.
-pub(super) async fn connect_upstream(
-    access: &Access,
+/// `user` and `database`. Returns it after `AuthenticationOk`, with the bytes read past it
+/// up to its `BackendKeyData`, and keeps it cancellable while the third value lives.
+pub(super) async fn connect_upstream<'a>(
+    access: &'a Access,
     client_parameters: &[(String, String)],
-) -> Result<(UpstreamStream, BytesMut), UpstreamRefusal> {
+) -> Result<(UpstreamStream, BytesMut, Option<Cancellable<'a>>), UpstreamRefusal> {
     let endpoint = &access.endpoint;
     let login = &access.login;
     let mut first_err = None;
@@ -55,6 +82,7 @@ pub(super) async fn connect_upstream(
             "dbvalet couldn't reach the database at {endpoint}: {err}"
         ))
     })?;
+    let address = tcp.peer_addr().map_err(failed)?;
     let (mut server, peer_cert_digest) = negotiate_upstream_tls(tcp, access).await?;
     let parameters = client_parameters
         .iter()
@@ -102,7 +130,10 @@ pub(super) async fn connect_upstream(
                             .to_owned(),
                     ));
                 }
-                return Ok((server, unread));
+                let cancellable = read_backend_key(&mut server, &mut unread)
+                    .await?
+                    .map(|key| register_cancel_target(&access.cancel_targets, key, address));
+                return Ok((server, unread, cancellable));
             }
             backend::Message::AuthenticationSasl(_) | backend::Message::AuthenticationOk => {
                 return Err(out_of_order());
@@ -115,6 +146,81 @@ pub(super) async fn connect_upstream(
         }
         server.write_all(&out).await.map_err(failed)?;
         server.flush().await.map_err(failed)?;
+    }
+}
+
+/// Sends a `CancelRequest` for `key` to the address of the session that handed the key out,
+/// then waits for that server to close the connection, as libpq does, so the client hears
+/// the cancel is done only once the server has acted on it. A key no live session of this
+/// proxy handed out goes nowhere, so a cancel can't reach a different server.
+pub(super) async fn forward_cancel(
+    access: &Access,
+    key: &CancelKey,
+) -> Result<(), UpstreamRefusal> {
+    let address = access
+        .cancel_targets
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(key)
+        .copied();
+    let Some(address) = address else {
+        return Ok(());
+    };
+    let tcp = TcpStream::connect(address).await.map_err(failed)?;
+    let (mut server, _) = negotiate_upstream_tls(tcp, access).await?;
+    server
+        .write_all(&key.cancel_request())
+        .await
+        .map_err(failed)?;
+    server.flush().await.map_err(failed)?;
+    tokio::io::copy(&mut server, &mut tokio::io::sink())
+        .await
+        .map_err(failed)?;
+    Ok(())
+}
+
+fn register_cancel_target(
+    targets: &CancelTargets,
+    key: CancelKey,
+    address: SocketAddr,
+) -> Cancellable<'_> {
+    targets
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key.clone(), address);
+    Cancellable { targets, key }
+}
+
+/// Reads on until the session's `BackendKeyData` and returns its key, leaving every byte in
+/// `unread` for the client. `None` when the startup ends without a usable one.
+async fn read_backend_key(
+    server: &mut UpstreamStream,
+    unread: &mut BytesMut,
+) -> Result<Option<CancelKey>, UpstreamRefusal> {
+    let mut scanned = 0;
+    loop {
+        while let Some(header) = backend::Header::parse(&unread[scanned..]).map_err(failed)? {
+            let frame_len = 1 + header.len() as usize;
+            if frame_len > MAX_UPSTREAM_LOGIN_MESSAGE_LEN {
+                return Err(UpstreamRefusal::Failed(
+                    "the database sent an oversized message during login".to_owned(),
+                ));
+            }
+            if unread.len() - scanned < frame_len {
+                break;
+            }
+            match header.tag() {
+                BACKEND_KEY_DATA_TAG => {
+                    let body = &unread[scanned + BACKEND_HEADER_LEN..scanned + frame_len];
+                    return Ok(CancelKey::parse(body).ok());
+                }
+                READY_FOR_QUERY_TAG | ERROR_RESPONSE_TAG => return Ok(None),
+                _ => scanned += frame_len,
+            }
+        }
+        if server.read_buf(unread).await.map_err(failed)? == 0 {
+            return Ok(None);
+        }
     }
 }
 
@@ -333,6 +439,68 @@ mod tests {
             .is_err()
         );
         assert!(select_sasl_mechanism(&["GSSAPI"], ChannelBindingMode::Prefer, None).is_err());
+    }
+
+    /// Far longer than a loopback exchange takes, so only a scan that never ends fails.
+    const LOOPBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The proxy's upstream end of a loopback connection, and the server's.
+    async fn loopback_pair() -> (UpstreamStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_end = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (Either::Left(proxy_end), server)
+    }
+
+    #[tokio::test]
+    async fn a_backend_key_split_across_reads_is_found_and_every_byte_kept() {
+        let (mut proxy_end, mut server) = loopback_pair().await;
+        let mut unread = BytesMut::from(&b"S\0\0\0\x15TimeZone\0Etc/"[..]);
+        server
+            .write_all(b"UTC\0K\0\0\0\x0c\0\0\x30\x39\xde\xad\xbe\xefZ\0\0\0\x05I")
+            .await
+            .unwrap();
+
+        let key = tokio::time::timeout(
+            LOOPBACK_TIMEOUT,
+            read_backend_key(&mut proxy_end, &mut unread),
+        )
+        .await
+        .unwrap()
+        .ok()
+        .unwrap();
+
+        assert_eq!(
+            key,
+            Some(CancelKey::parse(b"\0\0\x30\x39\xde\xad\xbe\xef").unwrap())
+        );
+        assert!(
+            unread.starts_with(
+                b"S\0\0\0\x15TimeZone\0Etc/UTC\0K\0\0\0\x0c\0\0\x30\x39\xde\xad\xbe\xef"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_startup_that_is_ready_without_a_backend_key_is_not_cancellable() {
+        let (mut proxy_end, _server) = loopback_pair().await;
+        let mut unread = BytesMut::from(&b"Z\0\0\0\x05I"[..]);
+
+        let key = tokio::time::timeout(
+            LOOPBACK_TIMEOUT,
+            read_backend_key(&mut proxy_end, &mut unread),
+        )
+        .await
+        .unwrap()
+        .ok()
+        .unwrap();
+
+        assert_eq!(key, None);
+        assert_eq!(&unread[..], b"Z\0\0\0\x05I");
     }
 
     #[test]
