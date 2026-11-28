@@ -398,7 +398,8 @@ fn a_sweep_without_the_ledger_that_cant_reassign_a_reader_logins_table_fails_and
          DROP TABLE IF EXISTS e2e_write_ledgerless_stuck_table;
          DROP ROLE IF EXISTS dbvalet_ledgerlessstuck2;
          CREATE ROLE dbvalet_ledgerlessstuck2 LOGIN VALID UNTIL '2000-01-01' IN ROLE dbvalet_reader;
-         GRANT dbvalet_ledgerlessstuck2 TO e2e_write_ledgerless_stuck;
+         GRANT dbvalet_ledgerlessstuck2 TO e2e_write_ledgerless_stuck
+             WITH ADMIN TRUE, INHERIT TRUE, SET FALSE;
          CREATE TABLE e2e_write_ledgerless_stuck_table ();
          ALTER TABLE e2e_write_ledgerless_stuck_table OWNER TO dbvalet_ledgerlessstuck2;",
     );
@@ -419,8 +420,10 @@ fn a_sweep_without_the_ledger_that_cant_reassign_a_reader_logins_table_fails_and
 
     let stderr = text(&swept.stderr);
     assert_eq!(swept.status.code(), Some(1), "stderr: {stderr}");
+    // The membership mint gives a CREATEROLE admin, so the reader group is out of SET's reach.
     assert!(
-        stderr.contains("dbvalet_ledgerlessstuck2"),
+        stderr.contains("dbvalet_ledgerlessstuck2")
+            && stderr.contains("must be able to SET ROLE \"dbvalet_reader\""),
         "stderr: {stderr}"
     );
     assert_eq!(login_left, 1);
